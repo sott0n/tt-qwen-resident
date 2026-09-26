@@ -15,6 +15,9 @@
 // 9 q_off (tile offset of this core's qkvzab columns), 10 head_rows_addr, then num_heads x (x, y) of the
 // head cores, then num_streamers x (x, y) of the streamers.
 // Extra compile-time arg: 41 sem_rows (head cores' row-arrival semaphore).
+// Last runtime arg: optional timeline buffer (0 = off): per layer 8 wall-clock words at the phase
+// boundaries (slots, qkvzab row ready, heads done, attn partial sent, slots, act slice ready, act
+// complete, mlp partial sent), after the reader's 8 words.
 
 #include "api/dataflow/dataflow_api.h"
 #include "gdn_layer_common.hpp"
@@ -37,6 +40,14 @@ void kernel_main() {
     const uint32_t head_rows = get_arg_val<uint32_t>(10);
     constexpr uint32_t heads_base = 11;
     constexpr uint32_t peers_base = heads_base + 2 * num_heads;
+    const uint32_t ts_addr = get_arg_val<uint32_t>(peers_base + 2 * num_streamers);
+    volatile tt_l1_ptr uint32_t* ts = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ts_addr);
+    volatile uint32_t* clk = reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
+    auto mark = [&](uint32_t l, uint32_t i) {
+        if (ts_addr) {
+            ts[l * 16 + 8 + i] = *clk;
+        }
+    };
 
     volatile tt_l1_ptr uint32_t* slots_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_slots));
     volatile tt_l1_ptr uint32_t* act_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_act));
@@ -64,7 +75,9 @@ void kernel_main() {
     for (uint32_t l = 0; l < layers; l++) {
         // attention half
         take_slots(2 * l);
-        cb_wait_front(cb_qkvz_out, nq_max);
+        mark(l, 0);
+        cb_wait_front(cb_qkvz_out, kBlk);
+        mark(l, 1);
         const uint32_t row = get_read_ptr(cb_qkvz_out);
         for (uint32_t i = 0; i < num_heads; i++) {
             const uint32_t hx = get_arg_val<uint32_t>(heads_base + 2 * i);
@@ -77,15 +90,19 @@ void kernel_main() {
             const uint32_t hy = get_arg_val<uint32_t>(heads_base + 2 * i + 1);
             noc_semaphore_inc(get_noc_addr(hx, hy, rows_sem_addr), 1);
         }
-        cb_pop_front(cb_qkvz_out, nq_max);
+        cb_pop_front(cb_qkvz_out, kBlk);
         noc_semaphore_wait_min(heads_sem, num_heads * (l + 1));
+        mark(l, 2);
         cb_reserve_back(cb_o_in, Ot);
         cb_push_back(cb_o_in, Ot);
         send_partial(2 * l);
+        mark(l, 3);
 
         // mlp half
         take_slots(2 * l + 1);
-        cb_wait_front(cb_aslice, ng_max);
+        mark(l, 4);
+        cb_wait_front(cb_aslice, kBlk);
+        mark(l, 5);
         const uint32_t slice = get_read_ptr(cb_aslice);
         for (uint32_t s = 0; s < num_streamers; s++) {
             const uint32_t px = get_arg_val<uint32_t>(peers_base + 2 * s);
@@ -98,11 +115,13 @@ void kernel_main() {
             const uint32_t py = get_arg_val<uint32_t>(peers_base + 2 * s + 1);
             noc_semaphore_inc(get_noc_addr(px, py, act_sem_addr), 1);
         }
-        cb_pop_front(cb_aslice, ng_max);
+        cb_pop_front(cb_aslice, kBlk);
         noc_semaphore_wait_min(act_sem, num_streamers * (l + 1));
+        mark(l, 6);
         cb_reserve_back(cb_act, It);
         cb_push_back(cb_act, It);
         send_partial(2 * l + 1);
+        mark(l, 7);
     }
     noc_async_atomic_barrier();
 }

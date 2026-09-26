@@ -11,7 +11,7 @@
 //     x = sum of the slots;  h = rmsnorm(x) * gamma[set][1];  a = silu(h @ G) * (h @ U)
 //     d = act @ D;  pout = d (+ x on chip 0)
 //
-// Runtime args: 0 ng, 1 nd, 2 pout_off, 3 nq, 4 q_off (tile offset of this core's qkvzab columns)
+// Runtime args: 0 ng, 1 nd, 2 pout_off, 3 nq, 4 n_conv (leading q|k|v columns among this core's nq)
 
 #include <cstdint>
 #include "api/compute/compute_kernel_api.h"
@@ -50,16 +50,22 @@ FORCE_INLINE void with_block(F fn) {
     UNPACK((TT_STOREREG(4, consumed_addr_word)));
 }
 
-// out[n] = in0[1, K] @ W[K, n] for n_tiles columns streamed through ring entry E.
+// out[n] = in0[1, K] @ W[K, n] for n_tiles columns streamed through ring entry E; columns from
+// `split` on go to out_b (gate | up), each output CB takes one block of block_tiles.
 template <uint32_t E>
-FORCE_INLINE void matmul(uint32_t in0_cb, uint32_t out_cb, uint32_t n_tiles, uint32_t block_tiles) {
+FORCE_INLINE void matmul(
+    uint32_t in0_cb, uint32_t out_cb, uint32_t n_tiles, uint32_t block_tiles, uint32_t out_b = 0, uint32_t split = 0) {
     using En = Entry<E>;
+    const bool two = split > 0;
     cb_wait_front(in0_cb, En::Kt);
     reconfig_full_operand<SrcOrder::Reverse>(in0_cb, En::cb);
     custom_mm_block_init_short<false, true, false>(in0_cb, En::cb, out_cb);
     pack_reconfig_data_format<true>(out_cb);
     pack_block_contiguous_init(out_cb);
     cb_reserve_back(out_cb, block_tiles);
+    if (two) {
+        cb_reserve_back(out_b, block_tiles);
+    }
     for (uint32_t n = 0; n < n_tiles; n++) {
         tile_regs_acquire();
         for (uint32_t kb = 0; kb + 1 < En::nkb; kb++) {
@@ -68,10 +74,13 @@ FORCE_INLINE void matmul(uint32_t in0_cb, uint32_t out_cb, uint32_t n_tiles, uin
         with_block<E>([&] { custom_mm_block<true>(in0_cb, En::cb, (En::nkb - 1) * En::sb, 0, 0, En::sb); });
         tile_regs_commit();
         tile_regs_wait();
-        pack_block_contiguous(0, out_cb, 1);
+        pack_block_contiguous(0, two && n >= split ? out_b : out_cb, 1);
         tile_regs_release();
     }
     cb_push_back(out_cb, block_tiles);
+    if (two) {
+        cb_push_back(out_b, block_tiles);
+    }
     custom_mm_block_uninit<false>();
 }
 
@@ -140,29 +149,29 @@ FORCE_INLINE void rmsnorm(uint32_t g) {
 }
 
 // cb_aslice[i] = silu(g[i]) * u[i]
-FORCE_INLINE void silu_mul(uint32_t ng) {
-    cb_wait_front(cb_gu, 2 * ng_max);
-    cb_reserve_back(cb_aslice, ng_max);
-    reconfig_full_operand(cb_gu, cb_gu);
-    copy_init(cb_gu);
+FORCE_INLINE void silu_mul() {
+    cb_wait_front(cb_g, kBlk);
+    cb_wait_front(cb_u, kBlk);
+    cb_reserve_back(cb_aslice, kBlk);
+    reconfig_full_operand(cb_g_full, cb_u_full);
+    pack_reconfig_data_format<true>(cb_aslice_full);
+    pack_init(cb_aslice_full);
+    tile_regs_acquire();
+    copy_init(cb_g_full);
+    copy_tile(cb_g_full, 0, 0);
+    copy_tile(cb_u_full, 0, 1);
     silu_tile_init();
+    silu_tile(0);
     mul_binary_tile_init();
-    pack_init(cb_aslice);
-    for (uint32_t i = 0; i < ng; i++) {
-        tile_regs_acquire();
-        copy_tile(cb_gu, i, 0);
-        copy_tile(cb_gu, ng + i, 1);
-        silu_tile(0);
-        mul_binary_tile(0, 1, 0);
-        tile_regs_commit();
-        tile_regs_wait();
-        for (uint32_t d = 0; d < 1; d++) {
-            pack_tile(d, cb_aslice);
-        }
-        tile_regs_release();
-    }
-    cb_push_back(cb_aslice, ng_max);
-    cb_pop_front(cb_gu, 2 * ng_max);
+    mul_binary_tile(0, 1, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_aslice_full);
+    tile_regs_release();
+    cb_push_back(cb_aslice_full, 1);  // wraps the view's write pointer back to the base
+    cb_push_back(cb_aslice, kBlk);
+    cb_pop_front(cb_g, kBlk);
+    cb_pop_front(cb_u, kBlk);
 }
 
 // cb_pout = cb_dout + x[pout_off : pout_off + nd]
@@ -190,48 +199,60 @@ FORCE_INLINE void add_residual(uint32_t nd, uint32_t pout_off) {
 }
 
 // q|k|v columns: cb_qkvz_out = silu(w0 * y[t-3] + w1 * y[t-2] + w2 * y[t-1] + w3 * y[t]) and y[t] replaces
-// y[t-3] in the set's history ring; other columns are copied through. SFPU math in DST.
+// y[t-3] in the set's history ring; the first n_conv of this core's columns are q|k|v, the rest
+// (z, a, b) are copied through. The conv runs once on the 32x32 views of the column block.
 uint32_t conv_step[weight_sets];
 
-FORCE_INLINE void conv_pass(uint32_t set, uint32_t nq, uint32_t q_off) {
-    cb_wait_front(cb_qkvz, nq_max);
-    cb_reserve_back(cb_qkvz_out, nq_max);
-    reconfig_full_operand(cb_qkvz, cb_qkvz);
-    copy_init(cb_qkvz);
-    pack_init(cb_qkvz_out);
+FORCE_INLINE void conv_pass(uint32_t set, uint32_t nq, uint32_t n_conv) {
+    cb_wait_front(cb_qkvz, kBlk);
+    cb_reserve_back(cb_qkvz_out, kBlk);
     const uint32_t c = conv_step[set];
-    const uint32_t hist = set * 3 * nq_max;
-    const uint32_t slot[3] = {hist + (c % 3) * nq_max, hist + ((c + 1) % 3) * nq_max, hist + ((c + 2) % 3) * nq_max};
-    const uint32_t taps = set * nq_max * 4;
-    for (uint32_t i = 0; i < nq; i++) {
+    const uint32_t oldest = set * 3 + c % 3;
+    if (n_conv > 0) {
+        reconfig_full_operand(cb_qkvz_full, cb_qkvz_full);
+        pack_reconfig_data_format<true>(cb_qkvz_out_full);
+        pack_init(cb_qkvz_out_full);
         tile_regs_acquire();
-        copy_tile(cb_qkvz, i, 0);
-        const bool conv = q_off + i < conv_tiles;
-        if (conv) {
-            copy_tile(cb_conv_w, taps + i * 4 + 3, 1);
+        copy_init(cb_qkvz_full);
+        copy_tile(cb_qkvz_full, 0, 0);
+        copy_tile(cb_conv_w_full, set * 4 + 3, 1);
+        mul_binary_tile_init();
+        mul_binary_tile(0, 1, 1);
+        for (uint32_t j = 0; j < 3; j++) {
+            copy_init(cb_qkvz_full);
+            copy_tile(cb_conv_hist_full, set * 3 + (c + j) % 3, 2);
+            copy_tile(cb_conv_w_full, set * 4 + j, 3);
             mul_binary_tile_init();
-            mul_binary_tile(0, 1, 1);
-            for (uint32_t j = 0; j < 3; j++) {
-                copy_tile(cb_conv_hist, slot[j] + i, 2);
-                copy_tile(cb_conv_w, taps + i * 4 + j, 3);
-                mul_binary_tile_init();
-                mul_binary_tile(2, 3, 2);
-                add_binary_tile_init();
-                add_binary_tile(1, 2, 1);
-            }
-            silu_tile_init();
-            silu_tile(1);
+            mul_binary_tile(2, 3, 2);
+            add_binary_tile_init();
+            add_binary_tile(1, 2, 1);
         }
+        silu_tile_init();
+        silu_tile(1);
         tile_regs_commit();
         tile_regs_wait();
-        pack_tile(conv ? 1 : 0, cb_qkvz_out);
-        if (conv) {
-            pack_tile<true>(0, cb_conv_hist, slot[0] + i);  // newest input overwrites the oldest
-        }
+        pack_tile(1, cb_qkvz_out_full);
+        pack_tile<true>(0, cb_conv_hist_full, oldest);  // newest input overwrites the oldest
         tile_regs_release();
+        cb_push_back(cb_qkvz_out_full, 1);  // wraps the view's write pointer back to the base
     }
-    cb_push_back(cb_qkvz_out, nq_max);
-    cb_pop_front(cb_qkvz, nq_max);
+    if (n_conv < nq) {
+        reconfig_full_operand(cb_qkvz, cb_qkvz);
+        pack_reconfig_data_format<true>(cb_qkvz_out);
+        pack_init(cb_qkvz_out);
+        copy_init(cb_qkvz);
+        for (uint32_t i = n_conv; i < nq; i++) {
+            tile_regs_acquire();
+            copy_tile(cb_qkvz, i, 0);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile<true>(0, cb_qkvz_out, i);
+            tile_regs_release();
+        }
+    }
+    pack_reconfig_data_format<true>(cb_qkvz_out);
+    cb_push_back(cb_qkvz_out, kBlk);
+    cb_pop_front(cb_qkvz, kBlk);
     conv_step[set] = c + 1;
 }
 
@@ -255,7 +276,7 @@ void kernel_main() {
     const uint32_t nd = get_arg_val<uint32_t>(1);
     const uint32_t pout_off = get_arg_val<uint32_t>(2);
     const uint32_t nq = get_arg_val<uint32_t>(3);
-    const uint32_t q_off = get_arg_val<uint32_t>(4);
+    const uint32_t n_conv = get_arg_val<uint32_t>(4);
 #ifdef TRISC_UNPACK
     {
         auto& w = get_local_cb_interface(cb_w0);
@@ -270,24 +291,24 @@ void kernel_main() {
     custom_mm_block_init<false, true, false>(cb_h, Entry<0>::cb, cb_qkvz);
     custom_mm_block_uninit<false>();
     cb_wait_front(cb_gamma, weight_sets * 2 * Ht);
-    cb_wait_front(cb_conv_w, weight_sets * nq_max * 4);
+    cb_wait_front(cb_conv_w, weight_sets * 4 * kBlk);
 
     for (uint32_t l = 0; l < layers; l++) {
         const uint32_t set = l % weight_sets;
         // attention half
         sum_slots();
         rmsnorm(set * 2);
-        matmul<kQkvz>(cb_h, cb_qkvz, nq, nq_max);
+        matmul<kQkvz>(cb_h, cb_qkvz, nq, kBlk);
         cb_pop_front(cb_h, Ht);
-        conv_pass(set, nq, q_off);
+        conv_pass(set, nq, n_conv);
         project_to_partial<kOut>(cb_o_in, Ot, nd, pout_off);
         cb_pop_front(cb_x, Ht);
         // mlp half
         sum_slots();
         rmsnorm(set * 2 + 1);
-        matmul<kGateUp>(cb_h, cb_gu, 2 * ng, 2 * ng_max);
+        matmul<kGateUp>(cb_h, cb_g, 2 * ng, kBlk, cb_u, ng);
         cb_pop_front(cb_h, Ht);
-        silu_mul(ng);
+        silu_mul();
         project_to_partial<kDown>(cb_act, It, nd, pout_off);
         cb_pop_front(cb_x, Ht);
     }

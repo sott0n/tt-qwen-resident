@@ -23,7 +23,6 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3_b1.tests.unit_tests.test_dram_streaming_matmul import shuffle_tensor_tiles
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/resident_mlp.jsonl")
 KDIR = "models/experimental/qwen36_resident/kernels/"
@@ -32,7 +31,7 @@ TILE_BYTES = {ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 HIDDEN = 5120
 INTER = 17408  # full MLP width; each chip holds INTER / num_chips
 EPS = 1e-6
-PER_BANK = 2
+PER_BANK = int(os.environ.get("RESIDENT_PER_BANK", "4"))  # streamer cores per DRAM bank
 L1_WEIGHT_BUDGET = 1_000_000
 SEM_SLOTS, SEM_ACT, SEM_GATHER, SEM_FLAG = 0, 1, 2, 3
 GU_DT, DOWN_DT = ttnn.bfloat4_b, ttnn.bfloat8_b
@@ -42,7 +41,11 @@ def f32_bits(v):
     return struct.unpack("<I", struct.pack("<f", v))[0]
 
 
-def block_geometry(Kt, dtype, max_block=20_000, max_page=16_384):
+MAX_PAGE = int(os.environ.get("RESIDENT_MAX_PAGE", "8192"))  # DRAM read packet size cap
+
+
+def block_geometry(Kt, dtype, max_block=20_000, max_page=None):
+    max_page = max_page or MAX_PAGE
     tb = TILE_BYTES[dtype]
     sb = max(d for d in range(2, Kt + 1, 2) if Kt % d == 0 and d * tb <= max_block)
     block = sb * tb
@@ -52,31 +55,83 @@ def block_geometry(Kt, dtype, max_block=20_000, max_page=16_384):
     return sb, block // page, page, block
 
 
-def split(n, parts):
-    """(count, first) of `parts` contiguous pieces of n."""
+def interleaved_bank_layout(w, core_cols, sb):
+    """DRAM layout of a weight [K, N] for WIDTH_SHARDED banks read by PER_BANK cores each.
+
+    core_cols[bank][j] lists the tile columns of w that core j of the bank streams, in order. Each core
+    reads its columns as K blocks of sb tiles; the bank's cores' blocks are interleaved, slot
+    r * PER_BANK + j holding block r of core j, so the cores of a bank read neighbouring addresses at
+    the same time (disjoint per-core regions cost ~30% of the bank's bandwidth). Slots of cores with
+    fewer columns stay zero. Returns [K, banks * width] whose row-major tilized shards hold the slots
+    in order, width = PER_BANK x the largest per-core column count.
+    """
+    K, _ = w.shape
+    Kt = K // TILE
+    nkb = Kt // sb
+    tiles = w.reshape(Kt, TILE, -1, TILE).permute(0, 2, 1, 3)  # [Kt, Nt, 32, 32]
+    width = PER_BANK * max(len(c) for cols in core_cols for c in cols)
+    zero = torch.zeros(TILE, TILE)
+    shards = []
+    for cols in core_cols:
+        lin = [zero] * (Kt * width)
+        for j, cj in enumerate(cols):
+            for t, col in enumerate(cj):
+                for kb in range(nkb):
+                    slot = (t * nkb + kb) * PER_BANK + j
+                    for i in range(sb):
+                        lin[slot * sb + i] = tiles[kb * sb + i, col]
+        grid = torch.stack(lin).reshape(Kt, width, TILE, TILE).permute(0, 2, 1, 3)
+        shards.append(grid.reshape(K, width * TILE))
+    return torch.cat(shards, dim=1), width
+
+
+def bank_core_cols(total_tiles, banks, offset=0, first_extra=0):
+    """core_cols for column tiles [0, total_tiles) split bank-major, then contiguously over PER_BANK cores."""
+    per_bank = total_tiles // banks
+    return [
+        [
+            list(range(offset + b * per_bank + f, offset + b * per_bank + f + c))
+            for c, f in split(per_bank, PER_BANK, first_extra)
+        ]
+        for b in range(banks)
+    ]
+
+
+def gate_up_core_cols(it_total, banks, first_extra=0):
+    """core_cols of cat(G, U): each core streams its gate tiles, then its up tiles."""
+    g = bank_core_cols(it_total, banks, first_extra=first_extra)
+    u = bank_core_cols(it_total, banks, offset=it_total, first_extra=first_extra)
+    return [[gj + uj for gj, uj in zip(gb, ub)] for gb, ub in zip(g, u)]
+
+
+def split(n, parts, first_extra=0):
+    """(count, first) of `parts` contiguous pieces of n; the n % parts larger pieces start at part first_extra
+    (cyclically), so entries with a remainder can put it on different cores."""
     q, r = divmod(n, parts)
     out, first = [], 0
     for j in range(parts):
-        c = q + (j < r)
+        c = q + ((j - first_extra) % parts < r)
         out.append((c, first))
         first += c
     return out
 
 
 def streamer_cores(device):
+    """PER_BANK cores per DRAM bank: the bank-adjacent core plus its nearest free cores (column first)."""
     primary = device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0)
     grid = device.compute_with_storage_grid_size()
     used = {(c.x, c.y) for c in primary}
     groups = []
     for c in primary:
         g = [ttnn.CoreCoord(c.x, c.y)]
-        for dy in (1, -1, 2, -2, 3, -3):
-            if len(g) == PER_BANK:
-                break
-            y = c.y + dy
-            if 0 <= y < grid.y and (c.x, y) not in used:
-                used.add((c.x, y))
-                g.append(ttnn.CoreCoord(c.x, y))
+        near = sorted(
+            ((x, y) for x in range(grid.x) for y in range(grid.y) if (x, y) not in used),
+            key=lambda p: (abs(p[0] - c.x) * 2 + abs(p[1] - c.y), p),
+        )
+        for x, y in near[: PER_BANK - 1]:
+            used.add((x, y))
+            g.append(ttnn.CoreCoord(x, y))
+        assert len(g) == PER_BANK
         groups.append(g)
     return groups, used
 
@@ -100,17 +155,6 @@ def make_weights(num_chips, sets, banks, seed=0):
         gamma = (1.0 + 0.1 * torch.randn(HIDDEN, generator=g)).bfloat16().float()
         out.append((chips, gamma))
     return out
-
-
-def arrange_gate_up(G, U, banks):
-    """[H, 2 I_c] with, per bank and per core of the bank, [gate tiles of the core | up tiles of the core]."""
-    it_bank = G.shape[1] // TILE // banks
-    cols = []
-    for b in range(banks):
-        for cnt, first in split(it_bank, PER_BANK):
-            t0 = (b * it_bank + first) * TILE
-            cols += [G[:, t0 : t0 + cnt * TILE], U[:, t0 : t0 + cnt * TILE]]
-    return torch.cat(cols, dim=1)
 
 
 def torch_reference(x0, weights, layers):
@@ -186,16 +230,18 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
 
     dram_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))})
 
-    def dram_weight(per_chip, dtype):
-        k, cols = per_chip[0].shape
+    geo = [block_geometry(Ht, GU_DT), block_geometry(It, DOWN_DT)]
+
+    def dram_weight(per_chip, dtype, core_cols, sb):
+        laid = [interleaved_bank_layout(w, core_cols, sb) for w in per_chip]
+        k, width = per_chip[0].shape[0], laid[0][1]
         mc = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.WIDTH_SHARDED,
             ttnn.BufferType.DRAM,
-            ttnn.ShardSpec(dram_grid, [k, cols // banks], ttnn.ShardOrientation.ROW_MAJOR),
+            ttnn.ShardSpec(dram_grid, [k, width * TILE], ttnn.ShardOrientation.ROW_MAJOR),
         )
-        stacked = torch.stack([shuffle_tensor_tiles(w.reshape(1, 1, k, cols), TILE, banks)[0, 0] for w in per_chip])
         return ttnn.from_torch(
-            stacked.unsqueeze(1),
+            torch.stack([t for t, _ in laid]).unsqueeze(1),
             dtype=dtype,
             layout=ttnn.TILE_LAYOUT,
             device=mesh,
@@ -203,14 +249,16 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
             mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
         )
 
-    w_gu = [dram_weight([arrange_gate_up(G, U, banks) for G, U, _ in chips], GU_DT) for chips, _ in weights]
-    w_d = [dram_weight([D for _, _, D in chips], DOWN_DT) for chips, _ in weights]
+    gu_cols, d_cols = gate_up_core_cols(It, banks), bank_core_cols(Ht, banks)
+    w_gu = [
+        dram_weight([torch.cat([G, U], dim=1) for G, U, _ in chips], GU_DT, gu_cols, geo[0][0]) for chips, _ in weights
+    ]
+    w_d = [dram_weight([D for _, _, D in chips], DOWN_DT, d_cols, geo[1][0]) for chips, _ in weights]
 
-    geo = [block_geometry(Ht, GU_DT), block_geometry(It, DOWN_DT)]
     lcm = math.lcm(*TILE_BYTES.values())
     ring_bytes = (L1_WEIGHT_BUDGET // lcm) * lcm
-    ng_max = split(it_bank, PER_BANK)[0][0]
-    nd_max = split(ht_bank, PER_BANK)[0][0]
+    ng_max = max(c for c, _ in split(it_bank, PER_BANK))
+    nd_max = max(c for c, _ in split(ht_bank, PER_BANK))
 
     def cb(idx, pages, page=64, dtype=ttnn.bfloat16, tiled=True):
         fmt = ttnn.CBFormatDescriptor(
@@ -292,14 +340,9 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
             bank, j = divmod(i, PER_BANK)
             ng, gfirst = split(it_bank, PER_BANK)[j]
             nd, dfirst = split(ht_bank, PER_BANK)[j]
-            reader_rt[c.x][c.y] = [
-                bank,
-                i & 0x3,
-                2 * ng,
-                2 * gfirst * Ht * TILE_BYTES[GU_DT],
-                nd,
-                dfirst * It * TILE_BYTES[DOWN_DT],
-            ] + [t.buffer_address() for s in range(sets) for t in (w_gu[s], w_d[s])]
+            reader_rt[c.x][c.y] = [bank, i & 0x3, j, PER_BANK, 2 * ng, nd] + [
+                t.buffer_address() for s in range(sets) for t in (w_gu[s], w_d[s])
+            ]
             writer_rt[c.x][c.y] = [
                 ng,
                 bank * it_bank + gfirst,
@@ -433,7 +476,7 @@ def run_case(mesh, layers_short, layers_long, sets=2):
     n = mesh.get_num_devices()
     banks = mesh.dram_grid_size().x
     weights = make_weights(n, sets, banks)
-    x0 = torch.randn(HIDDEN).bfloat16().float()
+    x0 = torch.randn(HIDDEN, generator=torch.Generator().manual_seed(1)).bfloat16().float()
     run_s, res_s, info = build(mesh, weights, x0, layers_short)
     run_l, res_l, _ = build(mesh, weights, x0, layers_long)
     logger.info(info)

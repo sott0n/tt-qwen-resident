@@ -22,7 +22,6 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.demos.deepseek_v3_b1.tests.unit_tests.test_dram_streaming_matmul import shuffle_tensor_tiles
 from models.experimental.qwen36_resident.tests.bench_resident_mlp import (
     DOWN_DT,
     EPS,
@@ -33,9 +32,11 @@ from models.experimental.qwen36_resident.tests.bench_resident_mlp import (
     PER_BANK,
     TILE,
     TILE_BYTES,
-    arrange_gate_up,
+    bank_core_cols,
     block_geometry,
     f32_bits,
+    gate_up_core_cols,
+    interleaved_bank_layout,
     pcc,
     quantize,
     split,
@@ -47,7 +48,7 @@ OUT = os.environ.get("BENCH_OUT", "/tmp/resident_gdn.jsonl")
 KDIR = "models/experimental/qwen36_resident/kernels/"
 NK, NV, DK, DV, CONV_K = 16, 48, 128, 128, 4
 QKVZ_DT, OUT_DT = ttnn.bfloat8_b, ttnn.bfloat8_b
-SEM_SLOTS, SEM_ACT, SEM_GATHER, SEM_FLAG, SEM_HEADS, SEM_ROWS = range(6)
+SEM_SLOTS, SEM_ACT, SEM_GATHER, SEM_FLAG, SEM_HEADS, SEM_ROWS, SEM_STATE = range(7)
 HEAD_FP32_CBS = (5, 6, 7, 15, 30, 31)
 FP32_ACC = os.environ.get("RESIDENT_FP32_ACC", "1") == "1"
 STREAMER_FIDELITY = getattr(ttnn.MathFidelity, os.environ.get("RESIDENT_FIDELITY", "HiFi4"))
@@ -163,7 +164,7 @@ def torch_reference(x0, d, weights, layers, bf16_dataflow=False):
     return x
 
 
-def build(mesh, d, weights, x0, layers, packet_bytes=4096):
+def build(mesh, d, weights, x0, layers, packet_bytes=4096, timeline=False):
     n, banks = d.n, d.banks
     groups, used = streamer_cores(mesh)
     cores = [c for grp in groups for c in grp]
@@ -207,8 +208,12 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
 
     # ---- per-core column assignment
     q_bank, ht_bank, it_bank = d.row_tiles // banks, d.Ht // banks, d.It // banks
-    nq_split, nd_split, ng_split = split(q_bank, PER_BANK), split(ht_bank, PER_BANK), split(it_bank, PER_BANK)
-    nq_max, nd_max, ng_max = nq_split[0][0], nd_split[0][0], ng_split[0][0]
+    # the remainder columns of qkvzab and gate|up go to different cores of the bank: a bank's cores share
+    # its bandwidth evenly, so the core with the most bytes per layer paces the whole layer
+    g_extra = q_bank % PER_BANK
+    nq_split, nd_split = split(q_bank, PER_BANK), split(ht_bank, PER_BANK)
+    ng_split = split(it_bank, PER_BANK, g_extra)
+    nq_max, nd_max, ng_max = (max(c for c, _ in sp) for sp in (nq_split, nd_split, ng_split))
 
     # ---- streamer tensors
     slots0 = torch.zeros(S, n * HIDDEN)
@@ -222,7 +227,8 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
         grid,
         [1, sets * 2 * HIDDEN],
     )
-    conv_w = torch.zeros(n, S, sets * nq_max * CONV_K * TILE)
+    blk = TILE * TILE  # one 32x32 tile's worth of 1x32 tiles
+    conv_w = torch.zeros(n, S, sets * CONV_K * blk)
     for c in range(n):
         for i in range(S):
             bank, j = divmod(i, PER_BANK)
@@ -234,10 +240,10 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
                     if g >= d.conv_tiles:
                         continue
                     for tap in range(CONV_K):
-                        o = ((s * nq_max + t) * CONV_K + tap) * TILE
+                        o = (s * CONV_K + tap) * blk + t * TILE
                         conv_w[c, i, o : o + TILE] = taps[g * TILE : (g + 1) * TILE, tap]
-    conv_w_t = sharded(conv_w.reshape(n * S, -1), grid, [1, sets * nq_max * CONV_K * TILE], mapper=per_chip)
-    hist_t = sharded(torch.zeros(S, sets * 3 * nq_max * TILE), grid, [1, sets * 3 * nq_max * TILE])
+    conv_w_t = sharded(conv_w.reshape(n * S, -1), grid, [1, sets * CONV_K * blk], mapper=per_chip)
+    hist_t = sharded(torch.zeros(S, sets * 3 * blk), grid, [1, sets * 3 * blk])
 
     # ---- head tensors
     rows_t = sharded(torch.zeros(d.nv, d.row_cols), head_grid, [1, d.row_cols])
@@ -267,6 +273,38 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
         norm_w.reshape(n * d.nv * TILE, -1), head_grid, [TILE, sets * 4 * TILE], tile=full, mapper=per_chip
     )
 
+    # optional per-core timeline (16 uint32 per layer, see the streamer reader/writer)
+    ts_t = None
+    if timeline:
+        ts_t = ttnn.from_torch(
+            torch.zeros(S, layers * 16, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh,
+            mesh_mapper=rep,
+            memory_config=ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.BufferType.L1,
+                ttnn.ShardSpec(grid, [1, layers * 16], ttnn.ShardOrientation.ROW_MAJOR),
+            ),
+        )
+    ts_addr = ts_t.buffer_address() if timeline else 0
+    hts_t = None
+    if timeline:
+        hts_t = ttnn.from_torch(
+            torch.zeros(d.nv, layers * 4, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh,
+            mesh_mapper=rep,
+            memory_config=ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+                ttnn.BufferType.L1,
+                ttnn.ShardSpec(head_grid, [1, layers * 4], ttnn.ShardOrientation.ROW_MAJOR),
+            ),
+        )
+    hts_addr = hts_t.buffer_address() if timeline else 0
+
     # ---- hub
     hub_slots = ttnn.from_torch(
         torch.zeros(2 * n, HIDDEN),
@@ -285,16 +323,19 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
     # ---- DRAM weights (per chip), column slices bank-major
     dram_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))})
 
-    def dram_weight(mats, dtype):
-        k, cols = mats[0].shape
+    entries = [(d.Ht, QKVZ_DT), (d.Ot, OUT_DT), (d.Ht, GU_DT), (d.It, DOWN_DT)]
+    geo = [block_geometry(Kt, dt) for Kt, dt in entries]
+
+    def dram_weight(mats, dtype, core_cols, sb):
+        laid = [interleaved_bank_layout(m, core_cols, sb) for m in mats]
+        k, width = mats[0].shape[0], laid[0][1]
         mc = ttnn.MemoryConfig(
             ttnn.TensorMemoryLayout.WIDTH_SHARDED,
             ttnn.BufferType.DRAM,
-            ttnn.ShardSpec(dram_grid, [k, cols // banks], ttnn.ShardOrientation.ROW_MAJOR),
+            ttnn.ShardSpec(dram_grid, [k, width * TILE], ttnn.ShardOrientation.ROW_MAJOR),
         )
-        stacked = torch.stack([shuffle_tensor_tiles(m.reshape(1, 1, k, cols), TILE, banks)[0, 0] for m in mats])
         return ttnn.from_torch(
-            stacked.unsqueeze(1),
+            torch.stack([t for t, _ in laid]).unsqueeze(1),
             dtype=dtype,
             layout=ttnn.TILE_LAYOUT,
             device=mesh,
@@ -302,20 +343,23 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
             mesh_mapper=per_chip,
         )
 
+    cols = [
+        bank_core_cols(d.row_tiles, banks),
+        bank_core_cols(d.Ht, banks),
+        gate_up_core_cols(d.It, banks, g_extra),
+        bank_core_cols(d.Ht, banks),
+    ]
     w_dram = []
     for w in weights:
         ch = w["chips"]
-        w_dram.append(
-            [
-                dram_weight([c["Wq"] for c in ch], QKVZ_DT),
-                dram_weight([c["Wo"] for c in ch], OUT_DT),
-                dram_weight([arrange_gate_up(c["G"], c["U"], banks) for c in ch], GU_DT),
-                dram_weight([c["D"] for c in ch], DOWN_DT),
-            ]
-        )
+        mats = [
+            [c["Wq"] for c in ch],
+            [c["Wo"] for c in ch],
+            [torch.cat([c["G"], c["U"]], dim=1) for c in ch],
+            [c["D"] for c in ch],
+        ]
+        w_dram.append([dram_weight(m, dt, cc, g[0]) for m, (_, dt), cc, g in zip(mats, entries, cols, geo)])
 
-    entries = [(d.Ht, QKVZ_DT), (d.Ot, OUT_DT), (d.Ht, GU_DT), (d.It, DOWN_DT)]
-    geo = [block_geometry(Kt, dt) for Kt, dt in entries]
     lcm = math.lcm(*TILE_BYTES.values())
     ring_bytes = (L1_WEIGHT_BUDGET // lcm) * lcm
 
@@ -345,6 +389,12 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
             ],
         )
 
+    def with_full_view(desc, full_idx):
+        desc.format_descriptors = list(desc.format_descriptors) + [
+            ttnn.CBFormatDescriptor(buffer_index=full_idx, data_format=ttnn.bfloat16, page_size=full_page)
+        ]
+        return desc
+
     gamma_cb = ttnn.cb_descriptor_from_sharded_tensor(11, gamma_t)
     gamma_cb.format_descriptors = list(gamma_cb.format_descriptors) + [
         ttnn.CBFormatDescriptor(buffer_index=14, data_format=ttnn.bfloat16, page_size=full_page)
@@ -370,12 +420,13 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
         tiny_cb(9, nd_max),
         tiny_cb(10, nd_max),
         gamma_cb,
-        tiny_cb(15, 2 * ng_max),
-        tiny_cb(16, ng_max),
-        tiny_cb(17, nq_max),
-        tiny_cb(18, nq_max),
-        ttnn.cb_descriptor_from_sharded_tensor(19, conv_w_t),
-        ttnn.cb_descriptor_from_sharded_tensor(20, hist_t),
+        aliased(15, 27, TILE),  # gate block | 32x32 view
+        aliased(26, 28, TILE),  # up block
+        aliased(16, 29, TILE),  # silu(g) * u block
+        aliased(17, 22, TILE),  # qkvzab columns
+        aliased(18, 23, TILE),  # after conv1d + silu
+        with_full_view(ttnn.cb_descriptor_from_sharded_tensor(19, conv_w_t), 24),
+        with_full_view(ttnn.cb_descriptor_from_sharded_tensor(20, hist_t), 25),
         ttnn.cb_descriptor_from_sharded_tensor(21, o_in_t),
     ]
     bf, f32 = (ttnn.bfloat16, 2048), (ttnn.float32, 4096)
@@ -426,7 +477,7 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=22, data_format=ttnn.bfloat16, page_size=4 * 64)],
         )
     )
-    sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_grid, initial_value=0) for i in range(6)]
+    sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_grid, initial_value=0) for i in range(7)]
 
     head_unpack = type(ttnn.ComputeConfigDescriptor().unpack_to_dest_mode)([ttnn.UnpackToDestMode.Default] * 64)
     for i in HEAD_FP32_CBS:
@@ -474,18 +525,11 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
             nq, qf = nq_split[j]
             nd, dfirst = nd_split[j]
             ng, gfirst = ng_split[j]
-            reader_rt[c.x][c.y] = [
-                bank,
-                i & 0x3,
-                nq,
-                qf * d.Ht * TILE_BYTES[QKVZ_DT],
-                nd,
-                dfirst * d.Ot * TILE_BYTES[OUT_DT],
-                2 * ng,
-                2 * gfirst * d.Ht * TILE_BYTES[GU_DT],
-                nd,
-                dfirst * d.It * TILE_BYTES[DOWN_DT],
-            ] + [t.buffer_address() for s in range(sets) for t in w_dram[s]]
+            reader_rt[c.x][c.y] = (
+                [bank, i & 0x3, j, PER_BANK, nq, nd, 2 * ng, nd]
+                + [t.buffer_address() for s in range(sets) for t in w_dram[s]]
+                + [ts_addr]
+            )
             writer_rt[c.x][c.y] = (
                 [
                     ng,
@@ -502,8 +546,10 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
                 ]
                 + head_xy
                 + peers
+                + [ts_addr]
             )
-            compute_rt[c.x][c.y] = [ng, nd, bank * ht_bank + dfirst, nq, bank * q_bank + qf]
+            n_conv = max(0, min(nq, d.conv_tiles - (bank * q_bank + qf)))
+            compute_rt[c.x][c.y] = [ng, nd, bank * ht_bank + dfirst, nq, n_conv]
 
         head_r, head_w = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         group = d.nv // d.nk
@@ -514,20 +560,24 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
             for w in weights:
                 cw = w["chips"][chip]
                 gates += [f32_bits(float(cw["dt"][hh])), f32_bits(float(cw["neg_a"][hh]))]
-            head_r[c.x][c.y] = [
-                rows_t.buffer_address(),
-                state_t.buffer_address(),
-                norm_w_t.buffer_address(),
-                kh * 4,
-                d.qd // TILE + kh * 4,
-                2 * d.qd // TILE + hh * 4,
-                d.z0 // TILE + hh * 4,
-                a_col // TILE,
-                a_col % TILE,
-                b_col // TILE,
-                b_col % TILE,
-            ] + gates
-            head_w[c.x][c.y] = [state_t.buffer_address(), o_in_t.buffer_address(), hh] + peers
+            head_r[c.x][c.y] = (
+                [
+                    rows_t.buffer_address(),
+                    state_t.buffer_address(),
+                    norm_w_t.buffer_address(),
+                    kh * 4,
+                    d.qd // TILE + kh * 4,
+                    2 * d.qd // TILE + hh * 4,
+                    d.z0 // TILE + hh * 4,
+                    a_col // TILE,
+                    a_col % TILE,
+                    b_col // TILE,
+                    b_col % TILE,
+                ]
+                + gates
+                + [hts_addr]
+            )
+            head_w[c.x][c.y] = [state_t.buffer_address(), o_in_t.buffer_address(), hh] + peers + [hts_addr]
 
         compute = ttnn.ComputeConfigDescriptor()
         # custom_mm is LoFi by construction (no fidelity phases); the fidelity only applies to the
@@ -600,14 +650,14 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
             kernel(
                 "gdn_head_reader.cpp",
                 head_grid,
-                head_ct + [SEM_ROWS],
+                head_ct + [SEM_ROWS, SEM_STATE],
                 head_r,
                 dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.RISCV_1_default),
             ),
             kernel(
                 "gdn_head_writer.cpp",
                 head_grid,
-                head_ct + [SEM_HEADS],
+                head_ct + [SEM_HEADS, SEM_STATE],
                 head_w,
                 dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.RISCV_0_default),
             ),
@@ -628,25 +678,29 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
                 args.append(0)
         mesh_pd[ttnn.MeshCoordinateRange(coord, coord)] = program
 
-    io = [slots_t, act_t, o_in_t, gamma_t, conv_w_t, hist_t, rows_t, state_t, norm_w_t, hub_slots] + [
-        t for ws in w_dram for t in ws
-    ]
+    io = (
+        ([ts_t, hts_t] if timeline else [])
+        + [slots_t, act_t, o_in_t, gamma_t, conv_w_t, hist_t, rows_t, state_t, norm_w_t, hub_slots]
+        + [t for ws in w_dram for t in ws]
+    )
     state_host = ttnn.from_torch(
         state.reshape(n * d.nv * TILE, -1), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, tile=full, mesh_mapper=per_chip
     )
     hist_host = ttnn.from_torch(
-        torch.zeros(S, sets * 3 * nq_max * TILE),
+        torch.zeros(S, sets * 3 * blk),
         dtype=ttnn.bfloat16,
         layout=ttnn.TILE_LAYOUT,
         tile=tiny,
         mesh_mapper=rep,
     )
 
-    def run(keep=(ccl_sem,)):
-        # every launch starts from the same x, recurrent states and conv history
-        ttnn.copy_host_to_device_tensor(slots_host, slots_t)
-        ttnn.copy_host_to_device_tensor(state_host, state_t)
-        ttnn.copy_host_to_device_tensor(hist_host, hist_t)
+    def run(reset=True, keep=(ccl_sem,)):
+        # a checked launch starts from the same x, recurrent states and conv history; timed launches
+        # skip the (large, variable) host uploads
+        if reset:
+            ttnn.copy_host_to_device_tensor(slots_host, slots_t)
+            ttnn.copy_host_to_device_tensor(state_host, state_t)
+            ttnn.copy_host_to_device_tensor(hist_host, hist_t)
         ttnn.generic_op(io, mesh_pd)
 
     def result():
@@ -664,6 +718,9 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096):
         )
     )
     info = dict(chips=n, streamers=S, heads=len(heads), hub=(hub.x, hub.y), bytes_per_layer_per_chip=weight_bytes)
+    if timeline:
+        info["timeline"] = lambda: ttnn.to_torch(ts_t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
+        info["head_timeline"] = lambda: ttnn.to_torch(hts_t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
     return run, result, info
 
 
@@ -671,21 +728,25 @@ def run_case(mesh, layers_short, layers_long, sets=2):
     n = mesh.get_num_devices()
     d = Dims(n, mesh.dram_grid_size().x)
     weights = make_weights(d, sets)
-    x0 = torch.randn(HIDDEN).bfloat16().float()
+    x0 = torch.randn(HIDDEN, generator=torch.Generator().manual_seed(1)).bfloat16().float()
     times, checks = {}, {}
     for L in (layers_short, layers_long):
         # one build at a time: the L1 tensors of a build are only freed with its closures
         run, res, info = build(mesh, d, weights, x0, L)
-        times[L] = timed(mesh, run)
+        times[L] = timed(mesh, lambda: run(reset=False), reps=5)
         run()
         ttnn.synchronize_device(mesh)
         got = res()
+        run()
+        ttnn.synchronize_device(mesh)
+        repeat_exact = torch.equal(got, res())
         ref = torch_reference(x0, d, weights, L)
         ref_bf = torch_reference(x0, d, weights, L, bf16_dataflow=True)
         checks[L] = dict(
             pcc=pcc(got, ref),
             rel_err=((got - ref).norm() / ref.norm()).item(),
             rel_err_vs_bf16_dataflow=((got - ref_bf).norm() / ref_bf.norm()).item(),
+            repeat_exact=repeat_exact,
         )
         del run, res
         gc.collect()
@@ -708,4 +769,4 @@ def run_case(mesh, layers_short, layers_long, sets=2):
 @pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
 def test_resident_gdn_4chip(mesh_device):
     rec = run_case(mesh_device, 2, 10)
-    assert all(c["pcc"] > 0.99 for c in rec["checks"].values())
+    assert all(c["pcc"] > 0.99 and c["repeat_exact"] for c in rec["checks"].values())

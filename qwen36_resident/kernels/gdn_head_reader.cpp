@@ -9,10 +9,12 @@
 //   - the set's norm weight and recurrent state (kept in this core's L1) are copied in.
 // The ones and row-0 mask constants are built once.
 //
-// Compile-time args: 0 Kt, 1 Vt, 2 layers, 3 weight_sets, 4 num_streamers, 5 sem_rows
+// Compile-time args: 0 Kt, 1 Vt, 2 layers, 3 weight_sets, 4 num_streamers, 5 sem_rows, 6 sem_state (count of
+//   state write-backs done by the writer; a set is re-read only after its previous write-back)
 // Runtime args: 0 rows_addr, 1 state_addr (weight_sets x Kt*Vt fp32 tiles), 2 norm_w_addr (weight_sets x Vt
 //   bf16 row-0 tiles), 3 q_tile, 4 k_tile, 5 v_tile, 6 z_tile, 7 a_tile, 8 a_elem, 9 b_tile, 10 b_elem,
-//   then weight_sets x (dt_bias_h bits, neg_exp_A_h bits)
+//   then weight_sets x (dt_bias_h bits, neg_exp_A_h bits), then an optional timeline buffer (0 = off):
+//   per layer 4 words, the reader writes [0] rows arrived, [1] inputs pushed
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -25,6 +27,7 @@ constexpr uint32_t layers = get_compile_time_arg_val(2);
 constexpr uint32_t weight_sets = get_compile_time_arg_val(3);
 constexpr uint32_t num_streamers = get_compile_time_arg_val(4);
 constexpr uint32_t sem_rows = get_compile_time_arg_val(5);
+constexpr uint32_t sem_state = get_compile_time_arg_val(6);
 constexpr uint32_t st = Kt * Vt;
 
 constexpr uint32_t cb_q_in = 0, cb_k_in = 1, cb_v_in = 2, cb_z_in = 3, cb_norm_w = 4, cb_s_in = 5;
@@ -93,6 +96,9 @@ void kernel_main() {
     const uint32_t b_tile = get_arg_val<uint32_t>(9);
     const uint32_t b_elem = get_arg_val<uint32_t>(10);
     constexpr uint32_t gates_base = 11;
+    const uint32_t ts_addr = get_arg_val<uint32_t>(gates_base + 2 * weight_sets);
+    volatile tt_l1_ptr uint32_t* ts = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ts_addr);
+    volatile uint32_t* clk = reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
 
     // Rows 1..31 of the row-0 input tiles are never written again: zero them once (the rank-1 update
     // multiplies them by zero, so they must be finite).
@@ -113,11 +119,23 @@ void kernel_main() {
     cb_push_back(cb_row_mask, 1);
 
     volatile tt_l1_ptr uint32_t* rows_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_rows));
+    volatile tt_l1_ptr uint32_t* state_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_state));
     volatile tt_l1_ptr uint16_t* a_row = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(rows + a_tile * kTiny);
     volatile tt_l1_ptr uint16_t* b_row = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(rows + b_tile * kTiny);
     for (uint32_t l = 0; l < layers; l++) {
         const uint32_t set = l % weight_sets;
+        // the layer's state and norm weight do not depend on the rows: land them first (once the set's
+        // previous update has been written back)
+        if (l >= weight_sets) {
+            noc_semaphore_wait_min(state_sem, l - weight_sets + 1);
+        }
+        push_copy(cb_s_mm, state + set * st * kF32Tile, st, kF32Tile);
+        push_copy(cb_s_in, state + set * st * kF32Tile, st, kF32Tile);
+        push_copy(cb_norm_w, norm_w + set * Vt * kBf16Tile, Vt, kBf16Tile);
         noc_semaphore_wait_min(rows_sem, num_streamers * (l + 1));
+        if (ts_addr) {
+            ts[l * 4 + 0] = *clk;
+        }
         place_rows(cb_q_in, rows, q_tile, Kt);
         place_rows(cb_k_in, rows, k_tile, Kt);
         // a/b are the only scalars read by the RISC: the row buffer is written by other cores
@@ -129,9 +147,9 @@ void kernel_main() {
         push_fill(cb_neg_a_full, get_arg_val<uint32_t>(gates_base + 2 * set + 1));
         push_fill(cb_b_full, b_bits);
         place_rows(cb_v_in, rows, v_tile, Vt);
-        push_copy(cb_s_mm, state + set * st * kF32Tile, st, kF32Tile);
-        push_copy(cb_s_in, state + set * st * kF32Tile, st, kF32Tile);
-        push_copy(cb_norm_w, norm_w + set * Vt * kBf16Tile, Vt, kBf16Tile);
         place_rows(cb_z_in, rows, z_tile, Vt);
+        if (ts_addr) {
+            ts[l * 4 + 1] = *clk;
+        }
     }
 }

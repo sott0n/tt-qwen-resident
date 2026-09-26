@@ -15,9 +15,9 @@
 //   0 layers, 1 weight_sets, 2 num_chips, 3 num_streamers, 4 Ht, 5 It (mlp inter tiles per chip),
 //   6 chip, 7 ring_bytes, 8 rms eps bits, 9 1/sqrt(hidden) bits, 10 sem_slots, 11 sem_act, 12 sem_gather,
 //   13 + 5e (e = 0 qkvzab, 1 out, 2 gate|up, 3 down): Kt, sb, pages, page_size, block_bytes,
-//   33 ng_max, 34 nd_max, 35 nq_max (qkvzab tiles per core), 36 conv_tiles (q|k|v tiles per chip),
-//   37 Ot (value_dim tiles = out-proj K tiles), 38 num_heads, 39 sem_heads, 40 row_tiles (padded
-//   qkvzab tiles per chip, the head cores' row buffer)
+//   33 ng_max, 34 nd_max, 35 nq_max (qkvzab tiles per core; ng_max, nq_max <= kBlk), 36 conv_tiles (q|k|v tiles per
+//   chip), 37 Ot (value_dim tiles = out-proj K tiles), 38 num_heads, 39 sem_heads, 40 row_tiles (padded qkvzab tiles
+//   per chip, the head cores' row buffer)
 #pragma once
 
 #include <stdint.h>
@@ -40,13 +40,25 @@ constexpr uint32_t cb_gamma = 11;  // weight_sets x 2 x Ht: [set][attn, mlp]
 constexpr uint32_t cb_x_full = 12;
 constexpr uint32_t cb_h_full = 13;
 constexpr uint32_t cb_gamma_full = 14;
-constexpr uint32_t cb_gu = 15;
+constexpr uint32_t cb_g = 15;  // gate columns of this core (one full-tile block of 1x32 tiles)
 constexpr uint32_t cb_aslice = 16;
 constexpr uint32_t cb_qkvz = 17;       // qkvzab matmul columns of this core
 constexpr uint32_t cb_qkvz_out = 18;   // after conv1d + silu (q|k|v columns) / passthrough (z, a, b)
-constexpr uint32_t cb_conv_w = 19;     // weight_sets x nq_max x 4 taps
-constexpr uint32_t cb_conv_hist = 20;  // weight_sets x 3 x nq_max previous inputs (ring of 3 per set)
+constexpr uint32_t cb_conv_w = 19;     // weight_sets x 4 taps x kBlk
+constexpr uint32_t cb_conv_hist = 20;  // weight_sets x 3 x kBlk previous inputs (ring of 3 per set)
 constexpr uint32_t cb_o_in = 21;       // attention output of all heads (Ot), written by the head cores
+constexpr uint32_t cb_u = 26;          // up columns of this core
+// The per-core column blocks of the elementwise phases (conv1d + silu, silu(g) * u) hold at most
+// kBlk 1x32 tiles and are laid out on a 32x32 tile's worth of bytes, so the SFPU math runs once on
+// the 32x32 views below instead of once per 1x32 tile (an SFPU op covers a full 32x32 tile).
+constexpr uint32_t kBlk = 32;
+constexpr uint32_t cb_qkvz_full = 22;
+constexpr uint32_t cb_qkvz_out_full = 23;
+constexpr uint32_t cb_conv_w_full = 24;     // [set][tap] full tiles
+constexpr uint32_t cb_conv_hist_full = 25;  // [set][slot] full tiles
+constexpr uint32_t cb_g_full = 27;
+constexpr uint32_t cb_u_full = 28;
+constexpr uint32_t cb_aslice_full = 29;
 constexpr uint32_t kUnit = 64;
 constexpr uint32_t kTileBytes = 64;
 
@@ -72,6 +84,8 @@ constexpr uint32_t num_heads = get_compile_time_arg_val(38);
 constexpr uint32_t sem_heads = get_compile_time_arg_val(39);
 constexpr uint32_t row_tiles = get_compile_time_arg_val(40);
 constexpr uint32_t Hf = Ht / 32;
+static_assert(
+    get_compile_time_arg_val(33) <= 32 && get_compile_time_arg_val(35) <= 32, "column blocks exceed one full tile");
 
 template <uint32_t E>
 struct Entry {
