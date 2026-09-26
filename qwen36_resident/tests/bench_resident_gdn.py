@@ -516,7 +516,7 @@ def build(mesh, d, weights, x0, layers, packet_bytes=4096, timeline=False):
         ]
         for (Kt, _), (sb, pages, page, block) in zip(entries, geo):
             ct += [Kt, sb, pages, page, block]
-        ct += [ng_max, nd_max, nq_max, d.conv_tiles, d.Ot, d.nv, SEM_HEADS, d.row_tiles, SEM_ROWS]
+        ct += [ng_max, nd_max, nq_max, d.conv_tiles, d.Ot, d.nv, SEM_HEADS, d.row_tiles, SEM_ROWS, d.nv]
         reader_rt, writer_rt, compute_rt = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
         peers = [v for p in phys for v in (p.x, p.y)]
         head_xy = [v for p in head_phys for v in (p.x, p.y)]

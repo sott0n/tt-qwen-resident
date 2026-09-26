@@ -32,7 +32,7 @@ HIDDEN = 5120
 INTER = 17408  # full MLP width; each chip holds INTER / num_chips
 EPS = 1e-6
 PER_BANK = int(os.environ.get("RESIDENT_PER_BANK", "4"))  # streamer cores per DRAM bank
-L1_WEIGHT_BUDGET = 1_000_000
+L1_WEIGHT_BUDGET = int(os.environ.get("RESIDENT_RING_BYTES", "1000000"))  # weight ring bytes per streamer
 SEM_SLOTS, SEM_ACT, SEM_GATHER, SEM_FLAG = 0, 1, 2, 3
 GU_DT, DOWN_DT = ttnn.bfloat4_b, ttnn.bfloat8_b
 

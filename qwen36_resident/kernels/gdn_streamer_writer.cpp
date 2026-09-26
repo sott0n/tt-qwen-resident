@@ -14,7 +14,8 @@
 // Runtime args: 0 ng, 1 act_off, 2 nd, 3 pout_off, 4 hub_x, 5 hub_y, 6 hub_slots, 7 act_addr, 8 nq,
 // 9 q_off (tile offset of this core's qkvzab columns), 10 head_rows_addr, then num_heads x (x, y) of the
 // head cores, then num_streamers x (x, y) of the streamers.
-// Extra compile-time arg: 41 sem_rows (head cores' row-arrival semaphore).
+// Extra compile-time args: 41 sem_rows (head cores' row-arrival semaphore), 42 o_writers (cores that write
+// o into this core's buffer, each bumping sem_heads once per layer).
 // Last runtime arg: optional timeline buffer (0 = off): per layer 8 wall-clock words at the phase
 // boundaries (slots, qkvzab row ready, heads done, attn partial sent, slots, act slice ready, act
 // complete, mlp partial sent), after the reader's 8 words.
@@ -25,6 +26,7 @@
 using namespace resident_gdn;
 
 constexpr uint32_t sem_rows = get_compile_time_arg_val(41);
+constexpr uint32_t o_writers = get_compile_time_arg_val(42);
 
 void kernel_main() {
     const uint32_t ng = get_arg_val<uint32_t>(0);
@@ -91,7 +93,7 @@ void kernel_main() {
             noc_semaphore_inc(get_noc_addr(hx, hy, rows_sem_addr), 1);
         }
         cb_pop_front(cb_qkvz_out, kBlk);
-        noc_semaphore_wait_min(heads_sem, num_heads * (l + 1));
+        noc_semaphore_wait_min(heads_sem, o_writers * (l + 1));
         mark(l, 2);
         cb_reserve_back(cb_o_in, Ot);
         cb_push_back(cb_o_in, Ot);
