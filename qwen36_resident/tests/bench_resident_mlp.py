@@ -117,23 +117,49 @@ def split(n, parts, first_extra=0):
 
 
 def streamer_cores(device):
-    """PER_BANK cores per DRAM bank: the bank-adjacent core plus its nearest free cores (column first)."""
+    """PER_BANK cores per DRAM bank. The banks' adjacent cores sit in two columns; each column's banks get
+    one compact block of two columns (the bank column and the next) by PER_BANK / 2 rows, the banks in row
+    order, so the hub's slot multicast covers all streamers with one rectangle per block."""
     primary = device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0)
     grid = device.compute_with_storage_grid_size()
-    used = {(c.x, c.y) for c in primary}
-    groups = []
-    for c in primary:
-        g = [ttnn.CoreCoord(c.x, c.y)]
-        near = sorted(
-            ((x, y) for x in range(grid.x) for y in range(grid.y) if (x, y) not in used),
-            key=lambda p: (abs(p[0] - c.x) * 2 + abs(p[1] - c.y), p),
-        )
-        for x, y in near[: PER_BANK - 1]:
-            used.add((x, y))
-            g.append(ttnn.CoreCoord(x, y))
-        assert len(g) == PER_BANK
-        groups.append(g)
+    assert PER_BANK % 2 == 0
+    rows = PER_BANK // 2
+    groups = [None] * len(primary)
+    used = set()
+    for x in sorted({c.x for c in primary}):
+        banks = sorted((c.y, i) for i, c in enumerate(primary) if c.x == x)
+        height = rows * len(banks)
+        top = min(max(round(sum(y for y, _ in banks) / len(banks) - height / 2), 0), grid.y - height)
+        assert x + 1 < grid.x and top >= 0
+        for k, (_, i) in enumerate(banks):
+            g = [ttnn.CoreCoord(x + dx, top + k * rows + dy) for dy in range(rows) for dx in range(2)]
+            used |= {(c.x, c.y) for c in g}
+            groups[i] = g
+    assert len(used) == PER_BANK * len(primary)
     return groups, used
+
+
+def rect_cover(mesh, cores):
+    """rectangles covering exactly `cores` (logical), as hub multicast args: count, then per rectangle
+    noc x0, y0, x1, y1 (physical) and its number of cores"""
+    left = {(c.x, c.y) for c in cores}
+    out = []
+    for y, x in sorted((c.y, c.x) for c in cores):
+        if (x, y) not in left:
+            continue
+        x1 = x
+        while (x1 + 1, y) in left:
+            x1 += 1
+        y1 = y
+        while all((xx, y1 + 1) in left for xx in range(x, x1 + 1)):
+            y1 += 1
+        for yy in range(y, y1 + 1):
+            for xx in range(x, x1 + 1):
+                left.discard((xx, yy))
+        p0 = mesh.worker_core_from_logical_core(ttnn.CoreCoord(x, y))
+        p1 = mesh.worker_core_from_logical_core(ttnn.CoreCoord(x1, y1))
+        out += [p0.x, p0.y, p1.x, p1.y, (x1 - x + 1) * (y1 - y + 1)]
+    return [len(out) // 5] + out
 
 
 def quantize(w, dtype):
@@ -174,15 +200,12 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
     cores = [c for grp in groups for c in grp]
     S = len(cores)
     grid = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in cores])
-    # hub: a free core inside the streamers' bounding box (the slot multicast loops back through it)
+    # hub: a free core inside the streamers' bounding box, central to its slot multicasts
     xs, ys = [c.x for c in cores], [c.y for c in cores]
     x0r, x1r, y0r, y1r = min(xs), max(xs), min(ys), max(ys)
     hub = next(ttnn.CoreCoord(x, y) for x in range(x0r, x1r + 1) for y in range(y0r, y1r + 1) if (x, y) not in used)
     hub_grid = ttnn.CoreRangeSet([ttnn.CoreRange(hub, hub)])
     all_grid = grid.merge(hub_grid)
-    mc_dests = (x1r - x0r + 1) * (y1r - y0r + 1)
-    p0 = mesh.worker_core_from_logical_core(ttnn.CoreCoord(x0r, y0r))
-    p1 = mesh.worker_core_from_logical_core(ttnn.CoreCoord(x1r, y1r))
     hub_phys = mesh.worker_core_from_logical_core(hub)
     phys = [mesh.worker_core_from_logical_core(c) for c in cores]
 
@@ -226,7 +249,7 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
             ttnn.ShardSpec(hub_grid, [2 * n, HIDDEN], ttnn.ShardOrientation.ROW_MAJOR),
         ),
     )
-    ccl_sem = ttnn.create_global_semaphore(mesh, hub_grid, 0)
+    ccl_sems = [ttnn.create_global_semaphore(mesh, hub_grid, 0) for _ in range(2)]  # per slot parity
 
     dram_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(banks - 1, 0))})
 
@@ -368,9 +391,9 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
         hub_rt = ttnn.RuntimeArgs()
         hub_rt[hub.x][hub.y] = [
             hub_slots.buffer_address(),
-            ttnn.get_global_semaphore_address(ccl_sem),
+            *[ttnn.get_global_semaphore_address(s) for s in ccl_sems],
             slots_t.buffer_address(),
-        ]
+        ] + rect_cover(mesh, cores)
         hub_ct = [
             n,
             chip,
@@ -380,11 +403,6 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
             S,
             SEM_GATHER,
             SEM_SLOTS,
-            p0.x,
-            p0.y,
-            p1.x,
-            p1.y,
-            mc_dests,
             SEM_FLAG,
             0,
         ]
@@ -437,7 +455,7 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
 
     # the hub multicasts overwrite the streamers' slots during a run: restore layer 0's input each launch
 
-    def run(keep=(ccl_sem,)):
+    def run(keep=tuple(ccl_sems)):
         ttnn.copy_host_to_device_tensor(slots_host_t, slots_t)
         ttnn.generic_op(io, mesh_pd)
 
@@ -450,7 +468,6 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
         chips=n,
         streamers=S,
         hub=(hub.x, hub.y),
-        mc_rect=(x0r, y0r, x1r, y1r),
         ring_bytes=ring_bytes,
         bytes_per_layer_per_chip=bytes_per_layer,
     )

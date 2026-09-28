@@ -37,6 +37,7 @@ from models.experimental.qwen36_resident.tests.bench_resident_mlp import (
     f32_bits,
     gate_up_core_cols,
     quantize,
+    rect_cover,
     split,
     streamer_cores,
 )
@@ -397,8 +398,6 @@ class ResidentModel:
         hub_p, lead_p, tail_p = phys(hub), phys(leader), phys(tail_core)
         head_p = [phys(c) for c in heads]
         wphys = [phys(c) for c in workers]
-        p0, p1 = phys(ttnn.CoreCoord(x0r, y0r)), phys(ttnn.CoreCoord(x1r, y1r))
-        mc_dests = (x1r - x0r + 1) * (y1r - y0r + 1)
 
         tiny, full = ttnn.Tile([1, TILE]), ttnn.Tile([TILE, TILE])
         rep, per_chip = ttnn.ReplicateTensorToMesh(mesh), ttnn.ShardTensorToMesh(mesh, dim=0)
@@ -541,6 +540,13 @@ class ResidentModel:
                             hist[chip, row, o : o + TILE] = st.hist[c][chip][age, cols]
         taps_t = dram_t(taps.reshape(n * S * gdn_copies, -1), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
         self.hist_t = dram_t(hist.reshape(n * S * gdn_copies, -1), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
+        # host copies of the decode state's initial contents (reset() restores them)
+        self._initial = [
+            (
+                ttnn.from_torch(hist.reshape(n * S * gdn_copies, -1), dtype=ttnn.bfloat16, mesh_mapper=per_chip),
+                self.hist_t,
+            )
+        ]
 
         # ---- mixer rows (GDN heads, attention leader and tail core)
         row_w = max(d.g_cols, d.a_cols)
@@ -562,6 +568,17 @@ class ResidentModel:
                     if w["gdn"]:
                         norm[chip, (c * 4 + vt) * TILE] = w["gdn"][c]["norm_w"][vt * TILE : (vt + 1) * TILE]
         self.state_t = dram_t(state.reshape(n * gdn_copies * d.nv * 16 * TILE, TILE), ttnn.float32)
+        self._initial.append(
+            (
+                ttnn.from_torch(
+                    state.reshape(n * gdn_copies * d.nv * 16 * TILE, TILE),
+                    dtype=ttnn.float32,
+                    layout=ttnn.TILE_LAYOUT,
+                    mesh_mapper=per_chip,
+                ),
+                self.state_t,
+            )
+        )
         norm_t = dram_t(norm.reshape(-1, TILE), ttnn.bfloat16)
 
         # ---- attention: q / M buffers, norm weights, KV caches (position tile t -> bank t % banks)
@@ -596,14 +613,13 @@ class ResidentModel:
                 ttnn.BufferType.DRAM,
                 ttnn.ShardSpec(dram_grid, [attn_copies * rpb * TILE, HD], ttnn.ShardOrientation.ROW_MAJOR),
             )
-            return ttnn.from_torch(
-                t.reshape(n * banks * attn_copies * rpb * TILE, HD),
-                dtype=ttnn.bfloat8_b,
-                layout=ttnn.TILE_LAYOUT,
-                device=mesh,
-                memory_config=mc,
-                mesh_mapper=per_chip,
+            flat = t.reshape(n * banks * attn_copies * rpb * TILE, HD)
+            dev = ttnn.from_torch(
+                flat, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh, memory_config=mc, mesh_mapper=per_chip
             )
+            host = ttnn.from_torch(flat, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, mesh_mapper=per_chip)
+            self._initial.append((host, dev))
+            return dev
 
         self.K_t, self.V_t = settled(cache("K")), settled(cache("V"))
         chunk_max = max([chunk_of(wi, tp, banks)[3] for tp in range(max_tp + 1) for wi in range(WORKERS - 1)] + [1])
@@ -618,7 +634,7 @@ class ResidentModel:
 
         # ---- hub
         self.hub_slots = l1(torch.zeros(2 * n, HIDDEN), hub_grid, [2 * n, HIDDEN], layout=ttnn.ROW_MAJOR_LAYOUT)
-        self.ccl_sem = ttnn.create_global_semaphore(mesh, hub_grid, 0)
+        self.ccl_sems = [ttnn.create_global_semaphore(mesh, hub_grid, 0) for _ in range(2)]  # per slot parity
 
         # ---- optional timelines
         def ts_buf(grid_, count, words):
@@ -877,11 +893,11 @@ class ResidentModel:
             hub_rt = ttnn.RuntimeArgs()
             hub_rt[hub.x][hub.y] = [
                 self.hub_slots.buffer_address(),
-                ttnn.get_global_semaphore_address(self.ccl_sem),
+                *[ttnn.get_global_semaphore_address(s) for s in self.ccl_sems],
                 self.slots_t.buffer_address(),
-            ]
+            ] + rect_cover(mesh, cores)
             hub_ct = [n, chip, HIDDEN * 2, packet_bytes, 2 * layers, S, SEM_GATHER, SEM_SLOTS]
-            hub_ct += [p0.x, p0.y, p1.x, p1.y, mc_dests, SEM_FLAG, int(lm_head)]
+            hub_ct += [SEM_FLAG, int(lm_head)]
 
             # GDN heads
             hr, hw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -1018,6 +1034,12 @@ class ResidentModel:
         return ttnn.from_torch(
             t, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh)
         )
+
+    def reset(self):
+        """restore the decode state (GDN states, conv histories, KV caches) to its initial contents"""
+        for host, dev in self._initial:
+            ttnn.copy_host_to_device_tensor(host, dev)
+        ttnn.synchronize_device(self.mesh)
 
     def step(self, tok_host):
         ttnn.copy_host_to_device_tensor(tok_host, self.tok_t)
