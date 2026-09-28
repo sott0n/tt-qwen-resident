@@ -1,20 +1,23 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Resident GDN head core reader (NCRISC), one value head h (key head kh = h / group). Per layer
-// (set = layer % weight_sets), once every streamer has written its qkvzab columns into this core's
-// row buffer (1x32 tiles, conv already applied):
+// Resident GDN head core reader (NCRISC), one value head h (key head kh = h / group). Per GDN layer
+// g (copy c = g % copies), once every streamer has written its qkvzab columns into this core's row
+// buffer (1x32 tiles, conv already applied):
 //   - q_kh, k_kh, v_h, z_h are placed in row 0 of 32x32 bf16 tiles (rows 1..31 stay zero),
-//   - a_h / b_h and the set's dt_bias_h / neg_exp_A_h are broadcast into full fp32 tiles,
-//   - the set's norm weight and recurrent state (kept in this core's L1) are copied in.
+//   - a_h / b_h and the copy's dt_bias_h / neg_exp_A_h are broadcast into full fp32 tiles,
+//   - the copy's norm weight and this head's recurrent state are read from DRAM (ahead of the rows;
+//     the writer stores the updated state back, and a state is read again only in the next step).
 // The ones and row-0 mask constants are built once.
 //
-// Compile-time args: 0 Kt, 1 Vt, 2 layers, 3 weight_sets, 4 num_streamers, 5 sem_rows, 6 sem_state (count of
-//   state write-backs done by the writer; a set is re-read only after its previous write-back)
-// Runtime args: 0 rows_addr, 1 state_addr (weight_sets x Kt*Vt fp32 tiles), 2 norm_w_addr (weight_sets x Vt
-//   bf16 row-0 tiles), 3 q_tile, 4 k_tile, 5 v_tile, 6 z_tile, 7 a_tile, 8 a_elem, 9 b_tile, 10 b_elem,
-//   then weight_sets x (dt_bias_h bits, neg_exp_A_h bits), then an optional timeline buffer (0 = off):
-//   per layer 4 words, the reader writes [0] rows arrived, [1] inputs pushed
+// Compile-time args: 0 Kt, 1 Vt, 2 GDN layers, 3 copies, 4 num_streamers, 5 sem_rows, 6 heads (per chip),
+//   7 sem_state (count of state write-backs done by the writer; a copy's state is re-read within a step
+//   only after its previous write-back)
+// Runtime args: 0 rows_addr, 1 state address (DRAM, [copies][heads][Kt * Vt] fp32 tiles), 2 norm weight
+//   address (DRAM, [copies][Vt] bf16 row-0 tiles), 3 q_tile, 4 k_tile, 5 v_tile, 6 z_tile, 7 a_tile,
+//   8 a_elem, 9 b_tile, 10 b_elem, 11 head index, then copies x (dt_bias_h bits, neg_exp_A_h bits), then an
+//   optional timeline buffer (0 = off): per layer 4 words, the reader writes [0] rows arrived, [1] inputs
+//   pushed
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -24,10 +27,11 @@ namespace {
 constexpr uint32_t Kt = get_compile_time_arg_val(0);
 constexpr uint32_t Vt = get_compile_time_arg_val(1);
 constexpr uint32_t layers = get_compile_time_arg_val(2);
-constexpr uint32_t weight_sets = get_compile_time_arg_val(3);
+constexpr uint32_t copies = get_compile_time_arg_val(3);
 constexpr uint32_t num_streamers = get_compile_time_arg_val(4);
 constexpr uint32_t sem_rows = get_compile_time_arg_val(5);
-constexpr uint32_t sem_state = get_compile_time_arg_val(6);
+constexpr uint32_t num_heads = get_compile_time_arg_val(6);
+constexpr uint32_t sem_state = get_compile_time_arg_val(7);
 constexpr uint32_t st = Kt * Vt;
 
 constexpr uint32_t cb_q_in = 0, cb_k_in = 1, cb_v_in = 2, cb_z_in = 3, cb_norm_w = 4, cb_s_in = 5;
@@ -74,9 +78,13 @@ void push_fill(uint32_t cb, uint32_t bits) {
     cb_push_back(cb, 1);
 }
 
-void push_copy(uint32_t cb, uint32_t src, uint32_t n, uint32_t tile_bytes) {
+// tiles first .. first + n of an interleaved DRAM tensor
+template <typename AddrGen>
+void push_pages(uint32_t cb, const AddrGen& src, uint32_t first, uint32_t n, uint32_t tile_bytes) {
     cb_reserve_back(cb, n);
-    noc_async_read(get_noc_addr(src), get_write_ptr(cb), n * tile_bytes);
+    for (uint32_t t = 0; t < n; t++) {
+        noc_async_read_page(first + t, src, get_write_ptr(cb) + t * tile_bytes);
+    }
     noc_async_read_barrier();
     cb_push_back(cb, n);
 }
@@ -95,8 +103,13 @@ void kernel_main() {
     const uint32_t a_elem = get_arg_val<uint32_t>(8);
     const uint32_t b_tile = get_arg_val<uint32_t>(9);
     const uint32_t b_elem = get_arg_val<uint32_t>(10);
-    constexpr uint32_t gates_base = 11;
-    const uint32_t ts_addr = get_arg_val<uint32_t>(gates_base + 2 * weight_sets);
+    const uint32_t head = get_arg_val<uint32_t>(11);
+    constexpr uint32_t gates_base = 12;
+    const uint32_t ts_addr = get_arg_val<uint32_t>(gates_base + 2 * copies);
+    const InterleavedAddrGenFast<true> state_dram{
+        .bank_base_address = state, .page_size = kF32Tile, .data_format = DataFormat::Float32};
+    const InterleavedAddrGenFast<true> norm_dram{
+        .bank_base_address = norm_w, .page_size = kBf16Tile, .data_format = DataFormat::Float16_b};
     volatile tt_l1_ptr uint32_t* ts = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ts_addr);
     volatile uint32_t* clk = reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
 
@@ -123,15 +136,18 @@ void kernel_main() {
     volatile tt_l1_ptr uint16_t* a_row = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(rows + a_tile * kTiny);
     volatile tt_l1_ptr uint16_t* b_row = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(rows + b_tile * kTiny);
     for (uint32_t l = 0; l < layers; l++) {
-        const uint32_t set = l % weight_sets;
-        // the layer's state and norm weight do not depend on the rows: land them first (once the set's
-        // previous update has been written back)
-        if (l >= weight_sets) {
-            noc_semaphore_wait_min(state_sem, l - weight_sets + 1);
+        const uint32_t set = l % copies;
+        // the layer's state and norm weight do not depend on the rows: land them first
+        if (l >= copies) {
+            noc_semaphore_wait_min(state_sem, l - copies + 1);
         }
-        push_copy(cb_s_mm, state + set * st * kF32Tile, st, kF32Tile);
-        push_copy(cb_s_in, state + set * st * kF32Tile, st, kF32Tile);
-        push_copy(cb_norm_w, norm_w + set * Vt * kBf16Tile, Vt, kBf16Tile);
+        const uint32_t first = (set * num_heads + head) * st;
+        cb_reserve_back(cb_s_in, st);
+        push_pages(cb_s_mm, state_dram, first, st, kF32Tile);  // then a local copy: one DRAM read per state
+        noc_async_read(get_noc_addr(get_read_ptr(cb_s_mm)), get_write_ptr(cb_s_in), st * kF32Tile);
+        noc_async_read_barrier();
+        cb_push_back(cb_s_in, st);
+        push_pages(cb_norm_w, norm_dram, set * Vt, Vt, kBf16Tile);
         noc_semaphore_wait_min(rows_sem, num_streamers * (l + 1));
         if (ts_addr) {
             ts[l * 4 + 0] = *clk;

@@ -1,17 +1,21 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Resident GDN-layer streamer compute (TRISC). Per layer (set = layer % weight_sets):
-//   attention half:
-//     x = sum of the partial slots;  h = rmsnorm(x) * gamma[set][0]
-//     y = h @ W_qkvzab (this core's columns);  q|k|v columns: y = silu(conv1d_4(y)), with the three
-//     previous inputs kept per set (ring of 3);  z, a, b columns pass through
-//     d = o @ W_out (this core's columns, o = all heads' outputs);  pout = d (+ x on chip 0)
+// Resident streamer compute (TRISC), see streamer_common.hpp. Per layer:
+//   mixer half:
+//     x = sum of the partial slots;  h = rmsnorm(x)
+//     GDN: y = h @ W_qkvzab (this core's columns);  q|k|v columns: y = silu(conv1d_4(y)) over the
+//          history streamed in (oldest first), y itself goes out as the newest history entry;
+//          z, a, b columns pass through
+//     attention: y = h @ W_qkvg, passed through
+//     d = o @ W_out (this core's columns, o = the mixer cores' output);  pout = d (+ x on chip 0)
 //   mlp half:
-//     x = sum of the slots;  h = rmsnorm(x) * gamma[set][1];  a = silu(h @ G) * (h @ U)
+//     x = sum of the slots;  h = rmsnorm(x);  a = silu(h @ G) * (h @ U)
 //     d = act @ D;  pout = d (+ x on chip 0)
+// then optionally logits = rmsnorm(x) @ W_head (this core's columns).
 //
-// Runtime args: 0 ng, 1 nd, 2 pout_off, 3 nq, 4 n_conv (leading q|k|v columns among this core's nq)
+// Runtime args: 0 ng, 1 nd, 2 pout_off, 3 GDN projection tiles, 4 attention projection tiles, 5 n_conv
+// (leading q|k|v columns among this core's GDN projection tiles), 6 lm_head tiles
 
 #include <cstdint>
 #include "api/compute/compute_kernel_api.h"
@@ -25,9 +29,9 @@
 #include "api/compute/experimental/mul_reduce_scalar.h"
 #include "api/compute/experimental/add_rsqrt.h"
 #include "api/compute/experimental/rmsnorm.h"
-#include "gdn_layer_common.hpp"
+#include "streamer_common.hpp"
 
-using namespace resident_gdn;
+using namespace resident;
 
 namespace {
 
@@ -118,8 +122,8 @@ FORCE_INLINE void sum_slots() {
     cb_pop_front(cb_slots, num_chips * Ht);
 }
 
-// cb_h = x / rms(x) * gamma[g], computed on the 32x32 views of x, gamma and h
-FORCE_INLINE void rmsnorm(uint32_t g) {
+// cb_h = x / rms(x), computed on the 32x32 views of x and h (the norm weight is folded into the weights)
+FORCE_INLINE void rmsnorm() {
     static_assert(Hf >= 1 && Hf <= 8 && Hf * 32 == Ht, "hidden must be 1..8 full tiles");
     cb_wait_front(cb_x, Ht);
     cb_reserve_back(cb_h, Ht);
@@ -135,10 +139,6 @@ FORCE_INLINE void rmsnorm(uint32_t g) {
     add_rsqrt_tile<false, VectorMode::RC_custom, 1>(0, eps_bits);
     rmsnorm_mul_bcast_scalar_reuse_tiles_init<Hf>(cb_x_full);
     rmsnorm_mul_bcast_scalar_reuse_tiles<Hf, true>(cb_x_full, 0, 0, 0);
-    mul_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_gamma_full);
-    for (uint32_t i = 0; i < Hf; i++) {
-        mul_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_gamma_full, g * Hf + i, i);
-    }
     tile_regs_commit();
     tile_regs_wait();
     pack_block_contiguous(0, cb_h_full, Hf);
@@ -198,16 +198,18 @@ FORCE_INLINE void add_residual(uint32_t nd, uint32_t pout_off) {
     cb_pop_front(cb_dout, nd_max);
 }
 
-// q|k|v columns: cb_qkvz_out = silu(w0 * y[t-3] + w1 * y[t-2] + w2 * y[t-1] + w3 * y[t]) and y[t] replaces
-// y[t-3] in the set's history ring; the first n_conv of this core's columns are q|k|v, the rest
-// (z, a, b) are copied through. The conv runs once on the 32x32 views of the column block.
-uint32_t conv_step[weight_sets];
-
-FORCE_INLINE void conv_pass(uint32_t set, uint32_t nq, uint32_t n_conv) {
+// q|k|v columns: cb_qkvz_out = silu(w0 * y[t-3] + w1 * y[t-2] + w2 * y[t-1] + w3 * y[t]) over the
+// streamed-in history (cb_conv_hist, oldest first) and taps; y[t] goes to cb_hist_out; the first n_conv
+// of this core's columns are q|k|v, the rest (z, a, b) are copied through (attention: all of them).
+// The conv runs once on the 32x32 views of the column block.
+FORCE_INLINE void conv_pass(uint32_t nq, uint32_t n_conv, bool gdn) {
     cb_wait_front(cb_qkvz, kBlk);
     cb_reserve_back(cb_qkvz_out, kBlk);
-    const uint32_t c = conv_step[set];
-    const uint32_t oldest = set * 3 + c % 3;
+    if (gdn) {
+        cb_wait_front(cb_conv_w, 4 * kBlk);
+        cb_wait_front(cb_conv_hist, 3 * kBlk);
+        cb_reserve_back(cb_hist_out, 1);
+    }
     if (n_conv > 0) {
         reconfig_full_operand(cb_qkvz_full, cb_qkvz_full);
         pack_reconfig_data_format<true>(cb_qkvz_out_full);
@@ -215,13 +217,13 @@ FORCE_INLINE void conv_pass(uint32_t set, uint32_t nq, uint32_t n_conv) {
         tile_regs_acquire();
         copy_init(cb_qkvz_full);
         copy_tile(cb_qkvz_full, 0, 0);
-        copy_tile(cb_conv_w_full, set * 4 + 3, 1);
+        copy_tile(cb_conv_w_full, 3, 1);
         mul_binary_tile_init();
         mul_binary_tile(0, 1, 1);
         for (uint32_t j = 0; j < 3; j++) {
             copy_init(cb_qkvz_full);
-            copy_tile(cb_conv_hist_full, set * 3 + (c + j) % 3, 2);
-            copy_tile(cb_conv_w_full, set * 4 + j, 3);
+            copy_tile(cb_conv_hist_full, j, 2);
+            copy_tile(cb_conv_w_full, j, 3);
             mul_binary_tile_init();
             mul_binary_tile(2, 3, 2);
             add_binary_tile_init();
@@ -232,7 +234,7 @@ FORCE_INLINE void conv_pass(uint32_t set, uint32_t nq, uint32_t n_conv) {
         tile_regs_commit();
         tile_regs_wait();
         pack_tile(1, cb_qkvz_out_full);
-        pack_tile<true>(0, cb_conv_hist_full, oldest);  // newest input overwrites the oldest
+        pack_tile(0, cb_hist_out);
         tile_regs_release();
         cb_push_back(cb_qkvz_out_full, 1);  // wraps the view's write pointer back to the base
     }
@@ -253,7 +255,11 @@ FORCE_INLINE void conv_pass(uint32_t set, uint32_t nq, uint32_t n_conv) {
     pack_reconfig_data_format<true>(cb_qkvz_out);
     cb_push_back(cb_qkvz_out, kBlk);
     cb_pop_front(cb_qkvz, kBlk);
-    conv_step[set] = c + 1;
+    if (gdn) {
+        cb_push_back(cb_hist_out, 1);  // with no q|k|v columns the writer skips the write-back
+        cb_pop_front(cb_conv_w, 4 * kBlk);
+        cb_pop_front(cb_conv_hist, 3 * kBlk);
+    }
 }
 
 // d = in0 @ W_E over this core's down-type columns; pout = d (+ x on chip 0)
@@ -275,8 +281,10 @@ void kernel_main() {
     const uint32_t ng = get_arg_val<uint32_t>(0);
     const uint32_t nd = get_arg_val<uint32_t>(1);
     const uint32_t pout_off = get_arg_val<uint32_t>(2);
-    const uint32_t nq = get_arg_val<uint32_t>(3);
-    const uint32_t n_conv = get_arg_val<uint32_t>(4);
+    const uint32_t nq_gdn = get_arg_val<uint32_t>(3);
+    const uint32_t nq_attn = get_arg_val<uint32_t>(4);
+    const uint32_t n_conv = get_arg_val<uint32_t>(5);
+    const uint32_t nv = get_arg_val<uint32_t>(6);
 #ifdef TRISC_UNPACK
     {
         auto& w = get_local_cb_interface(cb_w0);
@@ -285,31 +293,37 @@ void kernel_main() {
             (reinterpret_cast<std::uintptr_t>(get_cb_tiles_acked_ptr(cb_consumed)) >> 2) & 0x3ffff);
     }
 #endif
-    for (uint32_t s = 0; s < weight_sets; s++) {
-        conv_step[s] = 0;
-    }
     custom_mm_block_init<false, true, false>(cb_h, Entry<0>::cb, cb_qkvz);
     custom_mm_block_uninit<false>();
-    cb_wait_front(cb_gamma, weight_sets * 2 * Ht);
-    cb_wait_front(cb_conv_w, weight_sets * 4 * kBlk);
 
     for (uint32_t l = 0; l < layers; l++) {
-        const uint32_t set = l % weight_sets;
-        // attention half
+        const bool attn = is_attn(l);
+        // mixer half
         sum_slots();
-        rmsnorm(set * 2);
-        matmul<kQkvz>(cb_h, cb_qkvz, nq, kBlk);
+        rmsnorm();
+        if (attn) {
+            matmul<kQkvg>(cb_h, cb_qkvz, nq_attn, kBlk);
+        } else {
+            matmul<kQkvz>(cb_h, cb_qkvz, nq_gdn, kBlk);
+        }
         cb_pop_front(cb_h, Ht);
-        conv_pass(set, nq, n_conv);
+        conv_pass(attn ? nq_attn : nq_gdn, attn ? 0 : n_conv, !attn);
         project_to_partial<kOut>(cb_o_in, Ot, nd, pout_off);
         cb_pop_front(cb_x, Ht);
         // mlp half
         sum_slots();
-        rmsnorm(set * 2 + 1);
+        rmsnorm();
         matmul<kGateUp>(cb_h, cb_g, 2 * ng, kBlk, cb_u, ng);
         cb_pop_front(cb_h, Ht);
         silu_mul();
         project_to_partial<kDown>(cb_act, It, nd, pout_off);
+        cb_pop_front(cb_x, Ht);
+    }
+    if constexpr (lm_head) {
+        sum_slots();
+        rmsnorm();
+        matmul<kHead>(cb_h, cb_logits, nv, nv_max);
+        cb_pop_front(cb_h, Ht);
         cb_pop_front(cb_x, Ht);
     }
 }

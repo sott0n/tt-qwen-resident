@@ -9,11 +9,13 @@
 //   3. multicast slot[p][0 .. num_chips) to the streamers' partial slots and bump their slots semaphore.
 //      The multicast rectangle is the streamers' bounding box and contains the hub (loopback); the hub
 //      and idle cores inside it only receive into addresses reserved for the streamers' buffers.
-// The last layer's slots stay on the hub for the host to read back.
+// The last layer's slots stay on the hub for the host to read back (and are also multicast when
+// mcast_last is set, for a stage that runs after the last layer).
 //
 // Compile-time args: 0 num_chips, 1 chip, 2 vector_bytes, 3 packet_bytes, 4 layers, 5 num_streamers,
 //   6 sem_gather id, 7 sem_slots id, 8..11 multicast rectangle (noc x0, y0, x1, y1), 12 multicast dests,
-//   13 sem_flag id (local word holding the value multicast into the streamers' slots semaphore)
+//   13 sem_flag id (local word holding the value multicast into the streamers' slots semaphore),
+//   14 mcast_last
 // Runtime args: 0 slots_addr, 1 ccl_sem_addr (global semaphore), 2 streamer slots addr, then FabricConnectionManager
 // args (fwd, bwd)
 
@@ -38,6 +40,7 @@ constexpr uint32_t mc_y0 = get_compile_time_arg_val(9);
 constexpr uint32_t mc_x1 = get_compile_time_arg_val(10);
 constexpr uint32_t mc_y1 = get_compile_time_arg_val(11);
 constexpr uint32_t mc_dests = get_compile_time_arg_val(12);
+constexpr bool mcast_last = get_compile_time_arg_val(14) != 0;
 constexpr uint32_t sem_flag = get_compile_time_arg_val(13);
 constexpr uint32_t packets_per_vector = (vector_bytes + packet_bytes - 1) / packet_bytes;
 
@@ -92,7 +95,7 @@ void kernel_main() {
             expected += (num_chips - 1) * packets_per_vector;
             noc_semaphore_wait_min(ccl_sem, expected);
         }
-        if (l + 1 < layers) {
+        if (l + 1 < layers || mcast_last) {
             noc_async_write_multicast_loopback_src(base, mc_slots, num_chips * vector_bytes, mc_dests);
             noc_async_write_barrier();
             *flag = l + 1;

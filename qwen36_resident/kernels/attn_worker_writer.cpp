@@ -7,11 +7,15 @@
 // address arrives in this core's sem_addr; a group head sends its own to its children at start. The
 // tail core then writes the updated tail k | v tiles back to the set's DRAM cache (off the critical path).
 //
-// Runtime args: 0 role (0 idle, 1 chunk worker, 2 tail core), 1 row-max slot index w, 2 leader x,
-// 3 leader y (NOC coordinates), 4 leader row-max slots address, 5 parent x, 6 parent y, 7 slot at the
-// parent, 8 children, then children x (x, y), then an optional timeline buffer (0 = off; word [3] of the
-// reader's: partial sent), then (tail core) the tail row's bank and row, and weight_sets x (k cache,
-// v cache).
+// A worker without a chunk sends -inf as its row max, once q of the layer has arrived, and its zero
+// partial once M has: its compute makes the zero partial on the math and pack threads alone, so nothing
+// else orders it after the layer's q and M.
+//
+// Runtime args: 0 role (1 chunk worker, 2 tail core), 1 row-max slot index w, 2 leader x, 3 leader y
+// (NOC coordinates), 4 leader row-max slots address, 5 parent x, 6 parent y, 7 slot at the parent,
+// 8 children, then children x (x, y), then an optional timeline buffer (0 = off; word [3] of the
+// reader's: partial sent), then (tail core) k cache address, v cache address, per-copy stride, token
+// state address.
 
 #include "api/dataflow/dataflow_api.h"
 #include "attn_common.hpp"
@@ -20,9 +24,6 @@ using namespace resident_attn;
 
 void kernel_main() {
     const uint32_t role = get_arg_val<uint32_t>(0);
-    if (role == 0) {
-        return;
-    }
     const uint32_t w = get_arg_val<uint32_t>(1);
     const uint32_t lx = get_arg_val<uint32_t>(2);
     const uint32_t ly = get_arg_val<uint32_t>(3);
@@ -51,12 +52,43 @@ void kernel_main() {
     const uint64_t m_sem = get_noc_addr(lx, ly, get_semaphore(sem_m));
     const uint64_t part_sem = get_noc_addr(px, py, get_semaphore(sem_part));
     const uint32_t out_cb = children > 0 ? cb_osum : cb_o;
+    volatile tt_l1_ptr uint32_t* q_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_q));
+    volatile tt_l1_ptr uint32_t* M_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_M));
+    cb_wait_front(cb_ntiles, 1);
+    const bool has_chunk = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_ntiles)) > 0;
+    // -inf rows (column 0 of rows 0..heads-1) for a worker without a chunk (its score buffer is unused)
+    const uint32_t neg_inf = get_write_ptr(cb_s);
+    if (!has_chunk) {
+        volatile tt_l1_ptr uint16_t* p = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(neg_inf);
+        for (uint32_t i = 0; i < heads * kFaceRow / 2; i++) {
+            p[i] = 0xff80;
+        }
+    }
+    uint32_t tail_bank = 0, tail_row = 0;
+    if (role == 2) {
+        const InterleavedAddrGen<true> tok{.bank_base_address = get_arg_val<uint32_t>(tail_args + 3), .page_size = 16};
+        noc_async_read(tok.get_noc_addr(0), get_write_ptr(cb_flush), 16);
+        noc_async_read_barrier();
+        const uint32_t tp = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_flush)) / 32;
+        tail_bank = tp % banks;
+        tail_row = tp / banks;
+    }
     for (uint32_t l = 0; l < layers; l++) {
-        cb_wait_front(cb_m, 1);
-        noc_async_write(get_read_ptr(cb_m), m_dst, heads * kFaceRow);
+        if (has_chunk) {
+            cb_wait_front(cb_m, 1);
+            noc_async_write(get_read_ptr(cb_m), m_dst, heads * kFaceRow);
+        } else {
+            noc_semaphore_wait_min(q_sem, l + 1);
+            noc_async_write(neg_inf, m_dst, heads * kFaceRow);
+        }
         noc_async_write_barrier();
         noc_semaphore_inc(m_sem, 1);
-        cb_pop_front(cb_m, 1);
+        if (has_chunk) {
+            cb_pop_front(cb_m, 1);
+        }
+        if (!has_chunk) {
+            noc_semaphore_wait_min(M_sem, l + 1);
+        }
         cb_wait_front(out_cb, kPart);
         const uint32_t src = get_read_ptr(out_cb);
         for (uint32_t d = 0; d < kPart; d++) {
@@ -69,17 +101,16 @@ void kernel_main() {
             ts[l * 4 + 3] = *clk;
         }
         if (role == 2) {
-            const uint32_t set = l % weight_sets;
-            const uint32_t bank = get_arg_val<uint32_t>(tail_args);
-            const uint32_t row = get_arg_val<uint32_t>(tail_args + 1);
+            const uint32_t copy_off = (l % copies) * get_arg_val<uint32_t>(tail_args + 2) + tail_row * kKvRow;
             cb_wait_front(cb_flush, 2 * Dt);
             for (uint32_t kv = 0; kv < 2; kv++) {
-                const uint32_t addr = get_arg_val<uint32_t>(tail_args + 2 + 2 * set + kv) + row * kKvRow;
+                const uint32_t addr = get_arg_val<uint32_t>(tail_args + kv) + copy_off;
                 noc_async_write(
-                    get_read_ptr(cb_flush) + kv * kKvRow, get_noc_addr_from_bank_id<true>(bank, addr), kKvRow);
+                    get_read_ptr(cb_flush) + kv * kKvRow, get_noc_addr_from_bank_id<true>(tail_bank, addr), kKvRow);
             }
             noc_async_write_barrier();
             cb_pop_front(cb_flush, 2 * Dt);
+            *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_tail)) = l + 1;
         }
     }
     noc_async_atomic_barrier();

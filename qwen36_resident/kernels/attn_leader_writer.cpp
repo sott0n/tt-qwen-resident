@@ -78,6 +78,7 @@ void kernel_main() {
 
         // global row max
         noc_semaphore_wait_min(m_sem, active * (l + 1));
+        invalidate_l1_cache();  // the slots are written by other cores
         {
             volatile tt_l1_ptr uint16_t* out = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(M_addr);
             for (uint32_t h = 0; h < heads; h++) {

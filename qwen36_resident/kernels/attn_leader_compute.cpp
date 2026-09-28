@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Attention leader compute (see attn_common.hpp). Per layer (set = layer % weight_sets):
-//   q = rope(rmsnorm_rows(q) * w_q[set]) into cb_q_mc (multicast);  gs = sigmoid(gate);
+// Attention leader compute (see attn_common.hpp). Per attention layer:
+//   q = rope(rmsnorm_rows(q) * w_q) into cb_q_mc (multicast);  gs = sigmoid(gate);
 //   o = (the group heads' partial sums) / row sum * gs into cb_out.
 //
 // Runtime args: 0 children (group heads of the reduction tree).
@@ -84,11 +84,11 @@ void kernel_main() {
     const uint32_t children = get_arg_val<uint32_t>(0);
     compute_kernel_hw_startup(cb_qraw, cb_qraw, cb_sq);
     cb_wait_front(cb_mean, 1);
-    cb_wait_front(cb_qw, weight_sets * Dt);
     cb_wait_front(cb_rope, 3);
     for (uint32_t l = 0; l < layers; l++) {
-        const uint32_t set = l % weight_sets;
-        norm_rope(cb_qraw, cb_qw, set * Dt, cb_q_mc, cb_q_mc);
+        cb_wait_front(cb_qw, Dt);
+        norm_rope(cb_qraw, cb_qw, 0, cb_q_mc, cb_q_mc);
+        cb_pop_front(cb_qw, Dt);
         gate_sigmoid();
         sum_partials<false>(children);
         normalize_gate();

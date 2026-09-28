@@ -386,6 +386,7 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
             p1.y,
             mc_dests,
             SEM_FLAG,
+            0,
         ]
         compute = ttnn.KernelDescriptor(
             kernel_source=KDIR + "mlp_streamer_compute.cpp",

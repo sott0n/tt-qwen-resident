@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Attention leader reader: per layer, waits for the streamers' projection row [q heads | gates | k | v]
-// (1x32 tiles) and places head h of q and of the gate into row h of cb_qraw / cb_gate; then releases the
-// group heads' partial sums to compute once all of them have written theirs.
+// Attention leader reader: reads the rope tables of the position from the token state; per attention
+// layer a, reads the layer's q norm weight (copy a % copies), waits for the streamers' projection row
+// [q heads | gates | k | v] (1x32 tiles) and places head h of q and of the gate into row h of cb_qraw /
+// cb_gate; then releases the group heads' partial sums to compute once all of them have written theirs.
 //
 // Runtime args: 0 row buffer address, 1 children (group heads of the reduction tree), 2 optional
 // timeline buffer (0 = off; per layer 8 wall-clock words: [1] rows arrived, [2] rows placed,
-// [3] partials arrived).
+// [3] partials arrived), 3 token state address, 4 rope offset in it, 5 q norm weight address (DRAM,
+// [copies][Dt] bf16 tiles).
 
 #include "api/dataflow/dataflow_api.h"
 #include "attn_common.hpp"
@@ -42,6 +44,10 @@ void kernel_main() {
     const uint32_t rows = get_arg_val<uint32_t>(0);
     const uint32_t children = get_arg_val<uint32_t>(1);
     const uint32_t ts_addr = get_arg_val<uint32_t>(2);
+    const uint32_t tok_addr = get_arg_val<uint32_t>(3);
+    const uint32_t rope_off = get_arg_val<uint32_t>(4);
+    const InterleavedAddrGenFast<true> qw_dram{
+        .bank_base_address = get_arg_val<uint32_t>(5), .page_size = kTile, .data_format = DataFormat::Float16_b};
     volatile tt_l1_ptr uint32_t* rows_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_rows));
     volatile tt_l1_ptr uint32_t* part_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_part));
     volatile tt_l1_ptr uint32_t* ts = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ts_addr);
@@ -55,11 +61,22 @@ void kernel_main() {
     zero_tiles(cb_qraw, Dt);
     zero_tiles(cb_gate, Dt);
     push_resident(cb_mean, 1);
-    push_resident(cb_qw, weight_sets * Dt);
-    push_resident(cb_rope, 3);
+    {
+        const InterleavedAddrGen<true> tok{.bank_base_address = tok_addr, .page_size = rope_off + 3 * kTile};
+        cb_reserve_back(cb_rope, 3);
+        noc_async_read(tok.get_noc_addr(0, rope_off), get_write_ptr(cb_rope), 3 * kTile);
+        noc_async_read_barrier();
+        cb_push_back(cb_rope, 3);
+    }
 
     constexpr uint32_t gate0 = heads * Dt;
     for (uint32_t l = 0; l < layers; l++) {
+        cb_reserve_back(cb_qw, Dt);
+        for (uint32_t d = 0; d < Dt; d++) {
+            noc_async_read_page((l % copies) * Dt + d, qw_dram, get_write_ptr(cb_qw) + d * kTile);
+        }
+        noc_async_read_barrier();
+        cb_push_back(cb_qw, Dt);
         noc_semaphore_wait_min(rows_sem, num_streamers * (l + 1));
         mark(l, 1);
         cb_reserve_back(cb_qraw, Dt);
