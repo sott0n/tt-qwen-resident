@@ -66,12 +66,14 @@ def test_resident_decode_steps(mesh_device, pos):
             rec.update(
                 logits_pcc=pcc(lg_got, lg_ref),
                 top1_match=bool(lg_got.flatten().argmax() == lg_ref.flatten().argmax()),
+                device_argmax=model.argmax() == int(lg_got[:, : d.vocab_chip].reshape(-1).argmax()),
             )
         logger.info(rec)
         recs.append(rec)
     with open(OUT, "a") as f:
         f.write(json.dumps(dict(test="decode_steps", records=recs)) + "\n")
     assert all(r["x_pcc"] > 0.99 and r["mixer_pcc"] > 0.99 and r.get("logits_pcc", 1) > 0.99 for r in recs)
+    assert all(r.get("device_argmax", True) for r in recs)
 
 
 def timed_steps(mesh, model, tok, reps=5):

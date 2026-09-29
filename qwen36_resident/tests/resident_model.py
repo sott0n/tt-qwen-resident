@@ -116,6 +116,7 @@ class Dims:
         self.It = self.ic // TILE
         self.Ht = HIDDEN // TILE
         self.vocab = pad(vocab // n) if vocab else 0  # lm_head columns per chip (padded)
+        self.vocab_chip = vocab // n  # of which real vocab entries
 
 
 def rope_tables(pos):
@@ -516,9 +517,9 @@ class ResidentModel:
         self.logits_t = l1(torch.zeros(S, nv_max * TILE), grid, [1, nv_max * TILE]) if lm_head else None
         blk = TILE * TILE
         # conv taps per (streamer, GDN copy): [tap][32 x 1x32 tiles], only the core's q|k|v columns
+        self._S, self._gdn_copies, self._attn_copies = S, gdn_copies, attn_copies
+        self._nqg_split, self._qg_bank = nqg_split, qg_bank
         taps = torch.zeros(n, S * gdn_copies, CONV_K * blk)
-        hist = torch.zeros(n, S * gdn_copies, (CONV_K - 1) * blk)
-        tok_pos = st.pos
         for chip in range(n):
             for i in range(S):
                 bank, j = divmod(i, PER_BANK)
@@ -534,19 +535,11 @@ class ResidentModel:
                         for tap in range(CONV_K):
                             o = tap * blk + t * TILE
                             taps[chip, row, o : o + TILE] = tp_[cols, tap]
-                        uses = (self.n_gdn - c + gdn_copies - 1) // gdn_copies
-                        for age in range(CONV_K - 1):  # age 0 = oldest; see conv_step in streamer_common.hpp
-                            o = ((tok_pos * uses + age) % 3) * blk + t * TILE
-                            hist[chip, row, o : o + TILE] = st.hist[c][chip][age, cols]
         taps_t = dram_t(taps.reshape(n * S * gdn_copies, -1), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
-        self.hist_t = dram_t(hist.reshape(n * S * gdn_copies, -1), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
+        hist = self._hist_host(st)
+        self.hist_t = dram_t(hist, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
         # host copies of the decode state's initial contents (reset() restores them)
-        self._initial = [
-            (
-                ttnn.from_torch(hist.reshape(n * S * gdn_copies, -1), dtype=ttnn.bfloat16, mesh_mapper=per_chip),
-                self.hist_t,
-            )
-        ]
+        self._initial = [(ttnn.from_torch(hist, dtype=ttnn.bfloat16, mesh_mapper=per_chip), self.hist_t)]
 
         # ---- mixer rows (GDN heads, attention leader and tail core)
         row_w = max(d.g_cols, d.a_cols)
@@ -554,30 +547,16 @@ class ResidentModel:
 
         # ---- GDN heads: state [copy][head][16] fp32 tiles (interleaved: a state's tiles spread over the
         # banks), norm weight [copy][4] row-0 tiles
-        state = torch.zeros(n, gdn_copies * d.nv * 16 * TILE, TILE)
         norm = torch.zeros(n, gdn_copies * 4 * TILE, TILE)
         for chip in range(n):
             for c in range(gdn_copies):
-                for hh in range(d.nv):
-                    Sm = st.gdn[c][chip][hh] if w["gdn"] else torch.zeros(DK, DV)
-                    for kt in range(4):
-                        for vt in range(4):
-                            i = ((c * d.nv + hh) * 16 + kt * 4 + vt) * TILE
-                            state[chip, i : i + TILE] = Sm[kt * TILE : (kt + 1) * TILE, vt * TILE : (vt + 1) * TILE]
                 for vt in range(4):
                     if w["gdn"]:
                         norm[chip, (c * 4 + vt) * TILE] = w["gdn"][c]["norm_w"][vt * TILE : (vt + 1) * TILE]
-        self.state_t = dram_t(state.reshape(n * gdn_copies * d.nv * 16 * TILE, TILE), ttnn.float32)
+        state = self._state_host(st)
+        self.state_t = dram_t(state, ttnn.float32)
         self._initial.append(
-            (
-                ttnn.from_torch(
-                    state.reshape(n * gdn_copies * d.nv * 16 * TILE, TILE),
-                    dtype=ttnn.float32,
-                    layout=ttnn.TILE_LAYOUT,
-                    mesh_mapper=per_chip,
-                ),
-                self.state_t,
-            )
+            (ttnn.from_torch(state, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, mesh_mapper=per_chip), self.state_t)
         )
         norm_t = dram_t(norm.reshape(-1, TILE), ttnn.bfloat16)
 
@@ -599,23 +578,21 @@ class ResidentModel:
         self.rpb = rpb
         kv_stride = rpb * KV_ROW
 
+        self._kv_mc = ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
+            ttnn.BufferType.DRAM,
+            ttnn.ShardSpec(dram_grid, [attn_copies * rpb * TILE, HD], ttnn.ShardOrientation.ROW_MAJOR),
+        )
+
         def cache(which):
-            t = torch.zeros(n, banks, attn_copies, rpb * TILE, HD)
-            for c in range(len(w["attn"])):
-                for chip in range(n):
-                    src = (st.K if which == "K" else st.V)[c][chip]
-                    for pt in range(src.shape[0] // TILE):
-                        t[chip, pt % banks, c, (pt // banks) * TILE : (pt // banks + 1) * TILE] = src[
-                            pt * TILE : (pt + 1) * TILE
-                        ]
-            mc = ttnn.MemoryConfig(
-                ttnn.TensorMemoryLayout.HEIGHT_SHARDED,
-                ttnn.BufferType.DRAM,
-                ttnn.ShardSpec(dram_grid, [attn_copies * rpb * TILE, HD], ttnn.ShardOrientation.ROW_MAJOR),
-            )
-            flat = t.reshape(n * banks * attn_copies * rpb * TILE, HD)
+            flat = self._kv_host(st, which)
             dev = ttnn.from_torch(
-                flat, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh, memory_config=mc, mesh_mapper=per_chip
+                flat,
+                dtype=ttnn.bfloat8_b,
+                layout=ttnn.TILE_LAYOUT,
+                device=mesh,
+                memory_config=self._kv_mc,
+                mesh_mapper=per_chip,
             )
             host = ttnn.from_torch(flat, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, mesh_mapper=per_chip)
             self._initial.append((host, dev))
@@ -635,6 +612,18 @@ class ResidentModel:
         # ---- hub
         self.hub_slots = l1(torch.zeros(2 * n, HIDDEN), hub_grid, [2 * n, HIDDEN], layout=ttnn.ROW_MAJOR_LAYOUT)
         self.ccl_sems = [ttnn.create_global_semaphore(mesh, hub_grid, 0) for _ in range(2)]  # per slot parity
+        # per streamer (order key, vocab index) of its largest logit, written by the streamer writers
+        self.argmax_t = (
+            l1(
+                torch.zeros(1, S * 4, dtype=torch.int32),
+                hub_grid,
+                [1, S * 4],
+                ttnn.uint32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
+            if lm_head
+            else None
+        )
 
         # ---- optional timelines
         def ts_buf(grid_, count, words):
@@ -860,7 +849,8 @@ class ResidentModel:
                 nqa, qaf = nqa_split[j]
                 nd, dfirst = nd_split[j]
                 ng, gfirst = ng_split[j]
-                nvv, _ = nv_split[j]
+                nvv, vfirst = nv_split[j]
+                v0 = (bank * v_bank + vfirst) * TILE
                 counts = [nqg, nqa, nd, 2 * ng, nd, nvv]
                 ent = []
                 for cnt, (t, stride, copies) in zip(counts, self.w_entries):
@@ -887,6 +877,8 @@ class ResidentModel:
                     + [lead_p.x, lead_p.y, tail_p.x, tail_p.y]
                     + peers
                     + [ts_addr]
+                    + [self.argmax_t.buffer_address() if lm_head else 0]
+                    + [max(0, min(nvv * TILE, d.vocab_chip - v0)), chip * d.vocab_chip + v0, i]
                 )
                 cr[c.x][c.y] = [ng, nd, bank * ht_bank + dfirst, nqg, nqa, n_conv, nvv]
 
@@ -1016,7 +1008,7 @@ class ResidentModel:
         self.io += [taps_t, self.hist_t, self.state_t, norm_t, qw_t, kw_t, self.K_t, self.V_t, self.tok_t]
         self.io += self._keep
         if lm_head:
-            self.io.append(self.logits_t)
+            self.io += [self.logits_t, self.argmax_t]
         if timeline:
             self.io.append(self.ts_t)
         self.nv_split, self.v_bank = nv_split, v_bank
@@ -1035,15 +1027,120 @@ class ResidentModel:
             t, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh)
         )
 
+    def _hist_host(self, st):
+        """conv histories of st as the hist tensor: per (streamer, GDN copy) row, 3 x 32 1x32 tiles; the ring
+        slot of age a (0 = oldest) at position p is (p * uses + a) % 3 (see conv_step in streamer_common.hpp)"""
+        d, n, S, copies, blk = self.d, self.d.n, self._S, self._gdn_copies, TILE * TILE
+        if not hasattr(self, "_hist_map"):
+            # (streamer, block tile) -> conv tile of the chip's q | k | v columns, for the conv tiles only
+            rows, tiles, convs = [], [], []
+            for i in range(S):
+                bank, j = divmod(i, PER_BANK)
+                cnt, first = self._nqg_split[j]
+                for t in range(cnt):
+                    g = bank * self._qg_bank + first + t
+                    if g < d.conv_tiles:
+                        rows.append(i)
+                        tiles.append(t)
+                        convs.append(g)
+            e = torch.arange(TILE)
+            self._hist_map = (
+                torch.tensor(rows),
+                (torch.tensor(tiles)[:, None] * TILE + e).reshape(-1),
+                (torch.tensor(convs)[:, None] * TILE + e).reshape(-1),
+            )
+        rows, cols, src = self._hist_map
+        hist = torch.zeros(n, S * copies, (CONV_K - 1) * blk)
+        rep_rows = rows.repeat_interleave(TILE)
+        for c in range(len(st.hist)):
+            uses = (self.n_gdn - c + copies - 1) // copies
+            h = torch.stack(st.hist[c])  # [n, 3, conv_ch]
+            for age in range(CONV_K - 1):
+                slot = (st.pos * uses + age) % 3
+                hist[:, rep_rows * copies + c, slot * blk + cols] = h[:, age, src]
+        return hist.reshape(n * S * copies, -1)
+
+    def _state_host(self, st):
+        """GDN states of st: per (copy, head) 16 fp32 tiles, interleaved over the banks"""
+        d, n, copies = self.d, self.d.n, self._gdn_copies
+        state = torch.zeros(n, copies, d.nv, 4, TILE, 4, TILE)
+        for c in range(len(st.gdn)):
+            for chip in range(n):
+                state[chip, c] = st.gdn[c][chip].reshape(d.nv, 4, TILE, 4, TILE)
+        return state.permute(0, 1, 2, 3, 5, 4, 6).reshape(n * copies * d.nv * 16 * TILE, TILE)
+
+    def _kv_host(self, st, which):
+        """KV caches of st: position tile t of a copy -> bank t % banks, row t // banks"""
+        n, banks, copies, rpb = self.d.n, self.d.banks, self._attn_copies, self.rpb
+        t = torch.zeros(n, banks, copies, rpb * TILE, HD)
+        caches = st.K if which == "K" else st.V
+        for c in range(len(caches)):
+            for chip in range(n):
+                src = caches[c][chip]
+                pts = src.shape[0] // TILE
+                tiles = src[: pts * TILE].reshape(pts, TILE, HD)
+                for b in range(banks):
+                    sel = tiles[b::banks]
+                    t[chip, b, c, : sel.shape[0] * TILE] = sel.reshape(-1, HD)
+        return t.reshape(n * banks * copies * rpb * TILE, HD)
+
+    def load_hist(self, st):
+        """write st's conv histories (at st.pos) as the decode's"""
+        host = ttnn.from_torch(
+            self._hist_host(st), dtype=ttnn.bfloat16, mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0)
+        )
+        ttnn.copy_host_to_device_tensor(host, self.hist_t)
+
+    def load_state(self, st):
+        """write st (GDN states, conv histories at st.pos, KV caches) as the decode state"""
+        per_chip = ttnn.ShardTensorToMesh(self.mesh, dim=0)
+        hosts = [
+            (ttnn.from_torch(self._hist_host(st), dtype=ttnn.bfloat16, mesh_mapper=per_chip), self.hist_t),
+            (
+                ttnn.from_torch(
+                    self._state_host(st), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, mesh_mapper=per_chip
+                ),
+                self.state_t,
+            ),
+        ]
+        for which, dev in (("K", self.K_t), ("V", self.V_t)):
+            hosts.append(
+                (
+                    ttnn.from_torch(
+                        self._kv_host(st, which), dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, mesh_mapper=per_chip
+                    ),
+                    dev,
+                )
+            )
+        for host, dev in hosts:
+            ttnn.copy_host_to_device_tensor(host, dev)
+        ttnn.synchronize_device(self.mesh)
+
     def reset(self):
         """restore the decode state (GDN states, conv histories, KV caches) to its initial contents"""
         for host, dev in self._initial:
             ttnn.copy_host_to_device_tensor(host, dev)
         ttnn.synchronize_device(self.mesh)
 
+    def capture_trace(self):
+        """record the step's launch into a trace (the device needs a trace region): step() then replays it,
+        which skips the host's per-launch work (~0.5 ms); the token state is written before each replay"""
+        self.trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+        ttnn.generic_op(self.io, self.mesh_pd)
+        ttnn.end_trace_capture(self.mesh, self.trace_id, cq_id=0)
+        ttnn.synchronize_device(self.mesh)
+
+    def release_trace(self):
+        if getattr(self, "trace_id", None) is not None:
+            ttnn.release_trace(self.mesh, self.trace_id)
+            self.trace_id = None
+
     def step(self, tok_host):
         ttnn.copy_host_to_device_tensor(tok_host, self.tok_t)
-        ttnn.generic_op(self.io, self.mesh_pd)
+        if getattr(self, "trace_id", None) is not None:
+            ttnn.execute_trace(self.mesh, self.trace_id, cq_id=0, blocking=False)
+        else:
+            ttnn.generic_op(self.io, self.mesh_pd)
 
     def x(self):
         got = ttnn.to_torch(self.hub_slots, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
@@ -1055,6 +1152,13 @@ class ResidentModel:
         """the last layer's mixer output as received by streamer 0 of each chip"""
         o = ttnn.to_torch(self.o_in_t, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
         return o.reshape(self.d.n, self.S, -1)[:, 0]
+
+    def argmax(self):
+        """vocab index of the largest logit (the first one on ties), from the streamers' candidates"""
+        raw = ttnn.to_torch(self.argmax_t, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0))
+        c = raw.reshape(-1, 4)[:, :2].to(torch.int64) & 0xFFFFFFFF
+        best = c[:, 0].max()
+        return int(c[c[:, 0] == best, 1].min())
 
     def logits(self):
         """per-chip logits [n, vocab_chip] in vocab order"""

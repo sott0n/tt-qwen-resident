@@ -19,7 +19,13 @@
 // then gdn_heads x (x, y) of the head cores, then 2 x (x, y) of the attention leader and tail core,
 // then num_streamers x (x, y) of the streamers, then an optional timeline buffer (0 = off): per layer 8
 // wall-clock words at the phase boundaries (slots, row ready, mixer done, attn partial sent, slots,
-// act slice ready, act complete, mlp partial sent), after the reader's 8 words.
+// act slice ready, act complete, mlp partial sent), after the reader's 8 words; then (lm_head) the
+// argmax record address on the hub (0 = off), this core's valid logit columns and the vocab index of
+// its first column.
+//
+// With the lm_head the writer scans this core's logits for their maximum (the first one on ties) and
+// writes (order key, vocab index) to record slot [core] on the hub, so the host reads num_streamers
+// candidates per chip instead of the logits.
 
 #include "api/dataflow/dataflow_api.h"
 #include "streamer_common.hpp"
@@ -49,6 +55,10 @@ void kernel_main() {
     constexpr uint32_t attn_base = heads_base + 2 * gdn_heads;
     constexpr uint32_t peers_base = attn_base + 4;
     const uint32_t ts_addr = get_arg_val<uint32_t>(peers_base + 2 * num_streamers);
+    const uint32_t argmax_addr = get_arg_val<uint32_t>(peers_base + 2 * num_streamers + 1);
+    const uint32_t valid_cols = get_arg_val<uint32_t>(peers_base + 2 * num_streamers + 2);
+    const uint32_t first_index = get_arg_val<uint32_t>(peers_base + 2 * num_streamers + 3);
+    const uint32_t core = get_arg_val<uint32_t>(peers_base + 2 * num_streamers + 4);
     volatile tt_l1_ptr uint32_t* ts = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ts_addr);
     volatile uint32_t* clk = reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
     auto mark = [&](uint32_t l, uint32_t i) {
@@ -167,6 +177,33 @@ void kernel_main() {
     }
     if constexpr (lm_head) {
         take_slots(2 * layers);
+        if (argmax_addr) {
+            // bf16 bits -> unsigned key in the order of the values; the 1x32 tiles hold the columns in order
+            cb_wait_front(cb_logits, nv_max);
+            volatile tt_l1_ptr uint32_t* v = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_logits));
+            auto key = [](uint32_t b) { return (b & 0x8000) ? (~b & 0xffff) : (b | 0x8000); };
+            uint32_t best = 0, best_i = 0;
+            for (uint32_t i = 0; i < valid_cols; i += 2) {
+                const uint32_t w = v[i / 2];
+                const uint32_t k0 = key(w & 0xffff);
+                if (k0 > best) {
+                    best = k0;
+                    best_i = i;
+                }
+                if (i + 1 < valid_cols) {
+                    const uint32_t k1 = key(w >> 16);
+                    if (k1 > best) {
+                        best = k1;
+                        best_i = i + 1;
+                    }
+                }
+            }
+            volatile tt_l1_ptr uint32_t* rec = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_pout));
+            rec[0] = best;
+            rec[1] = first_index + best_i;
+            noc_async_write(get_write_ptr(cb_pout), get_noc_addr(hub_x, hub_y, argmax_addr + core * 16), 16);
+            noc_async_write_barrier();
+        }
     }
     noc_async_atomic_barrier();
 }
