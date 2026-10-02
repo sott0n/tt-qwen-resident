@@ -9,10 +9,12 @@ from loguru import logger
 
 import ttnn
 from models.experimental.qwen36_resident.prefill.pp_prefill import (
+    A0,
     CONV_CH,
     EPS,
     GDN_COLS,
     TILE,
+    QD,
     VD,
     Z0,
     PPPrefill,
@@ -73,11 +75,14 @@ def test_conv(mesh_device, C):
         ctrl[p, 0, 0, :2] = torch.tensor([valid[p], 1])
     pp.carry = {0: _dev(mesh_device, carry, ttnn.bfloat16)}
     pp.w = [dict(taps=_dev(mesh_device, tt, ttnn.bfloat16))]
-    pp.conv_y = _dev(mesh_device, torch.zeros(n, 1, C, CONV_CH), ttnn.bfloat16)
+    pp.q_t = _dev(mesh_device, torch.zeros(n, C, QD), ttnn.bfloat16)
+    pp.k_t = _dev(mesh_device, torch.zeros(n, C, QD), ttnn.bfloat16)
+    pp.v_t = _dev(mesh_device, torch.zeros(n, C, VD), ttnn.bfloat16)
     pp.ctrl = _dev(mesh_device, ctrl, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
     pp._conv_program()
     pp._conv(_dev(mesh_device, x, ttnn.bfloat16), 0)
-    y, new_carry = _cat(mesh_device, pp.conv_y), _cat(mesh_device, pp.carry[0])
+    y = torch.cat([_cat(mesh_device, t) for t in (pp.q_t, pp.k_t, pp.v_t)], dim=-1)[:, None]
+    new_carry = _cat(mesh_device, pp.carry[0])
     for p in range(n):
         win = torch.cat([carry[p, 0, :3], x[p, 0, :, :CONV_CH]])
         ref = torch.nn.functional.silu(sum(win[k : k + C] * taps[:, k] for k in range(4)))
@@ -85,6 +90,40 @@ def test_conv(mesh_device, C):
         c_err = float((new_carry[p, 0, :3] - win[valid[p] : valid[p] + 3]).abs().max())
         logger.info(f"chip {p}, {valid[p]} valid rows: y max err {y_err:.4f}, carry max err {c_err:.4f}")
         assert y_err < 0.05 * float(ref.abs().max()) and c_err == 0
+
+
+@pytest.mark.parametrize("C", [256, 1024])
+@pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
+def test_gates(mesh_device, C):
+    """g = neg_a * softplus(a + dt), beta = sigmoid(b) from the projection's a | b columns, masked to the
+    valid rows (zero on a chip whose chunk does not update)"""
+    n = mesh_device.get_num_devices()
+    pp = _bare(mesh_device, C)
+    g = torch.Generator().manual_seed(0)
+    p = torch.randn(n, 1, C, GDN_COLS, generator=g).bfloat16().float()
+    dt, neg_a = torch.randn(n, NV, generator=g), -torch.rand(n, NV, generator=g) * 4
+    row0 = (
+        lambda v: torch.cat([v, torch.zeros(n, 2 * TILE - NV)], -1)[:, None, None].expand(n, 1, TILE, 2 * TILE).clone()
+    )
+    valid, update = [C, C - 5, 30, C][:n], [1, 1, 1, 0][:n]
+    ctrl = torch.zeros(n, 1, 1, 8, dtype=torch.int32)
+    for c in range(n):
+        ctrl[c, 0, 0, :2] = torch.tensor([valid[c], update[c]])
+    pp.w = [dict(dt=_dev(mesh_device, row0(dt), ttnn.float32), neg_a=_dev(mesh_device, row0(neg_a), ttnn.float32))]
+    pp.ctrl = _dev(mesh_device, ctrl, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+    pp.g_t = _dev(mesh_device, torch.zeros(n, C, NV), ttnn.float32)
+    pp.beta_t = _dev(mesh_device, torch.zeros(n, C, NV), ttnn.float32)
+    pp._gates(_dev(mesh_device, p, ttnn.bfloat16), 0)
+    got_g, got_b = _cat(mesh_device, pp.g_t), _cat(mesh_device, pp.beta_t)
+    a, b = p[:, 0, :, A0 : A0 + NV], p[:, 0, :, A0 + NV : A0 + 2 * NV]
+    mask = torch.zeros(n, C, 1)
+    for c in range(n):
+        mask[c, : valid[c]] = float(update[c])
+    ref_g = neg_a[:, None] * torch.nn.functional.softplus(a + dt[:, None]) * mask
+    ref_b = torch.sigmoid(b) * mask
+    errs = (float((got_g - ref_g).abs().max()), float((got_b - ref_b).abs().max()))
+    logger.info(f"gates max err g {errs[0]:.4f} (max {float(ref_g.abs().max()):.2f}), beta {errs[1]:.4f}")
+    assert errs[0] < 0.02 * float(ref_g.abs().max()) and errs[1] < 0.01
 
 
 @pytest.mark.parametrize("C", [256, 1024])

@@ -147,8 +147,14 @@ class PPPrefill:
 
                 e["W"] = dev(stack("mixer", padded), ttnn.bfloat8_b)
                 e["taps"] = dev(stack("mixer", taps), ttnn.bfloat16)
-                e["dt"] = dev(stack("mixer", lambda m: m["dt"].reshape(1, -1)), ttnn.float32)
-                e["neg_a"] = dev(stack("mixer", lambda m: m["neg_a"].reshape(1, -1)), ttnn.float32)
+
+                def row0(v):  # values in row 0 of 32 x 64 (two tiles), broadcast down the rows by the gates
+                    t = torch.zeros(TILE, 2 * TILE)
+                    t[0, : v.shape[0]] = v
+                    return t
+
+                e["dt"] = dev(stack("mixer", lambda m: row0(m["dt"])), ttnn.float32)
+                e["neg_a"] = dev(stack("mixer", lambda m: row0(m["neg_a"])), ttnn.float32)
             self.w.append(e)
             del ws
 
@@ -181,11 +187,15 @@ class PPPrefill:
         )
         self.ids = dev(torch.zeros(n, 1, C, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         self._shift_program()
-        self.conv_y = dev(torch.zeros(n, 1, C, CONV_CH), ttnn.bfloat16)
+        # the delta-rule op's inputs: token-major q, k, v rows and the gates
+        self.q_t = dev(torch.zeros(n, C, QD), ttnn.bfloat16)
+        self.k_t = dev(torch.zeros(n, C, QD), ttnn.bfloat16)
+        self.v_t = dev(torch.zeros(n, C, VD), ttnn.bfloat16)
+        self.g_t = dev(torch.zeros(n, C, NV), ttnn.float32)
+        self.beta_t = dev(torch.zeros(n, C, NV), ttnn.float32)
         self.gate_y = dev(torch.zeros(n, 1, C, VD), ttnn.bfloat16)
-        # per tick and chip: [valid rows, update] for the conv, the row mask of the gates, rope, KV blocks
+        # per tick and chip: [valid rows, update] for the conv and the gates, rope, KV blocks
         self.ctrl = dev(torch.zeros(n, 1, 1, 8, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
-        self.mask = dev(torch.zeros(n, 1, C, 1), ttnn.float32)
         self.cos = dev(torch.zeros(n, 1, C, ROT), ttnn.bfloat16)
         self.sin = dev(torch.zeros(n, 1, C, ROT), ttnn.bfloat16)
         self.fill_pt = dev(torch.zeros(n, C // block, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
@@ -289,7 +299,7 @@ class PPPrefill:
         self._conv_dims = (Ct, Rt, Xw, cores)
 
     def _conv(self, p, j):
-        """silu(causal conv1d) of the q | k | v columns of p into conv_y; updates carry[j] per ctrl"""
+        """silu(causal conv1d) of the q | k | v columns of p into q_t, k_t, v_t; updates carry[j] per ctrl"""
         Ct, Rt, Xw, cores = self._conv_dims
         all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in self._conv_cores])
         cbs = [
@@ -309,12 +319,8 @@ class PPPrefill:
                 self.carry[j].buffer_address(),
                 self.w[j]["taps"].buffer_address(),
             ]
-            wr[core.x][core.y] = [
-                i,
-                cores,
-                self.conv_y.buffer_address(),
-                self.carry[j].buffer_address(),
-                self.ctrl.buffer_address(),
+            wr[core.x][core.y] = [i, cores] + [
+                t.buffer_address() for t in (self.q_t, self.k_t, self.v_t, self.carry[j], self.ctrl)
             ]
         compute = ttnn.ComputeConfigDescriptor()
         compute.math_fidelity = ttnn.MathFidelity.HiFi4
@@ -334,7 +340,7 @@ class PPPrefill:
                 kernel_source=KDIR + "conv_writer.cpp",
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=all_cores,
-                compile_time_args=[Rt, Ct],
+                compile_time_args=[Rt, Ct, QD // TILE],
                 runtime_args=wr,
                 config=ttnn.DataMovementConfigDescriptor(
                     processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.RISCV_0_default
@@ -355,8 +361,75 @@ class PPPrefill:
         program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
         mesh_pd = ttnn.MeshProgramDescriptor()
         mesh_pd[ttnn.MeshCoordinateRange(ttnn.MeshCoordinate(0, 0), ttnn.MeshCoordinate(0, self.n - 1))] = program
-        ttnn.generic_op([p, self.carry[j], self.w[j]["taps"], self.conv_y, self.ctrl], mesh_pd)
-        return self.conv_y
+        ttnn.generic_op([p, self.carry[j], self.w[j]["taps"], self.q_t, self.k_t, self.v_t, self.ctrl], mesh_pd)
+
+    def _gates(self, p, j):
+        """g = neg_a * softplus(a + dt), beta = sigmoid(b) from the a | b columns of p, both masked to the
+        chunk's valid rows (kernels/gates_*.cpp), into g_t and beta_t"""
+        mesh, C = self.mesh, self.C
+        grid = mesh.compute_with_storage_grid_size()
+        Rt = C // TILE
+        cores = min(grid.x * grid.y, Rt)
+        per = [Rt // cores + (i < Rt % cores) for i in range(cores)]
+        coords = [ttnn.CoreCoord(i % grid.x, i // grid.x) for i in range(cores)]
+        all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in coords])
+        bf, f32 = (ttnn.bfloat16, 2048), (ttnn.float32, 4096)
+        spec = {0: (bf, 3), 1: (bf, 2), 2: (bf, 2), 3: (f32, 2), 4: (f32, 2), 5: (f32, 1), 6: (f32, 1), 7: (f32, 1)}
+        spec.update({16: (f32, 2), 17: (f32, 2)})
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=cnt * page,
+                core_ranges=all_cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=dt, page_size=page)],
+            )
+            for i, ((dt, page), cnt) in spec.items()
+        ]
+        w = self.w[j]
+        rr, wr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        first, by_count = 0, {}
+        for c, cnt in zip(coords, per):
+            rr[c.x][c.y] = [first, cnt] + [t.buffer_address() for t in (p, w["dt"], w["neg_a"], self.ctrl)]
+            wr[c.x][c.y] = [first, cnt, self.g_t.buffer_address(), self.beta_t.buffer_address()]
+            by_count.setdefault(cnt, []).append(c)
+            first += cnt
+        dm = lambda proc, noc: ttnn.DataMovementConfigDescriptor(processor=proc, noc=noc)
+        compute = ttnn.ComputeConfigDescriptor()
+        compute.math_fidelity = ttnn.MathFidelity.HiFi4
+        compute.fp32_dest_acc_en = True
+        kernel = lambda src, cores_, ct, rt, cfg: ttnn.KernelDescriptor(
+            kernel_source=KDIR + src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores_,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=cfg,
+        )
+        kernels = [
+            kernel(
+                "gates_reader.cpp",
+                all_cores,
+                [GDN_COLS // TILE, A0 // TILE],
+                rr,
+                dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.RISCV_1_default),
+            ),
+            kernel(
+                "gates_writer.cpp", all_cores, [], wr, dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.RISCV_0_default)
+            ),
+        ]
+        for cnt, cs in by_count.items():
+            kernels.append(
+                kernel(
+                    "gates_compute.cpp",
+                    ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in cs]),
+                    [cnt],
+                    ttnn.RuntimeArgs(),
+                    compute,
+                )
+            )
+        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+        pd = ttnn.MeshProgramDescriptor()
+        pd[ttnn.MeshCoordinateRange(ttnn.MeshCoordinate(0, 0), ttnn.MeshCoordinate(0, self.n - 1))] = program
+        ttnn.generic_op([p, w["dt"], w["neg_a"], self.ctrl, self.g_t, self.beta_t], pd)
 
     def _gate(self, o, p):
         """rmsnorm over each head's 128 dims of the head-major delta-rule output o, times silu(z) of the
@@ -474,30 +547,20 @@ class PPPrefill:
             dtype=ttnn.bfloat16,
         )
 
-    def _gdn(self, x, j):
+    def _gdn(self, h, j):
         C, w = self.C, self.w[j]
-        h = ttnn.rms_norm(x, epsilon=EPS)
         p = self._linear(h, w["W"], "gdn")
-        ttnn.deallocate(h)
-        y = self._conv(p, j)
-        # token-major q | k | v rows go to the delta-rule op as they are ([1, C, width] is a view): it
-        # L2-normalizes q and k per head itself (folding q's scale) and returns o head-major
-        q = ttnn.reshape(ttnn.slice(y, (0, 0, 0, 0), (1, 1, C, QD)), (1, C, QD))
-        k = ttnn.reshape(ttnn.slice(y, (0, 0, 0, QD), (1, 1, C, 2 * QD)), (1, C, QD))
-        v = ttnn.reshape(ttnn.slice(y, (0, 0, 0, 2 * QD), (1, 1, C, CONV_CH)), (1, C, VD))
-        ab = ttnn.typecast(ttnn.slice(p, (0, 0, 0, A0), (1, 1, C, A0 + 2 * NV)), ttnn.float32)
-        a = ttnn.slice(ab, (0, 0, 0, 0), (1, 1, C, NV))
-        b = ttnn.slice(ab, (0, 0, 0, NV), (1, 1, C, 2 * NV))
-        # masked rows / chunks: g = 0, beta = 0 leave the state unchanged
-        beta = ttnn.multiply(ttnn.sigmoid(b), self.mask)
-        g = ttnn.multiply(ttnn.multiply(ttnn.softplus(ttnn.add(a, w["dt"])), w["neg_a"]), self.mask)
+        # q, k, v rows and the gates go to the delta-rule op token-major: it L2-normalizes q and k per head
+        # itself (folding q's scale) and returns o head-major
+        self._conv(p, j)
+        self._gates(p, j)
         eye, tril, ones, masks = self.gdn_consts
         o, S = ttnn.transformer.chunk_gated_delta_rule(
-            q,
-            k,
-            v,
-            ttnn.reshape(g, (1, C, NV)),
-            ttnn.reshape(beta, (1, C, NV)),
+            self.q_t,
+            self.k_t,
+            self.v_t,
+            self.g_t,
+            self.beta_t,
             scale=DK**-0.5,
             initial_state=self.S[j],
             output_final_state=True,
@@ -514,7 +577,7 @@ class PPPrefill:
         # per-head rmsnorm (its weight is folded into out) * silu(z), token-major
         o = self._gate(o, p)
         out = self._linear(o, w["out"], "out")
-        return ttnn.add(x, out)
+        return out
 
     def _rope(self, t):
         r, rest = ttnn.slice(t, (0, 0, 0, 0), (1, t.shape[1], self.C, ROT)), None
@@ -523,9 +586,8 @@ class PPPrefill:
         r = ttnn.add(ttnn.multiply(r, self.cos), ttnn.multiply(rot, self.sin))
         return ttnn.concat([r, rest], dim=-1)
 
-    def _attn(self, x, j):
+    def _attn(self, h, j):
         C, w = self.C, self.w[j]
-        h = ttnn.rms_norm(x, epsilon=EPS)
         p = self._linear(h, w["W"], "attn")
         qd = NQ * HD
         gate = ttnn.slice(p, (0, 0, 0, qd), (1, 1, C, 2 * qd))
@@ -553,16 +615,15 @@ class PPPrefill:
         o = ttnn.experimental.nlp_concat_heads(o, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         o = ttnn.multiply(o, gate, input_tensor_b_activations=[ttnn.UnaryOpType.SIGMOID])
         out = self._linear(o, w["out"], "out")
-        return ttnn.add(x, out)
+        return out
 
-    def _mlp(self, x, j):
+    def _mlp(self, h, j):
         C, w = self.C, self.w[j]
-        h = ttnn.rms_norm(x, epsilon=EPS)
         g = self._linear(h, w["G"], "gu", activation="silu")
         u = self._linear(h, w["U"], "gu")
         a = ttnn.multiply(g, u)
         out = self._linear(a, w["D"], "down")
-        return ttnn.add(x, out)
+        return out
 
     def _body(self):
         """one tick: stage inputs (chip 0 the chunk's embeddings, chip p > 0 chip p - 1's last output),
@@ -572,10 +633,11 @@ class PPPrefill:
         ttnn.generic_op([self.x_last, self.x_in], self._shift_pd)
         x = self.x_in
         for j, attn in enumerate(self.kinds):
-            x = self._attn(x, j) if attn else self._gdn(x, j)
-            x = self._mlp(x, j)
+            h = ttnn.rms_norm(x, epsilon=EPS)
+            x = ttnn.add(x, self._attn(h, j) if attn else self._gdn(h, j))
+            x = ttnn.add(x, self._mlp(ttnn.rms_norm(x, epsilon=EPS), j))
         ttnn.copy(x, self.x_last)
-        return x
+        return self.x_last
 
     # ------------------------------------------------------------------ ticks
     def _control(self, t, n_tokens):
@@ -583,7 +645,6 @@ class PPPrefill:
         n, C, blk = self.n, self.C, self.block
         chunks = (n_tokens + C - 1) // C
         ctrl = torch.zeros(n, 1, 1, 8, dtype=torch.int32)
-        mask = torch.zeros(n, 1, C, 1)
         cos = torch.zeros(n, 1, C, ROT)
         sin = torch.zeros(n, 1, C, ROT)
         fill = torch.zeros(n, C // blk, dtype=torch.int32)
@@ -594,7 +655,6 @@ class PPPrefill:
             if 0 <= c < chunks:
                 valid = min(C, n_tokens - c * C)
                 ctrl[p, 0, 0, :2] = torch.tensor([valid, 1])
-                mask[p, 0, :valid] = 1.0
                 cos[p, 0], sin[p, 0] = rope_cos_sin(torch.arange(c * C, (c + 1) * C))
                 fill[p] = torch.arange(c * C // blk, (c + 1) * C // blk)
                 cstart[p] = c * C
@@ -606,7 +666,6 @@ class PPPrefill:
         host = lambda v, dt, layout=ttnn.TILE_LAYOUT: ttnn.from_torch(v, dtype=dt, layout=layout, mesh_mapper=shard)
         return [
             (host(ctrl, ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT), self.ctrl),
-            (host(mask, ttnn.float32), self.mask),
             (host(cos, ttnn.bfloat16), self.cos),
             (host(sin, ttnn.bfloat16), self.sin),
             (host(fill, ttnn.int32, ttnn.ROW_MAJOR_LAYOUT), self.fill_pt),

@@ -7,11 +7,12 @@
 //   0 I      s == t              1..3 L_d  s == t - d (t >= d)      4..6 U_d  s == 32 + t - d (t < d)
 //   7 D29    s == t - 29         8 A      s == o - 2 + t (t < 3)    9 B      s == 32 + o - 2 + t (t < 3)
 // with o = (v - 1) % 32 the last valid row's offset in its tile: A @ x_r + B @ x_{r-1} are the 3 inputs
-// ending at the last valid row. Stores y and, when the flag is set, the candidate of the last valid
-// tile as the new carry (in place: the reader of this column has already read the old one).
+// ending at the last valid row. Stores y split into its q, k and v column ranges (the delta-rule op takes
+// them as separate tensors) and, when the flag is set, the candidate of the last valid tile as the new
+// carry (in place: the reader of this column has already read the old one).
 //
-// Compile-time args: 0 Rt, 1 Ct. Runtime args: 0 core, 1 cores, 2 y, 3 carry, 4 control (DRAM uint32
-// page: [0] valid rows, [1] update flag).
+// Compile-time args: 0 Rt, 1 Ct, 2 q tiles per row (= k tiles; v takes the rest). Runtime args: 0 core,
+// 1 cores, 2 q, 3 k, 4 v, 5 carry, 6 control (DRAM uint32 page: [0] valid rows, [1] update flag).
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -41,11 +42,15 @@ void kernel_main() {
 
     constexpr uint32_t cb_consts = 3, cb_out = 6, cb_cand = 7;
     constexpr uint32_t tile = get_tile_size(cb_out);
-    const InterleavedAddrGenFast<true> y{
-        .bank_base_address = get_arg_val<uint32_t>(2), .page_size = tile, .data_format = DataFormat::Float16_b};
+    constexpr uint32_t Qt = get_compile_time_arg_val(2);
+    auto out = [](uint32_t i) {
+        return InterleavedAddrGenFast<true>{
+            .bank_base_address = get_arg_val<uint32_t>(2 + i), .page_size = tile, .data_format = DataFormat::Float16_b};
+    };
+    const InterleavedAddrGenFast<true> q_out = out(0), k_out = out(1), v_out = out(2);
     const InterleavedAddrGenFast<true> carry{
-        .bank_base_address = get_arg_val<uint32_t>(3), .page_size = tile, .data_format = DataFormat::Float16_b};
-    const InterleavedAddrGen<true> ctrl{.bank_base_address = get_arg_val<uint32_t>(4), .page_size = 32};
+        .bank_base_address = get_arg_val<uint32_t>(5), .page_size = tile, .data_format = DataFormat::Float16_b};
+    const InterleavedAddrGen<true> ctrl{.bank_base_address = get_arg_val<uint32_t>(6), .page_size = 32};
 
     cb_reserve_back(cb_consts, kConsts);
     const uint32_t base = get_write_ptr(cb_consts);
@@ -90,7 +95,13 @@ void kernel_main() {
     for (uint32_t col = core; col < Ct; col += cores) {
         for (uint32_t r = 0; r < Rt; r++) {
             cb_wait_front(cb_out, 1);
-            noc_async_write_tile(r * Ct + col, y, get_read_ptr(cb_out));
+            if (col < Qt) {
+                noc_async_write_tile(r * Qt + col, q_out, get_read_ptr(cb_out));
+            } else if (col < 2 * Qt) {
+                noc_async_write_tile(r * Qt + col - Qt, k_out, get_read_ptr(cb_out));
+            } else {
+                noc_async_write_tile(r * (Ct - 2 * Qt) + col - 2 * Qt, v_out, get_read_ptr(cb_out));
+            }
             cb_wait_front(cb_cand, 1);
             if (r == r_last && update) {
                 noc_async_write_tile(col, carry, get_read_ptr(cb_cand));
