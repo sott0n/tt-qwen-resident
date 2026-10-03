@@ -61,7 +61,7 @@ MM_BEST = {
     ("gdn", 1024): (13, 10, 8, 1, 4),
     ("attn", 1024): (12, 8, 8, 4, 2),
     ("out", 1024): (10, 8, 16, 1, 4),
-    ("gu", 1024): (13, 10, 16, 4, 2),
+    ("gu", 1024): (13, 10, 10, 4, 2),
     ("down", 1024): (10, 10, 16, 1, 4),
     ("gdn", 512): (13, 8, 4, 1, 4),
     ("attn", 512): (12, 10, 4, 2, 2),
@@ -796,10 +796,21 @@ class PPPrefill:
         return T
 
     # ------------------------------------------------------------------ handoff
-    def handoff(self, model, n_tokens):
+    def handoff(self, model, n_tokens, timings=None):
         """move the state after n_tokens prompt tokens into the resident decode `model` (TP-sharded):
-        GDN states and KV caches chip to chip on device (kernels/handoff.cpp), conv histories via the host"""
+        GDN states and KV caches chip to chip on device (kernels/handoff.cpp), conv histories via the host.
+        timings, if given, gets the seconds of each part"""
+        import time
+
         import numpy as np
+
+        mark = [time.perf_counter()]
+
+        def lap(name):
+            if timings is not None:
+                ttnn.synchronize_device(self.mesh)
+                mark.append(time.perf_counter())
+                timings[name] = mark[-1] - mark[-2]
 
         n, Ls, d = self.n, self.Ls, model.d
         mesh = self.mesh
@@ -864,6 +875,7 @@ class PPPrefill:
             if jobs[p]:
                 table[p, : len(jobs[p]), :8] = torch.tensor(jobs[p], dtype=torch.int64)
         table = (table & 0xFFFFFFFF).to(torch.int64).numpy().astype(np.uint32).view(np.int32)
+        lap("jobs")
         jobs_t = ttnn.from_torch(
             torch.from_numpy(table.reshape(n * most, 16).copy()),
             dtype=ttnn.uint32,
@@ -929,7 +941,9 @@ class PPPrefill:
             + list(self.K.values())
             + list(self.V.values())
         )
+        lap("upload")
         ttnn.generic_op(io, mesh_pd)
+        lap("copy")
 
         # conv histories (a few MB): carry rows through the host into the decode's history layout
         cat = lambda t: ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
@@ -950,6 +964,7 @@ class PPPrefill:
             ]
         )
         carry = {j: cat(self.carry[j]).float().reshape(n, TILE, CONV_CH)[:, : CONV_K - 1] for j in self.carry}
+        lap("hist_read")
         g_i = 0
         for i in range(self.layers):
             p, j = divmod(i, Ls)
@@ -958,8 +973,10 @@ class PPPrefill:
             cols = carry[j][p][:, local]  # [3, chips, local]
             st.hist[g_i] = [cols[:, chip] for chip in range(d.n)]
             g_i += 1
+        lap("hist_layout")
         model.load_hist(st)
         ttnn.synchronize_device(mesh)
+        lap("hist_write")
         ttnn.deallocate(jobs_t)
 
     def export_state(self, d, n_tokens, max_pos):
