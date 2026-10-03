@@ -72,6 +72,14 @@ def test_pp_matmul_sweep(mesh_device):
                 res.append((timeit(None), "auto"))
             except Exception as e:
                 pass
+            from models.experimental.qwen36_resident.prefill.pp_prefill import PPPrefill
+
+            cur = PPPrefill.__new__(PPPrefill)
+            cur.C, cur.mm_cols = C, 10
+            try:
+                res.append((timeit(cur._mm_config(name)), "cur"))
+            except Exception as e:
+                pass
             # 1D: in0 multicast to every core, N split over the grid (small chunks: weight-read bound)
             for gx, gy in [(13, 10), (13, 8), (12, 10), (10, 10), (13, 5), (8, 8)]:
                 if gx > G.x or gy > G.y:
@@ -125,6 +133,7 @@ def test_pp_matmul_sweep(mesh_device):
                 f"C={C} {name}: "
                 + " | ".join(f"{d*1e6:.0f}us {fl/d/1e12:.0f}TF {s}" for d, s in res[:4])
                 + f" | auto={[f'{d*1e6:.0f}' for d, s in res if s=='auto']}"
+                + f" cur={[f'{d*1e6:.0f}' for d, s in res if s=='cur']}"
             )
             ttnn.deallocate(w)
             ttnn.deallocate(xin)

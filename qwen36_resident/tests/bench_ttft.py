@@ -25,8 +25,8 @@ OUT = os.environ.get("BENCH_OUT", "/tmp/resident_ttft.jsonl")
 @pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
 def test_ttft(mesh_device):
     layers = int(os.environ.get("RESIDENT_LAYERS", "64"))
-    chunks = [int(c) for c in os.environ.get("RESIDENT_CHUNK", "256,512,1024").split(",")]
-    prompts = [int(p) for p in os.environ.get("RESIDENT_PROMPTS", "255,511,1024,2048,8192").split(",")]
+    chunks = [int(c) for c in os.environ.get("RESIDENT_CHUNK", "128,256,512,1024").split(",")]
+    prompts = [int(p) for p in os.environ.get("RESIDENT_PROMPTS", "127,255,511,1024,2048,8192").split(",")]
     ck = Q.Checkpoint()
     n = mesh_device.get_num_devices()
     d = Dims(n, mesh_device.dram_grid_size().x, vocab=ck.config["vocab_size"])

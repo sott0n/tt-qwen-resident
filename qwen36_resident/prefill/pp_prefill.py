@@ -63,24 +63,29 @@ MM_BEST = {
     ("out", 1024): (10, 8, 16, 1, 4),
     ("gu", 1024): (13, 10, 10, 4, 2),
     ("down", 1024): (10, 10, 16, 1, 4),
-    ("gdn", 512): (13, 8, 4, 1, 4),
-    ("attn", 512): (12, 10, 4, 2, 2),
+    ("gdn", 512): ("1d", 13, 8, 4, 1, 5),
+    ("attn", 512): ("1d", 13, 8, 4, 1, 5),
     ("out", 512): (13, 8, 16, 1, 1),
-    ("gu", 512): (13, 8, 4, 2, 2),
+    ("gu", 512): ("1d", 13, 10, 8, 1, 5),
     ("down", 512): (13, 8, 16, 1, 1),
-    # chunk 256: weight-read bound, in0 multicast to the whole grid ("1d": grid x, y, in0_block_w,
+    # chunks <= 256: weight-read bound, in0 multicast to the whole grid ("1d": grid x, y, in0_block_w,
     # out subblock h, w); "auto" = ttnn's own choice
     ("gdn", 256): ("1d", 13, 10, 16, 2, 4),
     ("attn", 256): ("1d", 12, 10, 16, 2, 4),
     ("out", 256): ("1d", 13, 5, 16, 2, 3),
     ("gu", 256): "auto",
     ("down", 256): ("1d", 13, 5, 16, 2, 3),
+    ("gdn", 128): ("1d", 13, 8, 4, 1, 5),
+    ("attn", 128): ("1d", 12, 10, 16, 2, 4),
+    ("out", 128): ("1d", 13, 5, 8, 2, 3),
+    ("gu", 128): "auto",
+    ("down", 128): ("1d", 13, 5, 8, 2, 3),
 }
 
 
 # a 64-layer tick at chunk C takes about base + slope * (mean context in K tokens) ms (QB2, traced: the
 # attention part grows with the context)
-TICK_MS = {256: (32.5, 2.9), 512: (48.0, 3.5), 1024: (81.0, 3.0)}
+TICK_MS = {128: (25.3, 1.6), 256: (32.5, 2.9), 512: (45.5, 3.2), 1024: (81.0, 3.0)}
 
 
 def rope_cos_sin(positions):
@@ -111,7 +116,9 @@ class PPPrefill:
         self.layers, self.interval, self.Ls, self.block = layers, interval, layers // n, block
         self.mm_cols = mm_cols
         C = max(self.chunks)
-        self.max_len = max_len or 4 * C
+        # whole chunks, and whole 8-block rows of the KV page table (SDPA reads 32 B page-table rows)
+        step = math.lcm(C, 8 * block)
+        self.max_len = -(-(max_len or 4 * C) // step) * step
         assert all(c % block == 0 and self.max_len % c == 0 for c in self.chunks)
         self.kinds = [is_attn(j, interval) for j in range(self.Ls)]
         shard, rep = ttnn.ShardTensorToMesh(mesh, dim=0), ttnn.ReplicateTensorToMesh(mesh)
@@ -630,7 +637,7 @@ class PPPrefill:
         mesh, C = self.mesh, self.C
         grid = mesh.compute_with_storage_grid_size()
         Rt, Ht = C // TILE, HIDDEN // TILE
-        Q = max(q for q in range(1, Ht + 1) if Ht % q == 0 and Rt * q <= grid.x * grid.y)
+        Q = max(q for q in range(1, Ht + 1) if Ht % q == 0 and (Ht // q) % 2 == 0 and Rt * q <= grid.x * grid.y)
         W = Ht // Q
         coords = [ttnn.CoreCoord(i % grid.x, i // grid.x) for i in range(Rt * Q)]
         phys = [mesh.worker_core_from_logical_core(c) for c in coords]
