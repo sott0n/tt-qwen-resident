@@ -969,47 +969,57 @@ class PPPrefill:
         core, sem = self._ho["core"], self._ho["sem"]
         banks = d.banks
         kv_row = (HD // TILE) * 1088
-        jobs = [[] for _ in range(n)]  # per chip, [m, 8] job rows
-        packets_in = [0] * n
-        tiles = (n_tokens + TILE - 1) // TILE
-        per_block = self.block // TILE
-        t = torch.arange(tiles, dtype=torch.int64)
-        bk, rt = t // per_block, t % per_block
-        g_i = a_i = 0
-        for i in range(self.layers):
-            p, j = divmod(i, Ls)
-            if self.kinds[j]:
-                for src, dst in ((self.K[j], model.K_t), (self.V[j], model.V_t)):
+        if self._ho.get("model") is not model:
+            # every job for a max_len prompt, once per decode model: per chip [m, 8] rows, each row's KV tile
+            # (-1: a GDN state, always sent) and the packets it sends to another chip
+            rows, tile_of, pk = [[] for _ in range(n)], [[] for _ in range(n)], [[] for _ in range(n)]
+            tiles_max = self.max_len // TILE
+            per_block = self.block // TILE
+            t = torch.arange(tiles_max, dtype=torch.int64)
+            bk, rt = t // per_block, t % per_block
+            g_i = a_i = 0
+            for i in range(self.layers):
+                p, j = divmod(i, Ls)
+                if self.kinds[j]:
+                    for src, dst in ((self.K[j], model.K_t), (self.V[j], model.V_t)):
+                        for c in range(n):
+                            r = torch.empty(tiles_max, 8, dtype=torch.int64)
+                            r[:, 0] = c
+                            r[:, 1] = src.buffer_address()
+                            r[:, 2] = ((bk * NKV + c) * per_block + rt) * (HD // TILE)
+                            r[:, 3] = 1088
+                            r[:, 4] = 1
+                            r[:, 5] = dst.buffer_address() + (a_i * model.rpb + t // banks) * kv_row
+                            r[:, 6] = t % banks
+                            r[:, 7] = HD // TILE
+                            rows[p].append(r)
+                            tile_of[p].append(t)
+                            pk[p].append(torch.full((tiles_max,), -(-kv_row // 4096) if c != p else 0))
+                    a_i += 1
+                else:
+                    pages = d.nv * 16
                     for c in range(n):
-                        rows = torch.empty(tiles, 8, dtype=torch.int64)
-                        rows[:, 0] = c
-                        rows[:, 1] = src.buffer_address()
-                        rows[:, 2] = ((bk * NKV + c) * per_block + rt) * (HD // TILE)
-                        rows[:, 3] = 1088
-                        rows[:, 4] = 1
-                        rows[:, 5] = dst.buffer_address() + (a_i * model.rpb + t // banks) * kv_row
-                        rows[:, 6] = t % banks
-                        rows[:, 7] = HD // TILE
-                        jobs[p].append(rows)
-                        if c != p:
-                            packets_in[c] += tiles * -(-kv_row // 4096)
-                a_i += 1
-            else:
-                pages = d.nv * 16
-                for c in range(n):
-                    jobs[p].append(
-                        torch.tensor(
-                            [
-                                [c, self.S[j].buffer_address(), c * pages, 4096, 0, model.state_t.buffer_address()]
-                                + [g_i * pages, pages]
-                            ],
-                            dtype=torch.int64,
+                        rows[p].append(
+                            torch.tensor(
+                                [
+                                    [c, self.S[j].buffer_address(), c * pages, 4096, 0, model.state_t.buffer_address()]
+                                    + [g_i * pages, pages]
+                                ],
+                                dtype=torch.int64,
+                            )
                         )
-                    )
-                    if c != p:
-                        packets_in[c] += pages
-                g_i += 1
-        jobs = [torch.cat(jb) if jb else torch.zeros(0, 8, dtype=torch.int64) for jb in jobs]
+                        tile_of[p].append(torch.tensor([-1]))
+                        pk[p].append(torch.tensor([pages if c != p else 0]))
+                    g_i += 1
+            cat = lambda xs: [torch.cat(x) for x in xs]
+            self._ho.update(model=model, rows=cat(rows), tile_of=cat(tile_of), pk=cat(pk))
+        tiles = (n_tokens + TILE - 1) // TILE
+        jobs, packets_in = [], torch.zeros(n, dtype=torch.int64)
+        for p in range(n):
+            sel = self._ho["tile_of"][p] < tiles
+            jobs.append(self._ho["rows"][p][sel])
+            packets_in += torch.bincount(jobs[p][:, 0], weights=self._ho["pk"][p][sel].double(), minlength=n).long()
+        packets_in = packets_in.tolist()
         most = max(1, max(len(jb) for jb in jobs))
         table = torch.zeros(n, most, 16, dtype=torch.int64)
         for p in range(n):
