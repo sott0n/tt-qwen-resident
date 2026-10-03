@@ -69,16 +69,16 @@ MM_BEST = {
     ("gu", 512): ("1d", 13, 10, 8, 1, 5),
     ("down", 512): (13, 8, 16, 1, 1),
     # chunks <= 256: weight-read bound, in0 multicast to the whole grid ("1d": grid x, y, in0_block_w,
-    # out subblock h, w); "auto" = ttnn's own choice
+    # out subblock h, w; these fuse gate's SiLU, ttnn's own choice "auto" does not)
     ("gdn", 256): ("1d", 13, 10, 16, 2, 4),
     ("attn", 256): ("1d", 12, 10, 16, 2, 4),
     ("out", 256): ("1d", 13, 5, 16, 2, 3),
-    ("gu", 256): "auto",
+    ("gu", 256): ("1d", 8, 8, 4, 2, 3),
     ("down", 256): ("1d", 13, 5, 16, 2, 3),
     ("gdn", 128): ("1d", 13, 8, 4, 1, 5),
     ("attn", 128): ("1d", 12, 10, 16, 2, 4),
     ("out", 128): ("1d", 13, 5, 8, 2, 3),
-    ("gu", 128): "auto",
+    ("gu", 128): ("1d", 13, 10, 8, 1, 5),
     ("down", 128): ("1d", 13, 5, 8, 2, 3),
 }
 
