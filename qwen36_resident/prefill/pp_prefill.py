@@ -68,12 +68,19 @@ MM_BEST = {
     ("out", 512): (13, 8, 16, 1, 1),
     ("gu", 512): (13, 8, 4, 2, 2),
     ("down", 512): (13, 8, 16, 1, 1),
+    # chunk 256: weight-read bound, in0 multicast to the whole grid ("1d": grid x, y, in0_block_w,
+    # out subblock h, w); "auto" = ttnn's own choice
+    ("gdn", 256): ("1d", 13, 10, 16, 2, 4),
+    ("attn", 256): ("1d", 12, 10, 16, 2, 4),
+    ("out", 256): ("1d", 13, 5, 16, 2, 3),
+    ("gu", 256): "auto",
+    ("down", 256): ("1d", 13, 5, 16, 2, 3),
 }
 
 
-# a 64-layer tick at chunk C takes about TICK_MS[0] + TICK_MS[1] * C ms (QB2: 53 ms at 512, 84 ms at 1024
-# for a 2k prompt)
-TICK_MS = (22.0, 0.068)
+# a 64-layer tick at chunk C takes about base + slope * (mean context in K tokens) ms (QB2, traced: the
+# attention part grows with the context)
+TICK_MS = {256: (32.5, 2.9), 512: (48.0, 3.5), 1024: (81.0, 3.0)}
 
 
 def rope_cos_sin(positions):
@@ -244,10 +251,14 @@ class PPPrefill:
             setattr(self, k, v)
 
     def pick_chunk(self, T):
-        """the chunk size with the shortest estimated prefill: (chunks + n - 1) ticks of TICK_MS[0] +
-        TICK_MS[1] * C (fixed per-op cost plus work, fit to measured ticks on QB2)"""
-        a, b = TICK_MS
-        return min(self.chunks, key=lambda C: ((T + C - 1) // C + self.n - 1) * (a + b * C))
+        """the chunk size with the shortest estimated prefill: (chunks + n - 1) ticks of TICK_MS at the
+        prompt's mean context (sizes without a measurement scale the 512 one)"""
+
+        def est(C):
+            base, slope = TICK_MS.get(C, (TICK_MS[512][0] * C / 512, TICK_MS[512][1]))
+            return ((T + C - 1) // C + self.n - 1) * (base + slope * T / 2048)
+
+        return min(self.chunks, key=est)
 
     # ------------------------------------------------------------------ pipeline shift
     def _shift_program(self):
@@ -670,8 +681,8 @@ class PPPrefill:
 
     # ------------------------------------------------------------------ layers
     def _mm_config(self, key, fused_activation=None):
-        """the measured best 2D multicast config of a projection at this chunk (tests/_sweep), else the
-        qwen36 prefill heuristic"""
+        """the measured best matmul config of a projection at this chunk (tests/bench_pp_matmul.py), else
+        the qwen36 prefill heuristic"""
         K, N = MM_SHAPES[key]
         best = MM_BEST.get((key, self.C))
         if best is None:
@@ -681,6 +692,21 @@ class PPPrefill:
                 )
             except Exception:
                 return None
+        if best == "auto":
+            return None
+        if best[0] == "1d":
+            _, gx, gy, bw, sh, sw = best
+            return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                compute_with_storage_grid_size=(gx, gy),
+                in0_block_w=bw,
+                out_subblock_h=sh,
+                out_subblock_w=sw,
+                per_core_M=self.C // TILE,
+                per_core_N=math.ceil(N // TILE / (gx * gy)),
+                fuse_batch=True,
+                fused_activation=fused_activation,
+                mcast_in0=True,
+            )
         gx, gy, bw, sh, sw = best
         return ttnn.MatmulMultiCoreReuseMultiCastProgramConfig(
             compute_with_storage_grid_size=(gx, gy),

@@ -72,7 +72,30 @@ def test_pp_matmul_sweep(mesh_device):
                 res.append((timeit(None), "auto"))
             except Exception as e:
                 pass
-            for gx, gy in itertools.product([8, 10, 11, 12, 13], [8, 10]):
+            # 1D: in0 multicast to every core, N split over the grid (small chunks: weight-read bound)
+            for gx, gy in [(13, 10), (13, 8), (12, 10), (10, 10), (13, 5), (8, 8)]:
+                if gx > G.x or gy > G.y:
+                    continue
+                pn = math.ceil(Nt / (gx * gy))
+                for bw in [b for b in (4, 8, 16) if Kt % b == 0]:
+                    sw = max(d for d in range(1, 9) if pn % d == 0)
+                    sh = max(d for d in range(1, 9) if Mt % d == 0 and d * sw <= 8)
+                    pc = ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+                        compute_with_storage_grid_size=(gx, gy),
+                        in0_block_w=bw,
+                        out_subblock_h=sh,
+                        out_subblock_w=sw,
+                        per_core_M=Mt,
+                        per_core_N=pn,
+                        fuse_batch=True,
+                        fused_activation=None,
+                        mcast_in0=True,
+                    )
+                    try:
+                        res.append((timeit(pc), f"1d g{gx}x{gy} bw{bw} sb{sh}x{sw} pn{pn}"))
+                    except Exception as e:
+                        pass
+            for gx, gy in itertools.product([8, 10, 11, 12, 13], [4, 8, 10]):
                 if gx > G.x or gy > G.y:
                     continue
                 pm, pn = math.ceil(Mt / gy), math.ceil(Nt / gx)
