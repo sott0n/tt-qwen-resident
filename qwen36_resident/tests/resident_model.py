@@ -1027,10 +1027,10 @@ class ResidentModel:
             t, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh)
         )
 
-    def _hist_host(self, st):
-        """conv histories of st as the hist tensor: per (streamer, GDN copy) row, 3 x 32 1x32 tiles; the ring
-        slot of age a (0 = oldest) at position p is (p * uses + a) % 3 (see conv_step in streamer_common.hpp)"""
-        d, n, S, copies, blk = self.d, self.d.n, self._S, self._gdn_copies, TILE * TILE
+    def hist_index(self):
+        """(streamer row, element in the row's 32 x 32 slot, conv column of the chip's q | k | v columns) of
+        every conv history element; the same on every chip"""
+        d, S = self.d, self._S
         if not hasattr(self, "_hist_map"):
             # (streamer, block tile) -> conv tile of the chip's q | k | v columns, for the conv tiles only
             rows, tiles, convs = [], [], []
@@ -1049,7 +1049,13 @@ class ResidentModel:
                 (torch.tensor(tiles)[:, None] * TILE + e).reshape(-1),
                 (torch.tensor(convs)[:, None] * TILE + e).reshape(-1),
             )
-        rows, cols, src = self._hist_map
+        return self._hist_map
+
+    def _hist_host(self, st):
+        """conv histories of st as the hist tensor: per (streamer, GDN copy) row, 3 x 32 1x32 tiles; the ring
+        slot of age a (0 = oldest) at position p is (p * uses + a) % 3 (see conv_step in streamer_common.hpp)"""
+        d, n, S, copies, blk = self.d, self.d.n, self._S, self._gdn_copies, TILE * TILE
+        rows, cols, src = self.hist_index()
         hist = torch.zeros(n, S * copies, (CONV_K - 1) * blk)
         rep_rows = rows.repeat_interleave(TILE)
         for c in range(len(st.hist)):

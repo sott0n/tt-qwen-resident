@@ -945,10 +945,17 @@ class PPPrefill:
         ttnn.generic_op(io, mesh_pd)
         lap("copy")
 
-        # conv histories (a few MB): carry rows through the host into the decode's history layout
-        cat = lambda t: ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0))
-        n_gdn = sum(not k for k in self.kinds) * n
-        st = State(d, n_gdn, 1, n_tokens, TILE, zero=True)
+        # conv histories: the carries' 3 history rows to the host (a few MB), each chip's columns packed
+        # compactly in the decode's ring-slot order, scattered into its history tensor on device
+        gdn_js = [j for j in range(Ls) if not self.kinds[j]]
+        rows3 = [
+            ttnn.slice(ttnn.to_layout(self.carry[j], ttnn.ROW_MAJOR_LAYOUT), [0, 0, 0, 0], [1, 1, CONV_K - 1, CONV_CH])
+            for j in gdn_js
+        ]
+        cat = ttnn.to_torch(ttnn.concat(rows3, dim=2), mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)).reshape(
+            n, len(gdn_js), CONV_K - 1, CONV_CH
+        )
+        lap("hist_read")
         gq, gv = d.gq, d.gv
         # chip-local q | k | v conv columns of every chip
         local = torch.stack(
@@ -963,21 +970,67 @@ class PPPrefill:
                 for chip in range(d.n)
             ]
         )
-        carry = {j: cat(self.carry[j]).float().reshape(n, TILE, CONV_CH)[:, : CONV_K - 1] for j in self.carry}
-        lap("hist_read")
-        g_i = 0
-        for i in range(self.layers):
-            p, j = divmod(i, Ls)
-            if self.kinds[j]:
-                continue
-            cols = carry[j][p][:, local]  # [3, chips, local]
-            st.hist[g_i] = [cols[:, chip] for chip in range(d.n)]
-            g_i += 1
+        hrows, hcols, hsrc = model.hist_index()
+        K, copies = len(hrows), model._gdn_copies
+        order = [(p, gdn_js.index(j)) for p, j in (divmod(i, Ls) for i in range(self.layers)) if not self.kinds[j]]
+        G = len(order)
+        hist = cat[[p for p, _ in order], [k for _, k in order]]  # [G, 3, CONV_CH], GDN copy order
+        packed = hist[:, :, local[:, hsrc]].permute(2, 0, 1, 3)  # [chips, G, age, K * 32]
+        uses = torch.tensor([(model.n_gdn - g + copies - 1) // copies for g in range(G)])
+        compact = torch.zeros(d.n, G, CONV_K - 1, K * TILE, dtype=packed.dtype)
+        for age in range(CONV_K - 1):
+            compact[:, torch.arange(G), (n_tokens * uses + age) % 3] = packed[:, :, age]
+        compact_t = ttnn.from_torch(
+            compact.reshape(d.n * G * (CONV_K - 1) * K, TILE),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh,
+            mesh_mapper=ttnn.ShardTensorToMesh(mesh, dim=0),
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
         lap("hist_layout")
-        model.load_hist(st)
+        grid = mesh.compute_with_storage_grid_size()
+        cores = min(G, grid.x * grid.y)
+        coords = [ttnn.CoreCoord(i % grid.x, i // grid.x) for i in range(cores)]
+        all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in coords])
+        tiles = (hcols[::TILE] // TILE).tolist()
+        pairs = [v for k in range(K) for v in (int(hrows[k]), tiles[k])]
+        rt, first = ttnn.RuntimeArgs(), 0
+        for i, c in enumerate(coords):
+            cnt = G // cores + (i < G % cores)
+            rt[c.x][c.y] = [compact_t.buffer_address(), model.hist_t.buffer_address(), first, cnt] + pairs
+            first += cnt
+        program = ttnn.ProgramDescriptor(
+            kernels=[
+                ttnn.KernelDescriptor(
+                    kernel_source=KDIR + "hist_scatter.cpp",
+                    source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                    core_ranges=all_cores,
+                    compile_time_args=[K, copies],
+                    runtime_args=rt,
+                    config=ttnn.DataMovementConfigDescriptor(
+                        processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.RISCV_0_default
+                    ),
+                )
+            ],
+            semaphores=[],
+            cbs=[
+                ttnn.CBDescriptor(
+                    total_size=K * 64,
+                    core_ranges=all_cores,
+                    format_descriptors=[
+                        ttnn.CBFormatDescriptor(buffer_index=0, data_format=ttnn.bfloat16, page_size=64)
+                    ],
+                )
+            ],
+        )
+        hist_pd = ttnn.MeshProgramDescriptor()
+        hist_pd[ttnn.MeshCoordinateRange(ttnn.MeshCoordinate(0, 0), ttnn.MeshCoordinate(0, n - 1))] = program
+        ttnn.generic_op([compact_t, model.hist_t], hist_pd)
         ttnn.synchronize_device(mesh)
         lap("hist_write")
         ttnn.deallocate(jobs_t)
+        ttnn.deallocate(compact_t)
 
     def export_state(self, d, n_tokens, max_pos):
         """the resident decode State (TP-sharded over d.n chips) after n_tokens prompt tokens"""
