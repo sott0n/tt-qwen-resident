@@ -822,58 +822,51 @@ class PPPrefill:
         core, sem = self._ho["core"], self._ho["sem"]
         banks = d.banks
         kv_row = (HD // TILE) * 1088
-        jobs = [[] for _ in range(n)]
+        jobs = [[] for _ in range(n)]  # per chip, [m, 8] job rows
         packets_in = [0] * n
+        tiles = (n_tokens + TILE - 1) // TILE
+        per_block = self.block // TILE
+        t = torch.arange(tiles, dtype=torch.int64)
+        bk, rt = t // per_block, t % per_block
         g_i = a_i = 0
         for i in range(self.layers):
             p, j = divmod(i, Ls)
             if self.kinds[j]:
-                tiles = (n_tokens + TILE - 1) // TILE
-                per_block = self.block // TILE
-                for which, src, dst in (("K", self.K[j], model.K_t), ("V", self.V[j], model.V_t)):
+                for src, dst in ((self.K[j], model.K_t), (self.V[j], model.V_t)):
                     for c in range(n):
-                        for t in range(tiles):
-                            bk, rt = divmod(t, per_block)
-                            first = ((bk * NKV + c) * per_block + rt) * (HD // TILE)
-                            off = (a_i * model.rpb + t // banks) * kv_row
-                            jobs[p].append(
-                                [
-                                    c,
-                                    src.buffer_address(),
-                                    first,
-                                    1088,
-                                    1,
-                                    dst.buffer_address() + off,
-                                    t % banks,
-                                    HD // TILE,
-                                ]
-                            )
-                            if c != p:
-                                packets_in[c] += -(-kv_row // 4096)
+                        rows = torch.empty(tiles, 8, dtype=torch.int64)
+                        rows[:, 0] = c
+                        rows[:, 1] = src.buffer_address()
+                        rows[:, 2] = ((bk * NKV + c) * per_block + rt) * (HD // TILE)
+                        rows[:, 3] = 1088
+                        rows[:, 4] = 1
+                        rows[:, 5] = dst.buffer_address() + (a_i * model.rpb + t // banks) * kv_row
+                        rows[:, 6] = t % banks
+                        rows[:, 7] = HD // TILE
+                        jobs[p].append(rows)
+                        if c != p:
+                            packets_in[c] += tiles * -(-kv_row // 4096)
                 a_i += 1
             else:
                 pages = d.nv * 16
                 for c in range(n):
                     jobs[p].append(
-                        [
-                            c,
-                            self.S[j].buffer_address(),
-                            c * pages,
-                            4096,
-                            0,
-                            model.state_t.buffer_address(),
-                            g_i * pages,
-                            pages,
-                        ]
+                        torch.tensor(
+                            [
+                                [c, self.S[j].buffer_address(), c * pages, 4096, 0, model.state_t.buffer_address()]
+                                + [g_i * pages, pages]
+                            ],
+                            dtype=torch.int64,
+                        )
                     )
                     if c != p:
                         packets_in[c] += pages
                 g_i += 1
+        jobs = [torch.cat(jb) if jb else torch.zeros(0, 8, dtype=torch.int64) for jb in jobs]
         most = max(1, max(len(jb) for jb in jobs))
         table = torch.zeros(n, most, 16, dtype=torch.int64)
         for p in range(n):
-            if jobs[p]:
-                table[p, : len(jobs[p]), :8] = torch.tensor(jobs[p], dtype=torch.int64)
+            table[p, : len(jobs[p]), :8] = jobs[p]
         table = (table & 0xFFFFFFFF).to(torch.int64).numpy().astype(np.uint32).view(np.int32)
         lap("jobs")
         jobs_t = ttnn.from_torch(
