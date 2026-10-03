@@ -54,6 +54,28 @@ def _cat(mesh, t):
     return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)).float()
 
 
+@pytest.mark.parametrize("C", [256, 512, 1024])
+@pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
+def test_addnorm(mesh_device, C):
+    """x += b in place and h = rmsnorm(x)"""
+    from models.experimental.qwen36_resident.prefill.pp_prefill import HIDDEN
+
+    n = mesh_device.get_num_devices()
+    pp = _bare(mesh_device, C)
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(n, 1, C, HIDDEN, generator=g).bfloat16().float()
+    b = torch.randn(n, 1, C, HIDDEN, generator=g).bfloat16().float()
+    x_t, b_t = _dev(mesh_device, x, ttnn.bfloat16), _dev(mesh_device, b, ttnn.bfloat16)
+    h_t = _dev(mesh_device, torch.zeros_like(x), ttnn.bfloat16)
+    pp._addnorm(x_t, b_t, h_t)
+    s = (x + b).bfloat16().float()
+    ref = s * torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + EPS)
+    got_s, got_h = _cat(mesh_device, x_t), _cat(mesh_device, h_t)
+    err_s, err = (got_s - s).abs().max().item(), (got_h - ref).abs().max().item()
+    logger.info(f"addnorm C={C}: max |s - ref| {err_s:.4f}, max |h - ref| {err:.4f}")
+    assert err_s < 0.05 and err < 0.05
+
+
 @pytest.mark.parametrize("C", [256, 512])
 @pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
 def test_conv(mesh_device, C):

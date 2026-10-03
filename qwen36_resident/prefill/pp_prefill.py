@@ -207,7 +207,7 @@ class PPPrefill:
     # ------------------------------------------------------------------ chunk sizes
     # what a tick of one chunk size owns: its buffers, programs, matmul configs and trace
     GEOMETRY = (
-        "C", "pc", "x_in", "x_last", "x_out", "ids", "q_t", "k_t", "v_t", "g_t", "beta_t", "gate_y",
+        "C", "pc", "x_in", "x_last", "x_out", "h_buf", "ids", "q_t", "k_t", "v_t", "g_t", "beta_t", "gate_y",
         "cos", "sin", "fill_pt", "cstart", "_shift_pd", "_shift_sems", "_conv_cores", "_conv_groups",
         "_conv_spec", "_conv_dims", "trace_id",
     )  # fmt: skip
@@ -219,6 +219,7 @@ class PPPrefill:
         self.x_in = dev(torch.zeros(n, 1, C, HIDDEN), ttnn.bfloat16)
         self.x_last = dev(torch.zeros(n, 1, C, HIDDEN), ttnn.bfloat16)  # a stage's output of the last tick
         self.x_out = None
+        self.h_buf = dev(torch.zeros(n, 1, C, HIDDEN), ttnn.bfloat16)  # normed residual stream
         self.ids = dev(torch.zeros(n, 1, C, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         self._shift_program()
         # the delta-rule op's inputs: token-major q, k, v rows and the gates
@@ -544,6 +545,61 @@ class PPPrefill:
         ttnn.generic_op([o, p, self.gate_y], pd)
         return self.gate_y
 
+    def _addnorm(self, x, b, h):
+        """x += b in place and h = rmsnorm(x) (kernels/addnorm_*.cpp): core (r, q) owns row tile r, columns
+        [q * W, (q + 1) * W) and swaps its part of the row's sum of squares with the row's other cores"""
+        mesh, C = self.mesh, self.C
+        grid = mesh.compute_with_storage_grid_size()
+        Rt, Ht = C // TILE, HIDDEN // TILE
+        Q = max(q for q in range(1, Ht + 1) if Ht % q == 0 and Rt * q <= grid.x * grid.y)
+        W = Ht // Q
+        coords = [ttnn.CoreCoord(i % grid.x, i // grid.x) for i in range(Rt * Q)]
+        phys = [mesh.worker_core_from_logical_core(c) for c in coords]
+        all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in coords])
+        bf, f32 = (ttnn.bfloat16, 2048), (ttnn.float32, 4096)
+        spec = {0: (bf, W), 1: (bf, W), 2: (bf, 1), 3: (f32, 1), 4: (f32, Q), 5: (f32, 1), 6: (bf, W), 16: (bf, W)}
+        spec[17] = (bf, W)
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=cnt * page,
+                core_ranges=all_cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=dt, page_size=page)],
+            )
+            for i, ((dt, page), cnt) in spec.items()
+        ]
+        rr, wr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        for i, c in enumerate(coords):
+            r, q = divmod(i, Q)
+            peers = [v for p in phys[r * Q : (r + 1) * Q] for v in (p.x, p.y)]
+            rr[c.x][c.y] = [r, q * W, x.buffer_address(), b.buffer_address()]
+            wr[c.x][c.y] = [r, q * W, q, x.buffer_address(), h.buffer_address()] + peers
+        compute = ttnn.ComputeConfigDescriptor()
+        compute.math_fidelity = ttnn.MathFidelity.HiFi4
+        compute.fp32_dest_acc_en = True
+        bits = lambda v: int(torch.tensor([v], dtype=torch.float32).view(torch.int32)[0])
+        dm = lambda proc, noc: ttnn.DataMovementConfigDescriptor(processor=proc, noc=noc)
+        kernel = lambda src, ct, rt, cfg: ttnn.KernelDescriptor(
+            kernel_source=KDIR + src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=all_cores,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=cfg,
+        )
+        kernels = [
+            kernel("addnorm_reader.cpp", [Ht, W], rr, dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.RISCV_1_default)),
+            kernel(
+                "addnorm_writer.cpp", [Ht, W, Q], wr, dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.RISCV_0_default)
+            ),
+            kernel("addnorm_compute.cpp", [W, Q, bits(EPS), bits(1.0 / HIDDEN)], ttnn.RuntimeArgs(), compute),
+        ]
+        sems = [ttnn.SemaphoreDescriptor(id=0, core_ranges=all_cores, initial_value=0)]
+        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
+        pd = ttnn.MeshProgramDescriptor()
+        pd[ttnn.MeshCoordinateRange(ttnn.MeshCoordinate(0, 0), ttnn.MeshCoordinate(0, self.n - 1))] = program
+        ttnn.generic_op([x, b, h], pd)
+        return h
+
     # ------------------------------------------------------------------ layers
     def _mm_config(self, key, fused_activation=None):
         """the measured best 2D multicast config of a projection at this chunk (tests/_sweep), else the
@@ -670,11 +726,11 @@ class PPPrefill:
         emb = ttnn.embedding(self.ids, self.embed, layout=ttnn.TILE_LAYOUT)
         ttnn.copy(ttnn.reshape(emb, (1, 1, self.C, HIDDEN)), self.x_in)
         ttnn.generic_op([self.x_last, self.x_in], self._shift_pd)
-        x = self.x_in
+        x = self.x_in  # updated in place
+        h = ttnn.rms_norm(x, epsilon=EPS)
         for j, attn in enumerate(self.kinds):
-            h = ttnn.rms_norm(x, epsilon=EPS)
-            x = ttnn.add(x, self._attn(h, j) if attn else self._gdn(h, j))
-            x = ttnn.add(x, self._mlp(ttnn.rms_norm(x, epsilon=EPS), j))
+            h = self._addnorm(x, self._attn(h, j) if attn else self._gdn(h, j), self.h_buf)
+            h = self._addnorm(x, self._mlp(h, j), self.h_buf)
         ttnn.copy(x, self.x_last)
         return self.x_last
 
