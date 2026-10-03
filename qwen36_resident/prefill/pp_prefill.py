@@ -20,6 +20,7 @@ State per chip: GDN recurrent states fp32 [48, 128, 128] and conv carries (last 
 bf8 KV caches of its attention layers. export_state() converts them into the resident decode's
 TP-sharded State.
 """
+
 import math
 
 import torch
@@ -70,6 +71,11 @@ MM_BEST = {
 }
 
 
+# a 64-layer tick at chunk C takes about TICK_MS[0] + TICK_MS[1] * C ms (QB2: 53 ms at 512, 84 ms at 1024
+# for a 2k prompt)
+TICK_MS = (22.0, 0.068)
+
+
 def rope_cos_sin(positions):
     """[T, ROT] cos / sin (both halves) of the rotated dims at the positions"""
     inv = 1.0 / ROPE_THETA ** (torch.arange(0, ROT, 2, dtype=torch.float64) / ROT)
@@ -89,15 +95,18 @@ def rotate_half_matrix():
 
 class PPPrefill:
     def __init__(self, mesh, ck, layers, interval, chunk=1024, max_len=None, block=64, mm_cols=10):
+        """chunk: one chunk size, or several; run() picks the fastest for each prompt (one trace per size,
+        sharing the weights and the state)"""
         self.mesh, self.n = mesh, mesh.get_num_devices()
         n = self.n
         assert layers % n == 0 and (layers // n) % interval == 0, "every stage needs the same layer schedule"
-        self.layers, self.interval, self.Ls, self.C, self.block = layers, interval, layers // n, chunk, block
+        self.chunks = sorted(chunk) if isinstance(chunk, (list, tuple)) else [chunk]
+        self.layers, self.interval, self.Ls, self.block = layers, interval, layers // n, block
         self.mm_cols = mm_cols
-        self.max_len = max_len or 4 * chunk
-        assert chunk % block == 0 and self.max_len % chunk == 0
+        C = max(self.chunks)
+        self.max_len = max_len or 4 * C
+        assert all(c % block == 0 and self.max_len % c == 0 for c in self.chunks)
         self.kinds = [is_attn(j, interval) for j in range(self.Ls)]
-        C = chunk
         shard, rep = ttnn.ShardTensorToMesh(mesh, dim=0), ttnn.ReplicateTensorToMesh(mesh)
         DRAM = ttnn.DRAM_MEMORY_CONFIG
 
@@ -113,8 +122,6 @@ class PPPrefill:
         self.hifi = ttnn.init_device_compute_kernel_config(
             mesh.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=False
         )
-
-        self.pc = {key: self._mm_config(key) for key in MM_SHAPES}
 
         # ---- weights: stage-layer j of chip p is layer p * Ls + j
         self.w = []
@@ -160,7 +167,7 @@ class PPPrefill:
 
         # ---- state
         self.blocks = self.max_len // block
-        self.scratch0 = self.blocks  # C // block scratch blocks after the real ones
+        self.scratch0 = self.blocks  # C // block scratch blocks after the real ones (largest chunk)
         kv_blocks = self.blocks + C // block
         self.S, self.carry, self.K, self.V = {}, {}, {}, {}
         for j, attn in enumerate(self.kinds):
@@ -179,12 +186,39 @@ class PPPrefill:
         lo_i, lo_j = ii < 16, jj < 16
         consts.append(torch.cat([(lo_i & lo_j).float(), (~lo_i & ~lo_j).float(), (~lo_i & lo_j).float()], dim=1))
         self.gdn_consts = [dev(t.reshape(1, 1, *t.shape), ttnn.float32, mapper=rep) for t in consts]
-        self.x_in = dev(torch.zeros(n, 1, C, HIDDEN), ttnn.bfloat16)
-        self.x_last = dev(torch.zeros(n, 1, C, HIDDEN), ttnn.bfloat16)  # a stage's output of the last tick
         # the embedding table on every chip (chip 0 looks up the next chunk's rows from its token ids)
         self.embed = dev(
             ck.get("model.language_model.embed_tokens.weight").bfloat16(), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, rep
         )
+        # per tick and chip: [valid rows, update] for the conv and the gates
+        self.ctrl = dev(torch.zeros(n, 1, 1, 8, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+        self.read_pt = dev(torch.zeros(n, self.blocks, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        self.sdpa_pc = ttnn.SDPAProgramConfig(
+            compute_with_storage_grid_size=mesh.compute_with_storage_grid_size(),
+            q_chunk_size=128,
+            k_chunk_size=128,
+            exp_approx_mode=False,
+        )
+        self._geo = {}
+        for c in self.chunks:
+            self._geo[c] = self._geometry(c)
+        self._use(C)
+
+    # ------------------------------------------------------------------ chunk sizes
+    # what a tick of one chunk size owns: its buffers, programs, matmul configs and trace
+    GEOMETRY = (
+        "C", "pc", "x_in", "x_last", "x_out", "ids", "q_t", "k_t", "v_t", "g_t", "beta_t", "gate_y",
+        "cos", "sin", "fill_pt", "cstart", "_shift_pd", "_shift_sems", "_conv_cores", "_conv_groups",
+        "_conv_spec", "_conv_dims", "trace_id",
+    )  # fmt: skip
+
+    def _geometry(self, C):
+        n, dev = self.n, self._dev
+        self.C = C
+        self.pc = {key: self._mm_config(key) for key in MM_SHAPES}
+        self.x_in = dev(torch.zeros(n, 1, C, HIDDEN), ttnn.bfloat16)
+        self.x_last = dev(torch.zeros(n, 1, C, HIDDEN), ttnn.bfloat16)  # a stage's output of the last tick
+        self.x_out = None
         self.ids = dev(torch.zeros(n, 1, C, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
         self._shift_program()
         # the delta-rule op's inputs: token-major q, k, v rows and the gates
@@ -194,21 +228,26 @@ class PPPrefill:
         self.g_t = dev(torch.zeros(n, C, NV), ttnn.float32)
         self.beta_t = dev(torch.zeros(n, C, NV), ttnn.float32)
         self.gate_y = dev(torch.zeros(n, 1, C, VD), ttnn.bfloat16)
-        # per tick and chip: [valid rows, update] for the conv and the gates, rope, KV blocks
-        self.ctrl = dev(torch.zeros(n, 1, 1, 8, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT)
+        # per tick and chip: rope, KV blocks
         self.cos = dev(torch.zeros(n, 1, C, ROT), ttnn.bfloat16)
         self.sin = dev(torch.zeros(n, 1, C, ROT), ttnn.bfloat16)
-        self.fill_pt = dev(torch.zeros(n, C // block, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-        self.read_pt = dev(torch.zeros(n, self.blocks, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
+        self.fill_pt = dev(torch.zeros(n, C // self.block, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         self.cstart = dev(torch.zeros(n, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
-        self.sdpa_pc = ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=mesh.compute_with_storage_grid_size(),
-            q_chunk_size=128,
-            k_chunk_size=128,
-            exp_approx_mode=False,
-        )
         self._conv_program()
         self.trace_id = None
+        return {k: getattr(self, k) for k in self.GEOMETRY}
+
+    def _use(self, C):
+        if getattr(self, "C", None) in self._geo:
+            self._geo[self.C].update({k: getattr(self, k) for k in self.GEOMETRY})
+        for k, v in self._geo[C].items():
+            setattr(self, k, v)
+
+    def pick_chunk(self, T):
+        """the chunk size with the shortest estimated prefill: (chunks + n - 1) ticks of TICK_MS[0] +
+        TICK_MS[1] * C (fixed per-op cost plus work, fit to measured ticks on QB2)"""
+        a, b = TICK_MS
+        return min(self.chunks, key=lambda C: ((T + C - 1) // C + self.n - 1) * (a + b * C))
 
     # ------------------------------------------------------------------ pipeline shift
     def _shift_program(self):
@@ -674,27 +713,31 @@ class PPPrefill:
         ]
 
     def capture(self):
-        """compile the tick body, then record it into a trace (replayed by run())"""
-        for host, dev in self._control(-1, 1):  # every chip idle: KV writes go to the scratch blocks
-            ttnn.copy_host_to_device_tensor(host, dev)
-        self.x_out = self._body()
-        ttnn.synchronize_device(self.mesh)
-        self.reset()
-        self.trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
-        self.x_out = self._body()
-        ttnn.end_trace_capture(self.mesh, self.trace_id, cq_id=0)
-        ttnn.synchronize_device(self.mesh)
+        """compile the tick body of every chunk size, then record each into a trace (replayed by run())"""
+        for C in self.chunks:
+            self._use(C)
+            for host, dev in self._control(-1, 1):  # every chip idle: KV writes go to the scratch blocks
+                ttnn.copy_host_to_device_tensor(host, dev)
+            self.x_out = self._body()
+            ttnn.synchronize_device(self.mesh)
+            self.reset()
+            self.trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
+            self.x_out = self._body()
+            ttnn.end_trace_capture(self.mesh, self.trace_id, cq_id=0)
+            ttnn.synchronize_device(self.mesh)
 
     def reset(self):
-        ttnn.copy_host_to_device_tensor(
-            ttnn.from_torch(
-                torch.zeros(self.n, 1, self.C, HIDDEN),
-                dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT,
-                mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
-            ),
-            self.x_last,
-        )
+        self._use(self.C)
+        for C, geo in self._geo.items():
+            ttnn.copy_host_to_device_tensor(
+                ttnn.from_torch(
+                    torch.zeros(self.n, 1, C, HIDDEN),
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
+                ),
+                geo["x_last"],
+            )
         for j in self.S:
             ttnn.copy_host_to_device_tensor(
                 ttnn.from_torch(
@@ -716,13 +759,14 @@ class PPPrefill:
             )
         ttnn.synchronize_device(self.mesh)
 
-    def run(self, token_ids, timings=None):
+    def run(self, token_ids, timings=None, chunk=None):
         """prefill the prompt token_ids [T]: one tick per chunk plus the pipeline drain"""
         import time
 
-        n, C = self.n, self.C
         T = token_ids.shape[0]
         assert T <= self.max_len
+        self._use(chunk or self.pick_chunk(T))
+        n, C = self.n, self.C
         chunks = (T + C - 1) // C
         ids = torch.zeros(chunks * C, dtype=torch.int32)
         ids[:T] = token_ids.to(torch.int32)

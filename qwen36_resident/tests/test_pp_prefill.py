@@ -29,7 +29,8 @@ REFPT = os.environ.get("RESIDENT_REFPT", "models/tt_transformers/tests/reference
 def test_pp_prefill_matches_decode(mesh_device):
     layers = int(os.environ.get("RESIDENT_LAYERS", "16"))
     T = int(os.environ.get("RESIDENT_PROMPT", "300"))
-    C = int(os.environ.get("RESIDENT_CHUNK", "256"))
+    chunks = [int(c) for c in os.environ.get("RESIDENT_CHUNK", "256").split(",")]
+    C = max(chunks)
     tokens = torch.load(REFPT, weights_only=False)["reference_tokens"][0]
     ck = Q.Checkpoint()
     n = mesh_device.get_num_devices()
@@ -48,14 +49,16 @@ def test_pp_prefill_matches_decode(mesh_device):
         interval,
         lm_head=True,
     )
-    pp = PPPrefill(mesh_device, ck, layers, interval, chunk=C, max_len=(T + C - 1) // C * C)
+    pp = PPPrefill(mesh_device, ck, layers, interval, chunk=chunks, max_len=(T + C - 1) // C * C)
     trace = os.environ.get("RESIDENT_TRACE", "1") == "1"
     if trace:
         pp.capture()
         pp.reset()
     t0 = time.perf_counter()
-    pp.run(tokens[:T])
-    logger.info(f"prefill of {T} tokens ({'traced' if trace else 'eager'}): {time.perf_counter() - t0:.3f} s")
+    pp.run(tokens[:T], chunk=chunks[0])
+    logger.info(
+        f"prefill of {T} tokens, chunk {pp.C} ({'traced' if trace else 'eager'}): {time.perf_counter() - t0:.3f} s"
+    )
     t0 = time.perf_counter()
     pp.handoff(model, T)
     logger.info(f"handoff: {time.perf_counter() - t0:.3f} s")
