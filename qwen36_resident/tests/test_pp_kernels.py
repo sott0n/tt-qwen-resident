@@ -54,6 +54,34 @@ def _cat(mesh, t):
     return ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh, dim=0)).float()
 
 
+@pytest.mark.parametrize("heads", [24, 4])
+@pytest.mark.parametrize("C", [256, 1024])
+@pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
+def test_qkrope(mesh_device, C, heads):
+    """per-head rmsnorm times the weight, then RoPE on the first ROT dims, in place"""
+    from models.experimental.qwen36_resident.prefill.pp_prefill import ROT, rope_cos_sin, rotate_half_matrix
+
+    n = mesh_device.get_num_devices()
+    pp = _bare(mesh_device, C)
+    g = torch.Generator().manual_seed(0)
+    t = torch.randn(n, heads, C, HD, generator=g).bfloat16().float()
+    w = (1 + 0.1 * torch.randn(n, 1, 1, HD, generator=g)).bfloat16().float()
+    pos = torch.arange(C) + 300
+    cos, sin = rope_cos_sin(pos)
+    pp.cos = _dev(mesh_device, cos[None, None].repeat(n, 1, 1, 1), ttnn.bfloat16)
+    pp.sin = _dev(mesh_device, sin[None, None].repeat(n, 1, 1, 1), ttnn.bfloat16)
+    t_t, w_t = _dev(mesh_device, t, ttnn.bfloat16), _dev(mesh_device, w, ttnn.bfloat16)
+    pp._qkrope(t_t, w_t)
+    y = t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + EPS) * w
+    r = y[..., :ROT]
+    cb, sb = cos.bfloat16().float(), sin.bfloat16().float()
+    y[..., :ROT] = r * cb + (r @ rotate_half_matrix()) * sb
+    got = _cat(mesh_device, t_t)
+    err = (got - y).abs().max().item()
+    logger.info(f"qkrope C={C} heads={heads}: max err {err:.4f}")
+    assert err < 0.05
+
+
 @pytest.mark.parametrize("C", [256, 512, 1024])
 @pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
 def test_addnorm(mesh_device, C):

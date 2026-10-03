@@ -40,12 +40,13 @@ def gdn_layer(ck, i):
 def attn_layer(ck, i):
     ln = ck.layer(i, "input_layernorm.weight")
     qg = ck.layer(i, "self_attn.q_proj.weight").reshape(NQ, 2, HD, -1)
+    # q | k | v | gate: q, k, v are one contiguous slice of the projection
     rows = torch.cat(
         [
             qg[:, 0].reshape(NQ * HD, -1),
-            qg[:, 1].reshape(NQ * HD, -1),
             ck.layer(i, "self_attn.k_proj.weight"),
             ck.layer(i, "self_attn.v_proj.weight"),
+            qg[:, 1].reshape(NQ * HD, -1),
         ]
     )
     return dict(

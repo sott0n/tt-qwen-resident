@@ -50,7 +50,7 @@ QD, VD = NK * DK, NV * DV  # 2048, 6144
 CONV_CH = 2 * QD + VD  # 10240
 Z0, A0 = CONV_CH, CONV_CH + VD  # z | a | b columns
 GDN_COLS = 16512  # q | k | v | z | a | b (16480) padded to 12 x 43 tiles
-ATTN_COLS = 2 * NQ * HD + 2 * NKV * HD  # q | gate | k | v = 14336
+ATTN_COLS = 2 * NQ * HD + 2 * NKV * HD  # q | k | v | gate = 14336
 TILE = 32
 MM_SHAPES = dict(
     gdn=(HIDDEN, GDN_COLS), attn=(HIDDEN, ATTN_COLS), out=(VD, HIDDEN), gu=(HIDDEN, INTER), down=(INTER, HIDDEN)
@@ -179,7 +179,6 @@ class PPPrefill:
                 self.carry[j] = dev(torch.zeros(n, 1, TILE, CONV_CH), ttnn.bfloat16)
 
         # ---- constants and buffers
-        self.R = dev(torch.stack([rotate_half_matrix()] * n)[:, None], ttnn.bfloat16)
         c = TILE  # the delta-rule op's chunk
         consts = [torch.eye(c), torch.tril(torch.ones(c, c)), torch.ones(c, c)]
         ii, jj = torch.arange(32)[:, None], torch.arange(32)[None]
@@ -545,6 +544,75 @@ class PPPrefill:
         ttnn.generic_op([o, p, self.gate_y], pd)
         return self.gate_y
 
+    def _qkrope(self, t, w):
+        """in place on the head-major q or k heads t [1, heads, C, 256]: rmsnorm over each head's dims times w,
+        then RoPE on the first ROT dims (kernels/qkrope_*.cpp)"""
+        mesh, C = self.mesh, self.C
+        grid = mesh.compute_with_storage_grid_size()
+        Rt, groups = C // TILE, t.shape[1] * (C // TILE)
+        cores = min(grid.x * grid.y, groups)
+        per = [groups // cores + (i < groups % cores) for i in range(cores)]
+        coords = [ttnn.CoreCoord(i % grid.x, i // grid.x) for i in range(cores)]
+        all_cores = ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in coords])
+        bf, f32 = (ttnn.bfloat16, 2048), (ttnn.float32, 4096)
+        spec = {0: (bf, 16), 1: (bf, 8), 2: (bf, 2), 3: (bf, 2), 4: (bf, 1), 5: (f32, 8), 6: (f32, 1), 7: (bf, 8)}
+        spec.update({8: (f32, 2), 16: (bf, 16)})
+        cbs = [
+            ttnn.CBDescriptor(
+                total_size=cnt * page,
+                core_ranges=all_cores,
+                format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=dt, page_size=page)],
+            )
+            for i, ((dt, page), cnt) in spec.items()
+        ]
+        rr, wr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+        first, by_count = 0, {}
+        for c, cnt in zip(coords, per):
+            rr[c.x][c.y] = [first, cnt] + [a.buffer_address() for a in (t, w, self.cos, self.sin)]
+            wr[c.x][c.y] = [first, cnt, t.buffer_address()]
+            by_count.setdefault(cnt, []).append(c)
+            first += cnt
+        dm = lambda proc, noc: ttnn.DataMovementConfigDescriptor(processor=proc, noc=noc)
+        compute = ttnn.ComputeConfigDescriptor()
+        compute.math_fidelity = ttnn.MathFidelity.HiFi4
+        compute.fp32_dest_acc_en = True
+        kernel = lambda src, cores_, ct, rt, cfg: ttnn.KernelDescriptor(
+            kernel_source=KDIR + src,
+            source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+            core_ranges=cores_,
+            compile_time_args=ct,
+            runtime_args=rt,
+            config=cfg,
+        )
+        eps_bits = int(torch.tensor([EPS], dtype=torch.float32).view(torch.int32)[0])
+        kernels = [
+            kernel(
+                "qkrope_reader.cpp",
+                all_cores,
+                [Rt],
+                rr,
+                dm(ttnn.DataMovementProcessor.RISCV_1, ttnn.NOC.RISCV_1_default),
+            ),
+            kernel(
+                "qkrope_writer.cpp", all_cores, [], wr, dm(ttnn.DataMovementProcessor.RISCV_0, ttnn.NOC.RISCV_0_default)
+            ),
+        ]
+        for cnt, cs in by_count.items():
+            kernels.append(
+                kernel(
+                    "qkrope_compute.cpp",
+                    ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in cs]),
+                    [cnt, eps_bits],
+                    ttnn.RuntimeArgs(),
+                    compute,
+                )
+            )
+        program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=[], cbs=cbs)
+        pd = ttnn.MeshProgramDescriptor()
+        pd[ttnn.MeshCoordinateRange(ttnn.MeshCoordinate(0, 0), ttnn.MeshCoordinate(0, self.n - 1))] = program
+        ttnn.generic_op([t, w, self.cos, self.sin], pd)
+        return t
+
     def _addnorm(self, x, b, h):
         """x += b in place and h = rmsnorm(x) (kernels/addnorm_*.cpp): core (r, q) owns row tile r, columns
         [q * W, (q + 1) * W) and swaps its part of the row's sum of squares with the row's other cores"""
@@ -674,27 +742,17 @@ class PPPrefill:
         out = self._linear(o, w["out"], "out")
         return out
 
-    def _rope(self, t):
-        r, rest = ttnn.slice(t, (0, 0, 0, 0), (1, t.shape[1], self.C, ROT)), None
-        rest = ttnn.slice(t, (0, 0, 0, ROT), (1, t.shape[1], self.C, HD))
-        rot = ttnn.matmul(r, self.R, compute_kernel_config=self.hifi)
-        r = ttnn.add(ttnn.multiply(r, self.cos), ttnn.multiply(rot, self.sin))
-        return ttnn.concat([r, rest], dim=-1)
-
     def _attn(self, h, j):
         C, w = self.C, self.w[j]
         p = self._linear(h, w["W"], "attn")
-        qd = NQ * HD
-        gate = ttnn.slice(p, (0, 0, 0, qd), (1, 1, C, 2 * qd))
-        qkv = ttnn.concat(
-            [ttnn.slice(p, (0, 0, 0, 0), (1, 1, C, qd)), ttnn.slice(p, (0, 0, 0, 2 * qd), (1, 1, C, ATTN_COLS))],
-            dim=-1,
-        )
+        qkv_d = (NQ + 2 * NKV) * HD
+        qkv = ttnn.slice(p, (0, 0, 0, 0), (1, 1, C, qkv_d))
+        gate = ttnn.slice(p, (0, 0, 0, qkv_d), (1, 1, C, ATTN_COLS))
         q, k, v = ttnn.experimental.nlp_create_qkv_heads(
             qkv, num_heads=NQ, num_kv_heads=NKV, transpose_k_heads=False, memory_config=ttnn.DRAM_MEMORY_CONFIG
         )
-        q = self._rope(ttnn.multiply(ttnn.rms_norm(q, epsilon=EPS), w["wq"]))
-        k = self._rope(ttnn.multiply(ttnn.rms_norm(k, epsilon=EPS), w["wk"]))
+        q = self._qkrope(q, w["wq"])
+        k = self._qkrope(k, w["wk"])
         ttnn.experimental.paged_fill_cache(self.K[j], ttnn.typecast(k, ttnn.bfloat8_b), self.fill_pt, batch_idx=0)
         ttnn.experimental.paged_fill_cache(self.V[j], ttnn.typecast(v, ttnn.bfloat8_b), self.fill_pt, batch_idx=0)
         o = ttnn.transformer.chunked_scaled_dot_product_attention(
