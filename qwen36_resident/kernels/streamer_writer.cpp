@@ -12,16 +12,21 @@
 // double-buffered (e.g. a head's next o needs this core's next projection row, which needs the mlp
 // slots, which need this core's down output, which comes after its out-proj used the current o).
 //
-// Runtime args: 0 ng, 1 act_off, 2 nd, 3 pout_off, 4 hub_x, 5 hub_y, 6 hub_slots, 7 act_addr,
+// Runtime args: 0 ng, 1 act_off, 2 nd, 3 pout_off, 4 hub_x, 5 hub_y, 6 publish (this core tells the hub the
+// streamers' slots address, which is the same on every streamer), 7 unused,
 // 8 GDN projection tiles, 9 their tile offset in the GDN row, 10 attention projection tiles, 11 their
 // offset in the attention row, 12 mixer row buffer address (same on every mixer core), 13 n_conv,
-// 14 conv history address, 15 this core's history rows base, 16 GDN copies, 17 token state address,
+// 14 conv history address, 15 this core's history rows base, 16 GDN copies, 17 unused,
 // then gdn_heads x (x, y) of the head cores, then 2 x (x, y) of the attention leader and tail core,
 // then num_streamers x (x, y) of the streamers, then an optional timeline buffer (0 = off): per layer 8
 // wall-clock words at the phase boundaries (slots, row ready, mixer done, attn partial sent, slots,
 // act slice ready, act complete, mlp partial sent), after the reader's 8 words; then (lm_head) the
 // argmax record address on the hub (0 = off), this core's valid logit columns and the vocab index of
-// its first column.
+// its first column, this core's index, then the GDN row runs: count, then per run (first tile of this
+// core's projection block, tiles, first head core, head cores) — each head core gets only the tiles it
+// reads (its key head's q | k, its value head's v | z, every head's a | b).
+//
+// The hub's slots address arrives in sem_addr before the first partial (the slots are a hub CB).
 //
 // With the lm_head the writer scans this core's logits for their maximum (the first one on ties) and
 // writes (order key, vocab index) to record slot [core] on the hub, so the host reads num_streamers
@@ -39,8 +44,7 @@ void kernel_main() {
     const uint32_t pout_off = get_arg_val<uint32_t>(3);
     const uint32_t hub_x = get_arg_val<uint32_t>(4);
     const uint32_t hub_y = get_arg_val<uint32_t>(5);
-    const uint32_t hub_slots = get_arg_val<uint32_t>(6);
-    const uint32_t act_addr = get_arg_val<uint32_t>(7);
+    const bool publish = get_arg_val<uint32_t>(6) != 0;
     const uint32_t nq_gdn = get_arg_val<uint32_t>(8);
     const uint32_t q_off_gdn = get_arg_val<uint32_t>(9);
     const uint32_t nq_attn = get_arg_val<uint32_t>(10);
@@ -50,7 +54,6 @@ void kernel_main() {
     const uint32_t hist_addr = get_arg_val<uint32_t>(14);
     const uint32_t first_row = get_arg_val<uint32_t>(15);
     const uint32_t gdn_copies = get_arg_val<uint32_t>(16);
-    const uint32_t tok_addr = get_arg_val<uint32_t>(17);
     constexpr uint32_t heads_base = 18;
     constexpr uint32_t attn_base = heads_base + 2 * gdn_heads;
     constexpr uint32_t peers_base = attn_base + 4;
@@ -63,10 +66,20 @@ void kernel_main() {
     volatile uint32_t* clk = reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
     auto mark = [&](uint32_t l, uint32_t i) {
         if (ts_addr) {
-            ts[l * 16 + 8 + i] = *clk;
+            ts[l * kTsWords + 8 + i] = *clk;
         }
     };
 
+    auto cb_base = [](uint32_t cb) {
+        auto& iface = get_local_cb_interface(cb);
+        return iface.fifo_limit - iface.fifo_size;
+    };
+    if (publish) {
+        noc_inline_dw_write(get_noc_addr(hub_x, hub_y, get_semaphore(sem_addr)), cb_base(cb_x));
+    }
+    volatile tt_l1_ptr uint32_t* hub_addr_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_addr));
+    uint32_t hub_slots = 0;
+    const uint32_t act_addr = cb_base(cb_act);  // the same CB address on every streamer
     volatile tt_l1_ptr uint32_t* slots_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_slots));
     volatile tt_l1_ptr uint32_t* act_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_act));
     volatile tt_l1_ptr uint32_t* heads_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_heads));
@@ -74,26 +87,28 @@ void kernel_main() {
     const uint32_t rows_sem_addr = get_semaphore(sem_rows);
     const uint64_t hub_gather_sem = get_noc_addr(hub_x, hub_y, get_semaphore(sem_gather));
     const InterleavedAddrGen<true> hist{.bank_base_address = hist_addr, .page_size = 3 * kBlkBytes};
-    uint32_t pos;
-    {
-        // the position picks the history slot to overwrite; the o buffer is free until the first o
-        const InterleavedAddrGen<true> tok{.bank_base_address = tok_addr, .page_size = kTokRope + 3 * 2048};
-        const uint32_t scratch = get_write_ptr(cb_o_in);
-        noc_async_read(tok.get_noc_addr(0), scratch, 16);
-        noc_async_read_barrier();
-        pos = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scratch);
+    // the ring step (it picks the history slot to overwrite) comes from the reader: this RISC reads nothing,
+    // as the reader's NOC1 weight reads share the read counters of NOC1
+    volatile tt_l1_ptr uint32_t* ring_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_ring));
+    while (*ring_sem == 0) {
+        invalidate_l1_cache();
     }
+    const uint32_t ring = *ring_sem - 1;
 
-    // round 0's slots (x0) are seeded and released by the reader
+    // x of round 0 (x0) is seeded and released by the reader; the hub multicasts x of the later rounds
     auto take_slots = [&](uint32_t round) {
         if (round > 0) {
             noc_semaphore_wait_min(slots_sem, round);
-            cb_reserve_back(cb_slots, num_chips * Ht);
-            cb_push_back(cb_slots, num_chips * Ht);
+            cb_reserve_back(cb_x, Ht);
+            cb_push_back(cb_x, Ht);
         }
     };
     auto send_partial = [&](uint32_t round) {
         cb_wait_front(cb_pout, nd_max);
+        while (hub_slots == 0) {
+            invalidate_l1_cache();
+            hub_slots = *hub_addr_sem;
+        }
         const uint32_t dst = hub_slots + (((round & 1) * num_chips + chip) * Ht + pout_off) * kTileBytes;
         noc_async_write(get_read_ptr(cb_pout), get_noc_addr(hub_x, hub_y, dst), nd * kTileBytes);
         noc_async_write_barrier();
@@ -115,8 +130,38 @@ void kernel_main() {
         }
     };
 
+    constexpr uint32_t runs_base = peers_base + 2 * num_streamers + 5;
+    const uint32_t n_runs = get_arg_val<uint32_t>(runs_base);
+    auto send_runs = [&](uint32_t q_off) {
+        const uint32_t row = get_read_ptr(cb_qkvz_out);
+        for (uint32_t r = 0; r < n_runs; r++) {
+            const uint32_t start = get_arg_val<uint32_t>(runs_base + 1 + 4 * r);
+            const uint32_t count = get_arg_val<uint32_t>(runs_base + 2 + 4 * r);
+            const uint32_t first = get_arg_val<uint32_t>(runs_base + 3 + 4 * r);
+            const uint32_t dests = get_arg_val<uint32_t>(runs_base + 4 + 4 * r);
+            for (uint32_t c = first; c < first + dests; c++) {
+                const uint32_t hx = get_arg_val<uint32_t>(heads_base + 2 * c);
+                const uint32_t hy = get_arg_val<uint32_t>(heads_base + 2 * c + 1);
+                noc_async_write(
+                    row + start * kTileBytes,
+                    get_noc_addr(hx, hy, mixer_rows + (q_off + start) * kTileBytes),
+                    count * kTileBytes);
+            }
+        }
+        noc_async_write_barrier();
+        for (uint32_t r = 0; r < n_runs; r++) {
+            const uint32_t first = get_arg_val<uint32_t>(runs_base + 3 + 4 * r);
+            const uint32_t dests = get_arg_val<uint32_t>(runs_base + 4 + 4 * r);
+            for (uint32_t c = first; c < first + dests; c++) {
+                const uint32_t hx = get_arg_val<uint32_t>(heads_base + 2 * c);
+                const uint32_t hy = get_arg_val<uint32_t>(heads_base + 2 * c + 1);
+                noc_semaphore_inc(get_noc_addr(hx, hy, rows_sem_addr), 1);
+            }
+        }
+    };
+
     uint32_t g = 0;
-    uint32_t o_expected = 0;  // o writes so far: gdn_heads per GDN layer, the leader per attention layer
+    uint32_t o_expected = 0;  // o writes so far: o_heads per GDN layer, the leader per attention layer
     for (uint32_t l = 0; l < layers; l++) {
         const bool attn = is_attn(l);
         // mixer half
@@ -128,18 +173,19 @@ void kernel_main() {
             send_row(attn_base, 2, nq_attn, q_off_attn);
             o_expected += 1;
         } else {
-            send_row(heads_base, gdn_heads, nq_gdn, q_off_gdn);
-            o_expected += gdn_heads;
-            cb_wait_front(cb_hist_out, 1);
+            send_runs(q_off_gdn);
+            o_expected += o_heads;
+            cb_wait_front(cb_hist_out, kBlkViews);
             if (n_conv > 0) {
+                // the 32x32 views holding the q|k|v tiles
                 noc_async_write(
                     get_read_ptr(cb_hist_out),
-                    hist.get_noc_addr(first_row + g % gdn_copies, (conv_step(pos, g, gdn_copies) % 3) * kBlkBytes),
-                    kBlkBytes);
+                    hist.get_noc_addr(first_row + g % gdn_copies, (conv_step(ring, g, gdn_copies) % 3) * kBlkBytes),
+                    views_of(n_conv) * 2048);
                 noc_async_write_barrier();
             }
             *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_local)) = g + 1;
-            cb_pop_front(cb_hist_out, 1);
+            cb_pop_front(cb_hist_out, kBlkViews);
             g++;
         }
         cb_pop_front(cb_qkvz_out, kBlk);
@@ -178,30 +224,36 @@ void kernel_main() {
     if constexpr (lm_head) {
         take_slots(2 * layers);
         if (argmax_addr) {
-            // bf16 bits -> unsigned key in the order of the values; the 1x32 tiles hold the columns in order
+            // bf16 bits -> unsigned key in the order of the values; per user, record slot core * batch + u.
+            // Column c of user u: tile c / 32, face (c % 32) / 16, face row u
             cb_wait_front(cb_logits, nv_max);
-            volatile tt_l1_ptr uint32_t* v = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_logits));
+            const uint32_t base = get_read_ptr(cb_logits);
             auto key = [](uint32_t b) { return (b & 0x8000) ? (~b & 0xffff) : (b | 0x8000); };
-            uint32_t best = 0, best_i = 0;
-            for (uint32_t i = 0; i < valid_cols; i += 2) {
-                const uint32_t w = v[i / 2];
-                const uint32_t k0 = key(w & 0xffff);
-                if (k0 > best) {
-                    best = k0;
-                    best_i = i;
-                }
-                if (i + 1 < valid_cols) {
-                    const uint32_t k1 = key(w >> 16);
-                    if (k1 > best) {
-                        best = k1;
-                        best_i = i + 1;
+            volatile tt_l1_ptr uint32_t* rec = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_pout));
+            for (uint32_t u = 0; u < batch; u++) {
+                uint32_t best = 0, best_i = 0;
+                for (uint32_t i = 0; i < valid_cols; i += 2) {
+                    const uint32_t c = i % 32;
+                    const uint32_t w = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                        base + (i / 32) * kTileBytes + ((c / 16) * batch + u) * 32)[(c % 16) / 2];
+                    const uint32_t k0 = key(w & 0xffff);
+                    if (k0 > best) {
+                        best = k0;
+                        best_i = i;
+                    }
+                    if (i + 1 < valid_cols) {
+                        const uint32_t k1 = key(w >> 16);
+                        if (k1 > best) {
+                            best = k1;
+                            best_i = i + 1;
+                        }
                     }
                 }
+                rec[4 * u] = best;
+                rec[4 * u + 1] = first_index + best_i;
             }
-            volatile tt_l1_ptr uint32_t* rec = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_pout));
-            rec[0] = best;
-            rec[1] = first_index + best_i;
-            noc_async_write(get_write_ptr(cb_pout), get_noc_addr(hub_x, hub_y, argmax_addr + core * 16), 16);
+            noc_async_write(
+                get_write_ptr(cb_pout), get_noc_addr(hub_x, hub_y, argmax_addr + core * batch * 16), batch * 16);
             noc_async_write_barrier();
         }
     }

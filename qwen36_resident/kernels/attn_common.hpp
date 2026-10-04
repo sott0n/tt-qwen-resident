@@ -34,7 +34,12 @@
 // (the streamers' head-output semaphore), 14 eps bits, 15 sem_addr (a worker learns the leader's partial
 // buffer address through it), 16 fanin (partial slots per node of the reduction tree), 17 banks,
 // 18 sem_tail (tail core, local: tail write-backs done; a copy's tail is re-read within a step only after
-// its previous write-back)
+// its previous write-back), 19 batch
+//
+// Batch: the users run one after another through every attention layer (iteration i = layer * batch +
+// user; the semaphores count iterations). User u has its own position (token state word 1 + u), rope
+// tables and KV cache (per bank: users, then copies, then rows); the streamers' rows and the leader's
+// output are batch x 32 tiles, row u for user u.
 #pragma once
 
 #include <stdint.h>
@@ -60,6 +65,8 @@ constexpr uint32_t sem_addr = get_compile_time_arg_val(15);
 constexpr uint32_t fanin = get_compile_time_arg_val(16);
 constexpr uint32_t banks = get_compile_time_arg_val(17);
 constexpr uint32_t sem_tail = get_compile_time_arg_val(18);
+constexpr uint32_t batch = get_compile_time_arg_val(19);
+constexpr uint32_t iters = layers * batch;
 static_assert(heads <= 16, "head rows live in the top faces");
 static_assert(rot_tiles == 2, "rope pairs dims (i, i + 32) of the first 64 head dims");
 
@@ -69,7 +76,7 @@ constexpr uint32_t kTile = 2048;           // bf16 32x32 tile
 constexpr uint32_t kKvTile = 1088;         // bf8 32x32 tile
 constexpr uint32_t kFaceRow = 32;          // bytes of one 16-element face row (bf16)
 constexpr uint32_t kFace = 512;            // bytes of one bf16 face
-constexpr uint32_t kTiny = 64;             // a 1x32 bf16 tile
+constexpr uint32_t kRowTile = 64 * batch;  // a batch x 32 bf16 tile (streamer rows, leader output)
 constexpr uint32_t kKvRow = Dt * kKvTile;  // one position tile of k (or v) in the cache
 
 // shared CBs
@@ -82,7 +89,9 @@ constexpr uint32_t cb_s = 5;    // scores (fp32) of one block, chunk_max tiles
 constexpr uint32_t cb_p = 6;    // exp(s - M) of one block, chunk_max tiles
 constexpr uint32_t cb_m = 7;    // this core's row max
 constexpr uint32_t cb_o = 8;    // this core's partial (kPart tiles)
-constexpr uint32_t cb_ntiles = 10;  // worker: its chunk's KV tiles (one uint32, for compute and writer)
+constexpr uint32_t cb_ntiles = 10;   // worker: its chunk's KV tiles per user (uint32s, for compute and writer)
+constexpr uint32_t kNegInfOff = 64;  // in the cb_ntiles page: the writer's -inf row-max rows (heads x 32 B)
+static_assert(batch * 4 <= kNegInfOff, "chunk counts overlap the -inf rows");
 // chunk worker: online-softmax state over the chunk's blocks (fp32): output, row sum, row max, rescale
 constexpr uint32_t cb_orun = 9;    // 2 x Dt
 constexpr uint32_t cb_lrun = 15;   // 2
@@ -97,14 +106,14 @@ constexpr uint32_t cb_sq = 13;      // scratch (Dt)
 constexpr uint32_t cb_rs = 14;      // 1 / rms per row
 constexpr uint32_t cb_qw = 15;      // this layer's (1 + w_q) / sqrt(head_dim), Dt tiles, rows replicated
 constexpr uint32_t cb_kw = 16;      // this layer's (1 + w_k)
-constexpr uint32_t cb_rope = 17;    // cos, sin, -sin of this position (rows replicated)
+constexpr uint32_t cb_rope = 17;    // per user: cos, sin, -sin of its position (rows replicated)
 constexpr uint32_t cb_knew = 18;    // normalized + rotated k row (row 0)
 constexpr uint32_t cb_tail8 = 31;   // tail core: tail k | v tiles as read from DRAM (2 Dt bf8)
-constexpr uint32_t cb_rowsel = 12;  // tail core: R (ones in row r), 1 - R
+constexpr uint32_t cb_rowsel = 12;  // tail core: per user R (ones in row r), 1 - R
 constexpr uint32_t cb_tailk = 19;   // tail tiles with the new row (bf16, Dt)
 constexpr uint32_t cb_tailv = 20;
 constexpr uint32_t cb_vraw = 21;   // v row (row 0)
-constexpr uint32_t cb_mask = 22;   // 0 / -inf over the tail columns
+constexpr uint32_t cb_mask = 22;   // per user 0 / -inf over the tail columns
 constexpr uint32_t cb_parts = 23;  // fanin x kPart partials of this node's children (written by them)
 constexpr uint32_t cb_gs = 26;     // leader: sigmoid(gate)
 constexpr uint32_t cb_osum = 25;   // own + children's partials (kPart)
@@ -112,10 +121,13 @@ constexpr uint32_t cb_rl = 30;     // leader: 1 / row sum
 constexpr uint32_t cb_out = 27;    // gated output (Dt)
 constexpr uint32_t cb_flush = 28;  // updated tail k | v as bf8 (2 Dt), written back to DRAM
 constexpr uint32_t cb_mean = 29;   // reduce scaler 1 / (32 Dt)
-constexpr uint32_t cb_stage = 2;   // leader: gated output rows as 1x32 tiles (heads x Dt)
+constexpr uint32_t cb_stage = 2;   // leader: gated output rows as batch x 32 tiles (heads x Dt)
 
 // byte offset of row r inside a 32x32 bf16 tile, face 0 (columns 0..15); face 1 is + kFace
 FORCE_INLINE uint32_t row_offset(uint32_t r) { return (r < 16 ? 0 : 2 * kFace) + (r & 15) * kFaceRow; }
+
+// byte offset of user u's face 0 row inside a batch x 32 tile; its face 1 row is + batch * kFaceRow
+FORCE_INLINE uint32_t user_offset(uint32_t u) { return u * kFaceRow; }
 
 // chunk of chunk worker w at KV tile rows tp (complete position tiles): bank, first row j, row step J,
 // number of rows (0: no chunk)

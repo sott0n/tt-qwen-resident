@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Attention leader reader: reads the rope tables of the position from the token state; per attention
-// layer a, reads the layer's q norm weight (copy a % copies), waits for the streamers' projection row
-// [q heads | gates | k | v] (1x32 tiles) and places head h of q and of the gate into row h of cb_qraw /
-// cb_gate; then releases the group heads' partial sums to compute once all of them have written theirs.
+// Attention leader reader: reads every user's rope tables from the token state; per attention layer a,
+// reads the layer's q norm weight (copy a % copies) and waits for the streamers' projection rows
+// [q heads | gates | k | v] (batch x 32 tiles); per user u places head h of u's q and gate into row h of
+// cb_qraw / cb_gate, then releases the group heads' partial sums to compute once all of them have
+// written theirs. User u + 1's rows are placed before user u's partials are awaited.
 //
 // Runtime args: 0 row buffer address, 1 children (group heads of the reduction tree), 2 optional
 // timeline buffer (0 = off; per layer 8 wall-clock words: [1] rows arrived, [2] rows placed,
@@ -18,11 +19,12 @@ using namespace resident_attn;
 
 namespace {
 
-// copy a 1x32 tile into row `row` of a 32x32 bf16 tile (two 16-element face rows)
-FORCE_INLINE void place_row(uint32_t tiny, uint32_t tile, uint32_t row) {
+// copy user u's row of a batch x 32 tile into row `row` of a 32x32 bf16 tile (two 16-element face rows)
+FORCE_INLINE void place_row(uint32_t src, uint32_t u, uint32_t tile, uint32_t row) {
     const uint32_t off = row_offset(row);
-    noc_async_read(get_noc_addr(tiny), tile + off, kFaceRow);
-    noc_async_read(get_noc_addr(tiny + kFaceRow), tile + kFace + off, kFaceRow);
+    src += user_offset(u);
+    noc_async_read(get_noc_addr(src), tile + off, kFaceRow);
+    noc_async_read(get_noc_addr(src + batch * kFaceRow), tile + kFace + off, kFaceRow);
 }
 
 FORCE_INLINE void zero_tiles(uint32_t cb, uint32_t n) {
@@ -58,48 +60,60 @@ void kernel_main() {
         }
     };
 
-    zero_tiles(cb_qraw, Dt);
-    zero_tiles(cb_gate, Dt);
+    zero_tiles(cb_qraw, 2 * Dt);
+    zero_tiles(cb_gate, 2 * Dt);
     push_resident(cb_mean, 1);
     {
-        const InterleavedAddrGen<true> tok{.bank_base_address = tok_addr, .page_size = rope_off + 3 * kTile};
-        cb_reserve_back(cb_rope, 3);
-        noc_async_read(tok.get_noc_addr(0, rope_off), get_write_ptr(cb_rope), 3 * kTile);
+        const InterleavedAddrGen<true> tok{.bank_base_address = tok_addr, .page_size = rope_off + 3 * batch * kTile};
+        cb_reserve_back(cb_rope, 3 * batch);
+        noc_async_read(tok.get_noc_addr(0, rope_off), get_write_ptr(cb_rope), 3 * batch * kTile);
         noc_async_read_barrier();
-        cb_push_back(cb_rope, 3);
+        cb_push_back(cb_rope, 3 * batch);
     }
 
     constexpr uint32_t gate0 = heads * Dt;
-    for (uint32_t l = 0; l < layers; l++) {
-        cb_reserve_back(cb_qw, Dt);
-        for (uint32_t d = 0; d < Dt; d++) {
-            noc_async_read_page((l % copies) * Dt + d, qw_dram, get_write_ptr(cb_qw) + d * kTile);
-        }
-        noc_async_read_barrier();
-        cb_push_back(cb_qw, Dt);
-        noc_semaphore_wait_min(rows_sem, num_streamers * (l + 1));
-        mark(l, 1);
+    auto place = [&](uint32_t u) {
         cb_reserve_back(cb_qraw, Dt);
         cb_reserve_back(cb_gate, Dt);
         const uint32_t q = get_write_ptr(cb_qraw), g = get_write_ptr(cb_gate);
         for (uint32_t h = 0; h < heads; h++) {
             for (uint32_t d = 0; d < Dt; d++) {
-                place_row(rows + (h * Dt + d) * kTiny, q + d * kTile, h);
+                place_row(rows + (h * Dt + d) * kRowTile, u, q + d * kTile, h);
             }
         }
         noc_async_read_barrier();
         cb_push_back(cb_qraw, Dt);
         for (uint32_t h = 0; h < heads; h++) {
             for (uint32_t d = 0; d < Dt; d++) {
-                place_row(rows + (gate0 + h * Dt + d) * kTiny, g + d * kTile, h);
+                place_row(rows + (gate0 + h * Dt + d) * kRowTile, u, g + d * kTile, h);
             }
         }
         noc_async_read_barrier();
         cb_push_back(cb_gate, Dt);
-        mark(l, 2);
+    };
+    for (uint32_t i = 0; i < iters; i++) {
+        const uint32_t l = i / batch, u = i % batch;
+        if (u == 0) {
+            cb_reserve_back(cb_qw, Dt);
+            for (uint32_t d = 0; d < Dt; d++) {
+                noc_async_read_page((l % copies) * Dt + d, qw_dram, get_write_ptr(cb_qw) + d * kTile);
+            }
+            noc_async_read_barrier();
+            cb_push_back(cb_qw, Dt);
+            noc_semaphore_wait_min(rows_sem, num_streamers * (l + 1));
+            mark(l, 1);
+            place(0);
+            mark(l, 2);
+        }
+        // the next user's rows go in before this user's partials arrive, so compute prepares its q meanwhile
+        if (u + 1 < batch) {
+            place(u + 1);
+        }
 
-        noc_semaphore_wait_min(part_sem, children * (l + 1));
-        mark(l, 3);
+        noc_semaphore_wait_min(part_sem, children * (i + 1));
+        if (u + 1 == batch) {
+            mark(l, 3);
+        }
         push_resident(cb_parts, fanin * kPart);
     }
 }

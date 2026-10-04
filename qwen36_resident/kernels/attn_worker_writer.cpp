@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Attention worker writer: per layer, sends this core's row max (rows 0..heads-1 of column 0) to the
+// Attention worker writer: per layer and user, sends this core's row max (rows 0..heads-1 of column 0) to the
 // leader, then its partial (a group head: its partial plus its children's) to slot `slot` of its
 // parent's cb_parts (the leader or a group head), top two faces of each tile only. A parent's cb_parts
 // address arrives in this core's sem_addr; a group head sends its own to its children at start. The
@@ -55,30 +55,40 @@ void kernel_main() {
     volatile tt_l1_ptr uint32_t* q_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_q));
     volatile tt_l1_ptr uint32_t* M_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_M));
     cb_wait_front(cb_ntiles, 1);
-    const bool has_chunk = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_ntiles)) > 0;
-    // -inf rows (column 0 of rows 0..heads-1) for a worker without a chunk (its score buffer is unused)
-    const uint32_t neg_inf = get_write_ptr(cb_s);
-    if (!has_chunk) {
+    bool chunk_of_user[batch];
+    bool any_chunkless = false;
+    for (uint32_t u = 0; u < batch; u++) {
+        chunk_of_user[u] = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(cb_ntiles))[u] > 0;
+        any_chunkless |= !chunk_of_user[u];
+    }
+    // -inf rows (column 0 of rows 0..heads-1) for a user this worker has no chunk of, next to the counts
+    const uint32_t neg_inf = get_read_ptr(cb_ntiles) + kNegInfOff;
+    if (any_chunkless) {
         volatile tt_l1_ptr uint16_t* p = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(neg_inf);
         for (uint32_t i = 0; i < heads * kFaceRow / 2; i++) {
             p[i] = 0xff80;
         }
     }
-    uint32_t tail_bank = 0, tail_row = 0;
+    uint32_t tail_bank[batch], tail_row[batch];
     if (role == 2) {
-        const InterleavedAddrGen<true> tok{.bank_base_address = get_arg_val<uint32_t>(tail_args + 3), .page_size = 16};
-        noc_async_read(tok.get_noc_addr(0), get_write_ptr(cb_flush), 16);
+        const InterleavedAddrGen<true> tok{
+            .bank_base_address = get_arg_val<uint32_t>(tail_args + 3), .page_size = 4 * (1 + batch)};
+        noc_async_read(tok.get_noc_addr(0), get_write_ptr(cb_flush), 4 * (1 + batch));
         noc_async_read_barrier();
-        const uint32_t tp = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_flush)) / 32;
-        tail_bank = tp % banks;
-        tail_row = tp / banks;
+        for (uint32_t u = 0; u < batch; u++) {
+            const uint32_t tp = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_flush))[1 + u] / 32;
+            tail_bank[u] = tp % banks;
+            tail_row[u] = tp / banks;
+        }
     }
-    for (uint32_t l = 0; l < layers; l++) {
+    for (uint32_t i = 0; i < iters; i++) {
+        const uint32_t l = i / batch, u = i % batch;
+        const bool has_chunk = chunk_of_user[u];
         if (has_chunk) {
             cb_wait_front(cb_m, 1);
             noc_async_write(get_read_ptr(cb_m), m_dst, heads * kFaceRow);
         } else {
-            noc_semaphore_wait_min(q_sem, l + 1);
+            noc_semaphore_wait_min(q_sem, i + 1);
             noc_async_write(neg_inf, m_dst, heads * kFaceRow);
         }
         noc_async_write_barrier();
@@ -87,7 +97,7 @@ void kernel_main() {
             cb_pop_front(cb_m, 1);
         }
         if (!has_chunk) {
-            noc_semaphore_wait_min(M_sem, l + 1);
+            noc_semaphore_wait_min(M_sem, i + 1);
         }
         cb_wait_front(out_cb, kPart);
         const uint32_t src = get_read_ptr(out_cb);
@@ -101,16 +111,17 @@ void kernel_main() {
             ts[l * 4 + 3] = *clk;
         }
         if (role == 2) {
-            const uint32_t copy_off = (l % copies) * get_arg_val<uint32_t>(tail_args + 2) + tail_row * kKvRow;
+            const uint32_t copy_stride = get_arg_val<uint32_t>(tail_args + 2);
+            const uint32_t copy_off = (u * copies + l % copies) * copy_stride + tail_row[u] * kKvRow;
             cb_wait_front(cb_flush, 2 * Dt);
             for (uint32_t kv = 0; kv < 2; kv++) {
                 const uint32_t addr = get_arg_val<uint32_t>(tail_args + kv) + copy_off;
                 noc_async_write(
-                    get_read_ptr(cb_flush) + kv * kKvRow, get_noc_addr_from_bank_id<true>(tail_bank, addr), kKvRow);
+                    get_read_ptr(cb_flush) + kv * kKvRow, get_noc_addr_from_bank_id<true>(tail_bank[u], addr), kKvRow);
             }
             noc_async_write_barrier();
             cb_pop_front(cb_flush, 2 * Dt);
-            *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_tail)) = l + 1;
+            *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_tail)) = i + 1;
         }
     }
     noc_async_atomic_barrier();

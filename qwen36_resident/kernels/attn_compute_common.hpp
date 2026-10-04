@@ -25,8 +25,10 @@
 
 namespace resident_attn {
 
-// s[j] for j < n_tiles; with mask, cb_mask is added to the last tile (tail columns past the position)
-FORCE_INLINE void scores(uint32_t q_cb, uint32_t k_cb, uint32_t k_base, uint32_t n_tiles, bool mask) {
+// s[j] for j < n_tiles; with mask, tile mask_tile of cb_mask is added to the last tile (tail columns
+// past the position)
+FORCE_INLINE void scores(
+    uint32_t q_cb, uint32_t k_cb, uint32_t k_base, uint32_t n_tiles, bool mask, uint32_t mask_tile = 0) {
     cb_reserve_back(cb_s, chunk_max);
     reconfig_data_format(k_cb, q_cb);
     pack_reconfig_data_format(cb_s);
@@ -38,7 +40,7 @@ FORCE_INLINE void scores(uint32_t q_cb, uint32_t k_cb, uint32_t k_base, uint32_t
         }
         if (mask && j + 1 == n_tiles) {
             add_reuse_dest_init<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_mask);
-            add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_mask, 0, 0);
+            add_reuse_dest_tiles<EltwiseBinaryReuseDestType::DEST_TO_SRCA>(cb_mask, mask_tile, 0);
             matmul_init(q_cb, k_cb, 1);
         }
         tile_regs_commit();
@@ -199,8 +201,10 @@ FORCE_INLINE void row_rsqrt(uint32_t in_cb) {
     cb_push_back(cb_rs, 1);
 }
 
-// out = rope(in * rs * w[w_base ..]) into out_a (and out_b if given); pops in_cb
-FORCE_INLINE void norm_rope(uint32_t in_cb, uint32_t w_cb, uint32_t w_base, uint32_t out_a, uint32_t out_b) {
+// out = rope(in * rs * w[w_base ..]) into out_a (and out_b if given), rope tables at tile rope of cb_rope;
+// pops in_cb
+FORCE_INLINE void norm_rope(
+    uint32_t in_cb, uint32_t w_cb, uint32_t w_base, uint32_t out_a, uint32_t out_b, uint32_t rope = 0) {
     cb_wait_front(in_cb, Dt);
     row_rsqrt(in_cb);
     cb_wait_front(cb_rs, 1);
@@ -240,9 +244,9 @@ FORCE_INLINE void norm_rope(uint32_t in_cb, uint32_t w_cb, uint32_t w_base, uint
     copy_init(cb_sq);
     copy_tile(cb_sq, 0, 0);
     copy_tile(cb_sq, 1, 1);
-    copy_tile(cb_rope, 0, 2);
-    copy_tile(cb_rope, 1, 3);
-    copy_tile(cb_rope, 2, 4);
+    copy_tile(cb_rope, rope, 2);
+    copy_tile(cb_rope, rope + 1, 3);
+    copy_tile(cb_rope, rope + 2, 4);
     mul_binary_tile_init();
     mul_binary_tile(0, 2, 5);
     mul_binary_tile(1, 4, 6);
@@ -274,11 +278,12 @@ FORCE_INLINE void norm_rope(uint32_t in_cb, uint32_t w_cb, uint32_t w_base, uint
     cb_pop_front(cb_sq, Dt);
 }
 
-// row r of the tail tiles <- the new k / v row (row 0 of cb_knew / cb_vraw), kBatch tiles per DST pass
+// row r of the tail tiles <- the new k / v row (row 0 of cb_knew / cb_vraw), kBatch tiles per DST pass;
+// R, 1 - R at tiles sel, sel + 1 of cb_rowsel
 constexpr uint32_t kBatch = 4;
 static_assert(Dt % kBatch == 0, "tail tiles go in DST batches");
 
-FORCE_INLINE void update_tail() {
+FORCE_INLINE void update_tail(uint32_t sel = 0) {
     cb_wait_front(cb_tail8, 2 * Dt);
     cb_wait_front(cb_knew, Dt);
     cb_wait_front(cb_vraw, Dt);
@@ -291,12 +296,12 @@ FORCE_INLINE void update_tail() {
         reconfig_data_format(cb_tail8, cb_rowsel);
         mul_init(cb_tail8, cb_rowsel, false);
         for (uint32_t i = 0; i < kBatch; i++) {
-            mul_tiles(cb_tail8, cb_rowsel, i0 + i, 1, i);
+            mul_tiles(cb_tail8, cb_rowsel, i0 + i, sel + 1, i);
         }
         reconfig_data_format(cb_rowsel, row_cb);
         mul_bcast_rows_init(cb_rowsel, row_cb);
         for (uint32_t i = 0; i < kBatch; i++) {
-            mul_tiles_bcast_rows(cb_rowsel, row_cb, 0, (i0 + i) % Dt, kBatch + i);
+            mul_tiles_bcast_rows(cb_rowsel, row_cb, sel, (i0 + i) % Dt, kBatch + i);
         }
         add_binary_tile_init();
         for (uint32_t i = 0; i < kBatch; i++) {

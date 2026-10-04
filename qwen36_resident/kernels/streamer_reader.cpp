@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Resident streamer reader (NCRISC): seeds slot 0 with x0 of the token state (the other chips'
-// slots with zero), then streams this core's columns of every layer's weights from its DRAM bank into
-// the shared weight ring, running ahead of compute by up to the ring size (across the mixer phases
-// and the all-reduces). A GDN layer also brings its conv taps and conv history (oldest first).
+// Resident streamer reader (NCRISC): seeds x with x0 of the token state, then streams this core's columns of every
+// layer's weights from its DRAM bank into the shared weight ring, running ahead of compute by up to the ring size
+// (across the mixer phases and the all-reduces). A GDN layer also brings its conv taps and conv history (oldest first).
 // A bank's cores interleave their blocks in the bank (slot r * cores_per_bank + j is block r of the
 // bank's core j), and each block's pages alternate between NOC0 and NOC1: one NOC's reads cap at
 // ~47 GB/s per bank, both reach the bank's ~64 GB/s.
@@ -14,7 +13,8 @@
 // (DRAM rows of 4 x kBlk 1x32 tiles), 29 conv history address (rows of 3 x kBlk), 30 this core's first
 // row (core index x GDN copies), 31 GDN copies, 32 token state address, 33 optional timeline buffer
 // (0 = off): per layer, the wall clock at the end of each entry's stream and the cycles each entry
-// spent waiting for ring room.
+// spent waiting for ring room, 34 n_conv (q|k|v tiles of this core: only the 32x32 views holding them of
+// the taps and history are read).
 
 #include "api/dataflow/dataflow_api.h"
 #include "streamer_common.hpp"
@@ -101,6 +101,7 @@ void kernel_main() {
     const uint32_t gdn_copies = get_arg_val<uint32_t>(31);
     const uint32_t tok_addr = get_arg_val<uint32_t>(32);
     const uint32_t ts_addr = get_arg_val<uint32_t>(33);
+    const uint32_t conv_bytes = views_of(get_arg_val<uint32_t>(34)) * 2048;
     reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, 0);
     reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, 1);
     {
@@ -109,30 +110,42 @@ void kernel_main() {
         consumed = get_cb_tiles_acked_ptr(cb_consumed);
         *consumed = 0;
     }
-    const InterleavedAddrGen<true> tok{.bank_base_address = tok_addr, .page_size = kTokRope + 3 * 2048};
+    const InterleavedAddrGen<true> tok{.bank_base_address = tok_addr, .page_size = kTokBytes};
     const InterleavedAddrGen<true> taps{.bank_base_address = conv_w_addr, .page_size = 4 * kBlkBytes};
     const InterleavedAddrGen<true> hist{.bank_base_address = hist_addr, .page_size = 3 * kBlkBytes};
 
-    // slot 0 = x0, the other chips' slots zero: x = sum of the slots
-    cb_reserve_back(cb_slots, num_chips * Ht);
-    {
-        const uint32_t base = get_write_ptr(cb_slots);
-        volatile tt_l1_ptr uint32_t* p = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(base + Ht * kTileBytes);
-        for (uint32_t i = 0; i < (num_chips - 1) * Ht * kTileBytes / 4; i++) {
-            p[i] = 0;
+    // x of round 0 = x0; the ring step (for the conv slot order) lands in cb_dout, unused until compute runs
+    cb_reserve_back(cb_x, Ht);
+    noc_async_read(tok.get_noc_addr(0, kTokX0), get_write_ptr(cb_x), Ht * kTileBytes);
+    noc_async_read(tok.get_noc_addr(0), get_write_ptr(cb_dout), 16);
+    noc_async_read_barrier();
+    const uint32_t ring = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_dout));
+    *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_ring)) = ring + 1;  // for the writer
+    cb_push_back(cb_x, Ht);
+    if constexpr (batch > 1) {
+        // rmsnorm constants: ones, the fold matrix (1 where row = column mod batch), the identity, bf16 32x32
+        cb_reserve_back(cb_ones_full, 1);
+        cb_reserve_back(cb_fold, 1);
+        cb_reserve_back(cb_eye, 1);
+        volatile tt_l1_ptr uint16_t* ones = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_write_ptr(cb_ones_full));
+        volatile tt_l1_ptr uint16_t* fold = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_write_ptr(cb_fold));
+        volatile tt_l1_ptr uint16_t* eye = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_write_ptr(cb_eye));
+        for (uint32_t i = 0; i < 1024; i++) {
+            const uint32_t face = i / 256, row = (face / 2) * 16 + (i % 256) / 16, col = (face % 2) * 16 + i % 16;
+            ones[i] = 0x3f80;
+            fold[i] = row % batch == col % batch ? 0x3f80 : 0;
+            eye[i] = row == col ? 0x3f80 : 0;
         }
-        noc_async_read(tok.get_noc_addr(0, kTokX0), base, Ht * kTileBytes);
-        noc_async_read(tok.get_noc_addr(0), get_write_ptr(cb_x), 16);  // position, for the conv slot order
-        noc_async_read_barrier();
+        cb_push_back(cb_ones_full, 1);
+        cb_push_back(cb_fold, 1);
+        cb_push_back(cb_eye, 1);
     }
-    const uint32_t pos = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_x));
-    cb_push_back(cb_slots, num_chips * Ht);
 
     volatile tt_l1_ptr uint32_t* ts = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ts_addr);
     auto mark = [&](uint32_t l, uint32_t e) {
         if (ts_addr) {
-            ts[l * 16 + e] = *clk;
-            ts[l * 16 + 4 + e] = stall_cycles;
+            ts[l * kTsWords + e] = *clk;
+            ts[l * kTsWords + 4 + e] = stall_cycles;
         }
         stall_cycles = 0;
     };
@@ -146,19 +159,24 @@ void kernel_main() {
             // this layer's taps and history, oldest first (see conv_step); a copy used again within the step
             // waits for the writer's write-back of its previous use
             const uint32_t row = first_row + g % gdn_copies;
-            const uint32_t step = conv_step(pos, g, gdn_copies);
+            const uint32_t step = conv_step(ring, g, gdn_copies);
             if (g >= gdn_copies) {
                 noc_semaphore_wait_min(
                     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_local)), g - gdn_copies + 1);
             }
             cb_reserve_back(cb_conv_w, 4 * kBlk);
-            noc_async_read(taps.get_noc_addr(row), get_write_ptr(cb_conv_w), 4 * kBlkBytes);
             cb_reserve_back(cb_conv_hist, 3 * kBlk);
-            for (uint32_t j = 0; j < 3; j++) {
-                noc_async_read(
-                    hist.get_noc_addr(row, ((step + j) % 3) * kBlkBytes),
-                    get_write_ptr(cb_conv_hist) + j * kBlkBytes,
-                    kBlkBytes);
+            if (conv_bytes > 0) {
+                for (uint32_t j = 0; j < 4; j++) {
+                    noc_async_read(
+                        taps.get_noc_addr(row, j * kBlkBytes), get_write_ptr(cb_conv_w) + j * kBlkBytes, conv_bytes);
+                }
+                for (uint32_t j = 0; j < 3; j++) {
+                    noc_async_read(
+                        hist.get_noc_addr(row, ((step + j) % 3) * kBlkBytes),
+                        get_write_ptr(cb_conv_hist) + j * kBlkBytes,
+                        conv_bytes);
+                }
             }
             noc_async_read_barrier();
             cb_push_back(cb_conv_w, 4 * kBlk);

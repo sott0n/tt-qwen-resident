@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Resident GDN head core compute: the Gated DeltaNet decode step of one value head, repeated for every
-// layer of the run (T=1, B=1; row 0 of every tile is live). The reader lands the head's q/k/v/z/a/b
-// from the streamers and the layer's state; the writer keeps the updated state and returns the output.
+// layer and user of the run (T=1; row 0 of every tile is live, the users one after another). The reader lands the
+// head's q/k/v/z/a/b from the streamers and the layer's state; the writer keeps the updated state and returns the
+// output.
 //
 //   q, k  = l2norm(q) * scale, l2norm(k)                   (key head kh = h / group)
 //   decay = exp(neg_exp_A * softplus(a + dt_bias)),  beta = sigmoid(b)
@@ -15,7 +16,7 @@
 // State decay/update and the gates run on SFPU in fp32 (UnpackToDestFp32 CBs); matmuls and the
 // row-sum reductions run on the FPU with fp32 accumulation, matching the unfused ttnn graph.
 //
-// Compile-time args: Nk, Nv, Kt, Vt, group, scale, l2_eps, rms_eps, inv_dv (floats as bits), layers
+// Compile-time args: Nk, Nv, Kt, Vt, group, scale, l2_eps, rms_eps, inv_dv (floats as bits), layers x users
 
 #include <cstdint>
 #include "api/compute/compute_kernel_api.h"

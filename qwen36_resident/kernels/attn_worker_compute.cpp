@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Attention worker compute (see attn_common.hpp). Per attention layer:
+// Attention worker compute (see attn_common.hpp). Per attention layer and user:
 //   chunk worker: the partial attention of q over this core's KV chunk, block by block with an online
 //     softmax (a zero partial without one);
 //   tail core: k = rope(rmsnorm_rows(k) * w_k), the new k / v row into the tail tiles, the partial over
@@ -213,10 +213,14 @@ void kernel_main() {
     const uint32_t children = get_arg_val<uint32_t>(1);
     cb_wait_front(cb_one, 1);
     cb_wait_front(cb_ntiles, 1);
-    const uint32_t n_tiles = read_tile_value(cb_ntiles, 0, 0);
+    uint32_t n_of[batch];
+    for (uint32_t u = 0; u < batch; u++) {
+        n_of[u] = read_tile_value(cb_ntiles, 0, u);
+    }
     if (role == 1) {
         compute_kernel_hw_startup<SrcOrder::Reverse>(cb_q, cb_k, cb_s);
-        for (uint32_t l = 0; l < layers; l++) {
+        for (uint32_t i = 0; i < iters; i++) {
+            const uint32_t n_tiles = n_of[i % batch];
             cb_wait_front(cb_q, Dt);
             if (n_tiles > 0) {
                 for (uint32_t b0 = 0; b0 < n_tiles; b0 += chunk_max) {
@@ -243,18 +247,19 @@ void kernel_main() {
     }
     compute_kernel_hw_startup(cb_kraw, cb_kraw, cb_sq);
     cb_wait_front(cb_mean, 1);
-    cb_wait_front(cb_rope, 3);
-    cb_wait_front(cb_mask, 1);
-    cb_wait_front(cb_rowsel, 2);
-    for (uint32_t l = 0; l < layers; l++) {
+    cb_wait_front(cb_rope, 3 * batch);
+    cb_wait_front(cb_mask, batch);
+    cb_wait_front(cb_rowsel, 2 * batch);
+    for (uint32_t i = 0; i < iters; i++) {
+        const uint32_t u = i % batch;
         cb_wait_front(cb_kw, Dt);
-        norm_rope(cb_kraw, cb_kw, 0, cb_knew, cb_knew);
+        norm_rope(cb_kraw, cb_kw, 0, cb_knew, cb_knew, 3 * u);
         cb_pop_front(cb_kw, Dt);
-        update_tail();
+        update_tail(2 * u);
         cb_wait_front(cb_q, Dt);
         cb_wait_front(cb_tailk, Dt);
         cb_wait_front(cb_tailv, Dt);
-        scores(cb_q, cb_tailk, 0, 1, true);
+        scores(cb_q, cb_tailk, 0, 1, true, u);
         row_max(1);
         probs_and_partial(cb_tailv, 0, 1);
         if (children > 0) {

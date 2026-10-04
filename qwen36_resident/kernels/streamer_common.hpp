@@ -10,8 +10,8 @@
 //          DRAM; attention: q | gate | k | v);  y goes to the layer's mixer cores (GDN head cores or
 //          the attention leader + tail core), which return o;  partial = o @ W_out
 //   mlp:   h = rmsnorm(x);  partial = down(silu(h @ G) * (h @ U))
-// After each half the hub all-reduces the chips' partials (chip 0 folds x in) and multicasts the
-// per-chip slots back, so every streamer rebuilds x as the sum of the slots. The lm_head computes
+// After each half the hub all-reduces the chips' partials (chip 0 folds x in), sums them and multicasts
+// the new x to every streamer. The lm_head computes
 // this core's logit columns of rmsnorm(x) @ W_head into an L1 buffer read by the host.
 //
 // Weights: one DRAM tensor per entry holding `distinct` layers of that kind at a fixed per-bank stride;
@@ -22,8 +22,14 @@
 //   8 rms eps bits, 9 1/sqrt(hidden) bits, 10 sem_slots, 11 sem_act, 12 sem_gather, 13 sem_heads,
 //   14 sem_rows, 15 ng_max, 16 nd_max, 17 nq_max (projection tiles per core, <= kBlk), 18 nv_max
 //   (lm_head tiles per core), 19 conv_tiles (q|k|v tiles per chip), 20 Ot (out-proj K tiles),
-//   21 gdn_heads, 22 lm_head (0 / 1), then per entry e (see kEntries): 23 + 5e Kt, sb, pages,
-//   page_size, block_bytes, then 53 sem_local (conv history write-backs done, for the reader)
+//   21 gdn_heads (GDN head cores), 22 lm_head (0 / 1), then per entry e (see kEntries): 23 + 5e Kt, sb, pages,
+//   page_size, block_bytes, then 53 sem_local (conv history write-backs done, for the reader), 54 batch
+//   (users per step, 1 / 2 / 4 / 8), 55 sem_addr (CB addresses exchanged with the hub), 56 o_heads (GDN
+//   head cores that write o, one per value head), 57 column block tiles (kBlk), 58 sem_ring (local: the
+//   ring step + 1, from the reader to the writer)
+//
+// Batch: every activation tile is a batch x 32 tile, row u for user u (face 0 holds columns 0..15 of
+// all rows, face 1 columns 16..31). The weights stream once per step for all users.
 #pragma once
 
 #include <stdint.h>
@@ -34,7 +40,6 @@ constexpr uint32_t kEntries = 6;
 constexpr uint32_t kQkvz = 0, kQkvg = 1, kOut = 2, kGateUp = 3, kDown = 4, kHead = 5;
 
 // streamer CBs
-constexpr uint32_t cb_slots = 0;
 constexpr uint32_t cb_w0 = 1;  // weight ring, entry e -> cb_w0 + e (1..6)
 constexpr uint32_t cb_consumed = 7;
 constexpr uint32_t cb_act = 8;    // mlp intermediate activation (It)
@@ -54,10 +59,12 @@ constexpr uint32_t cb_o_in = 21;       // mixer output (Ot), written by the mixe
 constexpr uint32_t cb_u = 26;          // up columns of this core
 constexpr uint32_t cb_hist_out = 30;   // this step's input to the conv (the newest history entry)
 constexpr uint32_t cb_logits = 31;     // lm_head columns of this core (read by the host)
-// The per-core column blocks of the elementwise phases (conv1d + silu, silu(g) * u) hold at most
-// kBlk 1x32 tiles and are laid out on a 32x32 tile's worth of bytes, so the SFPU math runs once on
-// the 32x32 views below instead of once per 1x32 tile (an SFPU op covers a full 32x32 tile).
-constexpr uint32_t kBlk = 32;
+// The per-core column blocks of the elementwise phases (conv1d + silu, silu(g) * u) hold kBlk batch x 32
+// tiles (CT 57: a whole number of 32x32 views, 32 / batch tiles each), so the SFPU math runs on the 32x32
+// views below instead of once per small tile (an SFPU op covers a full 32x32 tile).
+constexpr uint32_t kBlk = get_compile_time_arg_val(57);
+constexpr uint32_t kBlkViews = kBlk * get_compile_time_arg_val(54) / 32;
+static_assert(kBlkViews * 32 == kBlk * get_compile_time_arg_val(54), "a column block is whole 32x32 views");
 constexpr uint32_t cb_qkvz_full = 22;
 constexpr uint32_t cb_qkvz_out_full = 23;
 constexpr uint32_t cb_conv_w_full = 24;     // [tap] full tiles
@@ -66,12 +73,26 @@ constexpr uint32_t cb_g_full = 27;
 constexpr uint32_t cb_u_full = 28;
 constexpr uint32_t cb_aslice_full = 29;
 constexpr uint32_t kUnit = 64;
-constexpr uint32_t kTileBytes = 64;
-constexpr uint32_t kBlkBytes = kBlk * kTileBytes;  // a 32x32 bf16 tile's worth of 1x32 tiles
+constexpr uint32_t batch = get_compile_time_arg_val(54);
+static_assert(batch == 1 || batch == 2 || batch == 4 || batch == 8, "custom_mm takes 1, 2, 4 or 8 rows");
+constexpr uint32_t kTileBytes = 64 * batch;        // a batch x 32 bf16 tile
+constexpr uint32_t kBlkBytes = kBlk * kTileBytes;  // kBlkViews 32x32 bf16 tiles
+// 32x32 views of a column block that hold its first n tiles
+constexpr uint32_t views_of(uint32_t n) { return (n * batch + 31) / 32; }
+// rmsnorm of a batch > 1: ones and the row-fold matrix (see rmsnorm_rows)
+constexpr uint32_t cb_ones_full = 32;
+constexpr uint32_t cb_fold = 33;
+constexpr uint32_t cb_sumsq = 34;  // fp32 scratch, 2 tiles
+constexpr uint32_t cb_rinv = 35;   // fp32, per-row 1 / rms on the view rows
+constexpr uint32_t cb_eye = 38;    // rmsnorm of a batch > 1: the identity (bf16 32x32)
 
-// token state (DRAM, uint32 words): [0] position; x0 (hidden bf16 as 1x32 tiles) at kTokX0; the rope
-// cos, sin, -sin tiles of the position (32x32 bf16, rows replicated) at kTokRope
+// token state (DRAM, uint32 words): [0] conv ring step (advances once per step), [1 + u] position of
+// user u; x0 (hidden bf16 as batch x 32 tiles) at kTokX0; per user the rope cos, sin, -sin tiles of its
+// position (32x32 bf16, rows replicated) at kTokRope
 constexpr uint32_t kTokX0 = 64;
+
+// optional timeline: per layer kTsWords words, reader [0, 8), writer [8, 16), compute [16, 26)
+constexpr uint32_t kTsWords = 32;
 
 constexpr uint32_t layers = get_compile_time_arg_val(0);
 constexpr uint32_t attn_interval = get_compile_time_arg_val(1);
@@ -98,21 +119,26 @@ constexpr uint32_t gdn_heads = get_compile_time_arg_val(21);
 constexpr bool lm_head = get_compile_time_arg_val(22) != 0;
 constexpr uint32_t Hf = Ht / 32;
 constexpr uint32_t kTokRope = kTokX0 + Ht * kTileBytes;
+constexpr uint32_t kTokBytes = kTokRope + 3 * 2048 * batch;
 static_assert(
     get_compile_time_arg_val(15) <= 32 && get_compile_time_arg_val(17) <= 32, "column blocks exceed one full tile");
 
 constexpr uint32_t sem_local = get_compile_time_arg_val(53);
+constexpr uint32_t sem_addr = get_compile_time_arg_val(55);
+constexpr uint32_t o_heads = get_compile_time_arg_val(56);
+constexpr uint32_t sem_ring = get_compile_time_arg_val(58);
 constexpr uint32_t gdn_layers = layers - (attn_interval > 0 ? layers / attn_interval : 0);
 
 FORCE_INLINE bool is_attn(uint32_t l) { return attn_interval > 0 && (l + 1) % attn_interval == 0; }
 
 // The conv history of a GDN copy is a ring of 3 slots advanced once per use: GDN layer g (use g / copies
-// of copy g % copies within the step) at position pos is the ring's step pos * uses + g / copies; slot
-// (step + j) % 3 holds the j-th oldest input and the step's input replaces slot step % 3.
-FORCE_INLINE uint32_t conv_step(uint32_t pos, uint32_t g, uint32_t copies) {
+// of copy g % copies within the step) at ring step s (token state word 0) is the ring's step
+// s * uses + g / copies; slot (step + j) % 3 holds the j-th oldest input and the step's input replaces slot
+// step % 3. All users share the ring order, so it follows the step count, not a position.
+FORCE_INLINE uint32_t conv_step(uint32_t s, uint32_t g, uint32_t copies) {
     const uint32_t c = g % copies;
     const uint32_t uses = (gdn_layers - c + copies - 1) / copies;
-    return pos * uses + g / copies;
+    return s * uses + g / copies;
 }
 
 template <uint32_t E>

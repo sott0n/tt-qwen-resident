@@ -405,6 +405,9 @@ def build(mesh, weights, x0, layers, packet_bytes=4096, dbg=0):
             SEM_SLOTS,
             SEM_FLAG,
             0,
+            1,  # header CB (unused: the headers fit the pool)
+            0,  # slots at the runtime-arg addresses
+            0,
         ]
         compute = ttnn.KernelDescriptor(
             kernel_source=KDIR + "mlp_streamer_compute.cpp",

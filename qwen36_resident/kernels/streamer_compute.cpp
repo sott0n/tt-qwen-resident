@@ -3,14 +3,14 @@
 //
 // Resident streamer compute (TRISC), see streamer_common.hpp. Per layer:
 //   mixer half:
-//     x = sum of the partial slots;  h = rmsnorm(x)
+//     h = rmsnorm(x) (x: from the hub)
 //     GDN: y = h @ W_qkvzab (this core's columns);  q|k|v columns: y = silu(conv1d_4(y)) over the
 //          history streamed in (oldest first), y itself goes out as the newest history entry;
 //          z, a, b columns pass through
 //     attention: y = h @ W_qkvg, passed through
 //     d = o @ W_out (this core's columns, o = the mixer cores' output);  pout = d (+ x on chip 0)
 //   mlp half:
-//     x = sum of the slots;  h = rmsnorm(x);  a = silu(h @ G) * (h @ U)
+//     h = rmsnorm(x);  a = silu(h @ G) * (h @ U)
 //     d = act @ D;  pout = d (+ x on chip 0)
 // then optionally logits = rmsnorm(x) @ W_head (this core's columns).
 //
@@ -29,6 +29,9 @@
 #include "api/compute/experimental/mul_reduce_scalar.h"
 #include "api/compute/experimental/add_rsqrt.h"
 #include "api/compute/experimental/rmsnorm.h"
+#include "api/compute/matmul.h"
+#include "api/compute/eltwise_unary/rsqrt.h"
+#include "api/compute/eltwise_unary/binop_with_scalar.h"
 #include "streamer_common.hpp"
 
 using namespace resident;
@@ -88,43 +91,101 @@ FORCE_INLINE void matmul(
     custom_mm_block_uninit<false>();
 }
 
-// cb_x = sum over chips of cb_slots
-static_assert(num_chips == 1 || num_chips % 2 == 0, "slots are summed in pairs");
-FORCE_INLINE void sum_slots() {
-    cb_wait_front(cb_slots, num_chips * Ht);
-    cb_reserve_back(cb_x, Ht);
-    reconfig_full_operand(cb_slots, cb_slots);
-    pack_init(cb_x);
-    for (uint32_t t0 = 0; t0 < Ht; t0 += kDst) {
-        const uint32_t n = t0 + kDst <= Ht ? kDst : Ht - t0;
+// cb_h = x / rms(x) per user row, batch > 1, on the FPU. Row R of every 32x32 view of x holds elements of
+// user R % batch only (a batch x 32 tile's face rows are 16 elements of one user, and 16 / batch face rows
+// repeat the users in order), so: D = sum over the views of x x^T (exact bf16 products, fp32 sums) has the
+// view rows' sums of squares on its diagonal; masked by the identity, times ones, and folded by F (ones
+// where R = R' mod batch) every element of row R holds the sum of squares of user R % batch; then
+// h = x * rsqrt(sum / hidden + eps).
+FORCE_INLINE void rmsnorm_rows() {
+    constexpr uint32_t V = Hf * batch;  // 32x32 views of x
+    cb_wait_front(cb_x, Ht);
+    cb_reserve_back(cb_h, Ht);
+    cb_reserve_back(cb_sumsq, 2);
+    reconfig_full_operand<SrcOrder::Reverse>(cb_x_full, cb_x_full);
+    matmul_init(cb_x_full, cb_x_full, 1 /* transpose */);
+    pack_reconfig_data_format(cb_sumsq);
+    pack_init(cb_sumsq);
+    tile_regs_acquire();
+    for (uint32_t v = 0; v < V; v++) {
+        matmul_tiles(cb_x_full, cb_x_full, v, v, 0);
+    }
+    reconfig_full_operand_srca(cb_eye);
+    copy_init(cb_eye);
+    copy_tile(cb_eye, 0, 1);
+    mul_binary_tile_init();
+    mul_binary_tile(0, 1, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_sumsq);
+    tile_regs_release();
+    cb_push_back(cb_sumsq, 1);
+
+    cb_wait_front(cb_sumsq, 1);
+    reconfig_full_operand<SrcOrder::Reverse>(cb_sumsq, cb_ones_full);
+    matmul_init(cb_sumsq, cb_ones_full);
+    tile_regs_acquire();
+    matmul_tiles(cb_sumsq, cb_ones_full, 0, 0, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_sumsq);
+    tile_regs_release();
+    cb_push_back(cb_sumsq, 1);
+    cb_wait_front(cb_sumsq, 2);
+    cb_reserve_back(cb_rinv, 1);
+    reconfig_full_operand<SrcOrder::Reverse>(cb_fold, cb_sumsq);
+    matmul_init(cb_fold, cb_sumsq);
+    pack_reconfig_data_format(cb_rinv);
+    tile_regs_acquire();
+    matmul_tiles(cb_fold, cb_sumsq, 0, 1, 0);
+    binop_with_scalar_tile_init();
+    mul_unary_tile(
+        0,
+        __builtin_bit_cast(
+            uint32_t,
+            __builtin_bit_cast(float, inv_sqrt_hidden_bits) * __builtin_bit_cast(float, inv_sqrt_hidden_bits)));
+    add_unary_tile(0, eps_bits);
+    rsqrt_tile_init();
+    rsqrt_tile(0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_rinv);
+    tile_regs_release();
+    cb_push_back(cb_rinv, 1);
+    cb_pop_front(cb_sumsq, 2);
+
+    // h = x * r, the same 1 / rms tile for every view
+    cb_wait_front(cb_rinv, 1);
+    reconfig_full_operand(cb_x_full, cb_rinv);
+    mul_init(cb_x_full, cb_rinv);
+    pack_reconfig_data_format<true>(cb_h_full);
+    pack_init(cb_h_full);
+    for (uint32_t v0 = 0; v0 < V; v0 += kDst) {
+        const uint32_t n = v0 + kDst <= V ? kDst : V - v0;
         tile_regs_acquire();
-        if constexpr (num_chips == 1) {
-            copy_init(cb_slots);
-            for (uint32_t d = 0; d < n; d++) {
-                copy_tile(cb_slots, t0 + d, d);
-            }
-        } else {
-            for (uint32_t c = 0; c < num_chips; c += 2) {
-                add_init(cb_slots, cb_slots, c > 0 /* acc_to_dest */);
-                for (uint32_t d = 0; d < n; d++) {
-                    add_tiles(cb_slots, cb_slots, c * Ht + t0 + d, (c + 1) * Ht + t0 + d, d);
-                }
-            }
+        for (uint32_t i = 0; i < n; i++) {
+            mul_tiles(cb_x_full, cb_rinv, v0 + i, 0, i);
         }
         tile_regs_commit();
         tile_regs_wait();
-        for (uint32_t d = 0; d < n; d++) {
-            pack_tile(d, cb_x);
+        for (uint32_t i = 0; i < n; i++) {
+            pack_tile<true>(i, cb_h_full, v0 + i);
         }
         tile_regs_release();
     }
-    cb_push_back(cb_x, Ht);
-    cb_pop_front(cb_slots, num_chips * Ht);
+    cb_pop_front(cb_rinv, 1);
+    cb_push_back(cb_h_full, V);  // only wraps the view's write pointer back to the base
+    cb_push_back(cb_h, Ht);
+    pack_reconfig_data_format<true>(cb_h);
 }
 
 // cb_h = x / rms(x), computed on the 32x32 views of x and h (the norm weight is folded into the weights)
 FORCE_INLINE void rmsnorm() {
     static_assert(Hf >= 1 && Hf <= 8 && Hf * 32 == Ht, "hidden must be 1..8 full tiles");
+    if constexpr (batch > 1) {
+        rmsnorm_rows();
+        return;
+    }
     cb_wait_front(cb_x, Ht);
     cb_reserve_back(cb_h, Ht);
     reconfig_full_operand(cb_x_full, cb_x_full);
@@ -148,27 +209,40 @@ FORCE_INLINE void rmsnorm() {
     pack_reconfig_data_format<true>(cb_h);
 }
 
-// cb_aslice[i] = silu(g[i]) * u[i]
-FORCE_INLINE void silu_mul() {
+// cb_aslice[i] = silu(g[i]) * u[i] for the ng gate | up tiles of this core
+FORCE_INLINE void silu_mul(uint32_t ng) {
     cb_wait_front(cb_g, kBlk);
     cb_wait_front(cb_u, kBlk);
     cb_reserve_back(cb_aslice, kBlk);
     reconfig_full_operand(cb_g_full, cb_u_full);
     pack_reconfig_data_format<true>(cb_aslice_full);
     pack_init(cb_aslice_full);
-    tile_regs_acquire();
-    copy_init(cb_g_full);
-    copy_tile(cb_g_full, 0, 0);
-    copy_tile(cb_u_full, 0, 1);
-    silu_tile_init();
-    silu_tile(0);
-    mul_binary_tile_init();
-    mul_binary_tile(0, 1, 0);
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, cb_aslice_full);
-    tile_regs_release();
-    cb_push_back(cb_aslice_full, 1);  // wraps the view's write pointer back to the base
+    // up to 4 views per DST pass (g in slots 0..3, u in 4..7), one init per op
+    const uint32_t views = views_of(ng);
+    for (uint32_t v0 = 0; v0 < views; v0 += 4) {
+        const uint32_t W = views - v0 < 4 ? views - v0 : 4;
+        tile_regs_acquire();
+        copy_init(cb_g_full);
+        for (uint32_t i = 0; i < W; i++) {
+            copy_tile(cb_g_full, v0 + i, i);
+            copy_tile(cb_u_full, v0 + i, 4 + i);
+        }
+        silu_tile_init();
+        for (uint32_t i = 0; i < W; i++) {
+            silu_tile(i);
+        }
+        mul_binary_tile_init();
+        for (uint32_t i = 0; i < W; i++) {
+            mul_binary_tile(i, 4 + i, i);
+        }
+        tile_regs_commit();
+        tile_regs_wait();
+        for (uint32_t i = 0; i < W; i++) {
+            pack_tile<true>(i, cb_aslice_full, v0 + i);
+        }
+        tile_regs_release();
+    }
+    cb_push_back(cb_aslice_full, kBlkViews);  // wraps the view's write pointer back to the base
     cb_push_back(cb_aslice, kBlk);
     cb_pop_front(cb_g, kBlk);
     cb_pop_front(cb_u, kBlk);
@@ -208,35 +282,41 @@ FORCE_INLINE void conv_pass(uint32_t nq, uint32_t n_conv, bool gdn) {
     if (gdn) {
         cb_wait_front(cb_conv_w, 4 * kBlk);
         cb_wait_front(cb_conv_hist, 3 * kBlk);
-        cb_reserve_back(cb_hist_out, 1);
+        cb_reserve_back(cb_hist_out, kBlkViews);
     }
     if (n_conv > 0) {
         reconfig_full_operand(cb_qkvz_full, cb_qkvz_full);
         pack_reconfig_data_format<true>(cb_qkvz_out_full);
         pack_init(cb_qkvz_out_full);
-        tile_regs_acquire();
-        copy_init(cb_qkvz_full);
-        copy_tile(cb_qkvz_full, 0, 0);
-        copy_tile(cb_conv_w_full, 3, 1);
-        mul_binary_tile_init();
-        mul_binary_tile(0, 1, 1);
-        for (uint32_t j = 0; j < 3; j++) {
+        // view v of the block: taps and history slots j hold their own view v at j * kBlkViews + v; all eight
+        // operands of a view go to DST first (slot 0 keeps y for the history), one init per op
+        for (uint32_t v = 0; v < views_of(n_conv); v++) {
+            tile_regs_acquire();
             copy_init(cb_qkvz_full);
-            copy_tile(cb_conv_hist_full, j, 2);
-            copy_tile(cb_conv_w_full, j, 3);
+            copy_tile(cb_qkvz_full, v, 0);
+            copy_tile(cb_conv_w_full, 3 * kBlkViews + v, 1);
+            for (uint32_t j = 0; j < 3; j++) {
+                copy_tile(cb_conv_hist_full, j * kBlkViews + v, 2 + 2 * j);
+                copy_tile(cb_conv_w_full, j * kBlkViews + v, 3 + 2 * j);
+            }
             mul_binary_tile_init();
-            mul_binary_tile(2, 3, 2);
+            mul_binary_tile(0, 1, 1);
+            for (uint32_t j = 0; j < 3; j++) {
+                mul_binary_tile(2 + 2 * j, 3 + 2 * j, 3 + 2 * j);
+            }
             add_binary_tile_init();
-            add_binary_tile(1, 2, 1);
+            for (uint32_t j = 0; j < 3; j++) {
+                add_binary_tile(1, 3 + 2 * j, 1);
+            }
+            silu_tile_init();
+            silu_tile(1);
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile<true>(1, cb_qkvz_out_full, v);
+            pack_tile<true>(0, cb_hist_out, v);
+            tile_regs_release();
         }
-        silu_tile_init();
-        silu_tile(1);
-        tile_regs_commit();
-        tile_regs_wait();
-        pack_tile(1, cb_qkvz_out_full);
-        pack_tile(0, cb_hist_out);
-        tile_regs_release();
-        cb_push_back(cb_qkvz_out_full, 1);  // wraps the view's write pointer back to the base
+        cb_push_back(cb_qkvz_out_full, kBlkViews);  // wraps the view's write pointer back to the base
     }
     if (n_conv < nq) {
         reconfig_full_operand(cb_qkvz, cb_qkvz);
@@ -256,7 +336,7 @@ FORCE_INLINE void conv_pass(uint32_t nq, uint32_t n_conv, bool gdn) {
     cb_push_back(cb_qkvz_out, kBlk);
     cb_pop_front(cb_qkvz, kBlk);
     if (gdn) {
-        cb_push_back(cb_hist_out, 1);  // with no q|k|v columns the writer skips the write-back
+        cb_push_back(cb_hist_out, kBlkViews);  // with no q|k|v columns the writer skips the write-back
         cb_pop_front(cb_conv_w, 4 * kBlk);
         cb_pop_front(cb_conv_hist, 3 * kBlk);
     }
@@ -285,6 +365,16 @@ void kernel_main() {
     const uint32_t nq_attn = get_arg_val<uint32_t>(4);
     const uint32_t n_conv = get_arg_val<uint32_t>(5);
     const uint32_t nv = get_arg_val<uint32_t>(6);
+    const uint32_t ts_addr = get_arg_val<uint32_t>(7);
+    // the pack thread stamps the end of each phase's packing
+    auto mark = [&](uint32_t l, uint32_t i) {
+        PACK(({
+            if (ts_addr) {
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ts_addr)[l * kTsWords + 16 + i] =
+                    *reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
+            }
+        }));
+    };
 #ifdef TRISC_UNPACK
     {
         auto& w = get_local_cb_interface(cb_w0);
@@ -295,32 +385,44 @@ void kernel_main() {
 #endif
     custom_mm_block_init<false, true, false>(cb_h, Entry<0>::cb, cb_qkvz);
     custom_mm_block_uninit<false>();
+    if constexpr (batch > 1) {
+        cb_wait_front(cb_ones_full, 1);
+        cb_wait_front(cb_fold, 1);
+        cb_wait_front(cb_eye, 1);
+    }
 
     for (uint32_t l = 0; l < layers; l++) {
         const bool attn = is_attn(l);
         // mixer half
-        sum_slots();
+        mark(l, 0);
         rmsnorm();
+        mark(l, 1);
         if (attn) {
             matmul<kQkvg>(cb_h, cb_qkvz, nq_attn, kBlk);
         } else {
             matmul<kQkvz>(cb_h, cb_qkvz, nq_gdn, kBlk);
         }
         cb_pop_front(cb_h, Ht);
+        mark(l, 2);
         conv_pass(attn ? nq_attn : nq_gdn, attn ? 0 : n_conv, !attn);
+        mark(l, 3);
         project_to_partial<kOut>(cb_o_in, Ot, nd, pout_off);
         cb_pop_front(cb_x, Ht);
+        mark(l, 4);
         // mlp half
-        sum_slots();
+        mark(l, 5);
         rmsnorm();
+        mark(l, 6);
         matmul<kGateUp>(cb_h, cb_g, 2 * ng, kBlk, cb_u, ng);
         cb_pop_front(cb_h, Ht);
-        silu_mul();
+        mark(l, 7);
+        silu_mul(ng);
+        mark(l, 8);
         project_to_partial<kDown>(cb_act, It, nd, pout_off);
         cb_pop_front(cb_x, Ht);
+        mark(l, 9);
     }
     if constexpr (lm_head) {
-        sum_slots();
         rmsnorm();
         matmul<kHead>(cb_h, cb_logits, nv, nv_max);
         cb_pop_front(cb_h, Ht);

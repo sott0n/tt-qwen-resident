@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Attention leader compute (see attn_common.hpp). Per attention layer:
+// Attention leader compute (see attn_common.hpp). Per attention layer and user:
 //   q = rope(rmsnorm_rows(q) * w_q) into cb_q_mc (multicast);  gs = sigmoid(gate);
 //   o = (the group heads' partial sums) / row sum * gs into cb_out.
 //
@@ -84,13 +84,24 @@ void kernel_main() {
     const uint32_t children = get_arg_val<uint32_t>(0);
     compute_kernel_hw_startup(cb_qraw, cb_qraw, cb_sq);
     cb_wait_front(cb_mean, 1);
-    cb_wait_front(cb_rope, 3);
+    cb_wait_front(cb_rope, 3 * batch);
     for (uint32_t l = 0; l < layers; l++) {
+        // user u + 1's q and gate are prepared before user u's output, while the workers run user u
         cb_wait_front(cb_qw, Dt);
-        norm_rope(cb_qraw, cb_qw, 0, cb_q_mc, cb_q_mc);
-        cb_pop_front(cb_qw, Dt);
-        gate_sigmoid();
-        sum_partials<false>(children);
-        normalize_gate();
+        auto prep = [&](uint32_t u) {
+            norm_rope(cb_qraw, cb_qw, 0, cb_q_mc, cb_q_mc, 3 * u);
+            gate_sigmoid();
+            if (u + 1 == batch) {
+                cb_pop_front(cb_qw, Dt);
+            }
+        };
+        prep(0);
+        for (uint32_t u = 0; u < batch; u++) {
+            if (u + 1 < batch) {
+                prep(u + 1);
+            }
+            sum_partials<false>(children);
+            normalize_gate();
+        }
     }
 }
