@@ -384,12 +384,18 @@ def bf16_bits(t):
 
 class ResidentModel:
     def __init__(self, mesh, d, w, st, layers, interval, lm_head=False, timeline=False, packet_bytes=4096):
-        """st: the decode state (State), or one State per user for a batch of len(st) users"""
+        """st: the decode state (State), or one State per user for a batch of len(st) users. More than 8 users
+        run as sub-batches of 8, one launch each (the launches share the weights and buffers, each has its
+        own decode state)"""
         self.mesh, self.d, self.layers, self.interval, self.lm_head = mesh, d, layers, interval, lm_head
-        sts = list(st) if isinstance(st, (list, tuple)) else [st]
-        B = self.batch = len(sts)
+        sts_all = list(st) if isinstance(st, (list, tuple)) else [st]
+        n_sub = -(-len(sts_all) // 8)
+        assert len(sts_all) % n_sub == 0
+        sts = sts_all[: len(sts_all) // n_sub]
+        B = self.batch = len(sts)  # users per launch
+        self.n_sub, self.users = n_sub, len(sts_all)
         assert B in (1, 2, 4, 8), "custom_mm takes 1, 2, 4 or 8 rows"
-        assert len({s.max_pos for s in sts}) == 1
+        assert len({s.max_pos for s in sts_all}) == 1
         n, banks = d.n, d.banks
         self.n_attn = sum(is_attn(l, interval) for l in range(layers))
         self.n_gdn = layers - self.n_attn
@@ -554,7 +560,9 @@ class ResidentModel:
             cbs_ = 64 * b * (2 * d.Ht + d.It + 2 * nd_max + 13 * blk) + (18432 if b > 1 else 0)
             return cbs_ + b * 2 * (d.gv + nv_max * TILE + max(d.g_cols, d.a_cols))
 
-        ring_bytes = ((L1_WEIGHT_BUDGET - act_bytes(B) + act_bytes(1)) // lcm) * lcm
+        # (each further sub-batch has its own logits, an L1 tensor)
+        extra = (n_sub - 1) * B * 2 * nv_max * TILE if lm_head else 0
+        ring_bytes = ((L1_WEIGHT_BUDGET - act_bytes(B) + act_bytes(1) - extra) // lcm) * lcm
         self.ring_bytes = ring_bytes
 
         # ---- streamer tensors
@@ -632,8 +640,8 @@ class ResidentModel:
             ttnn.ShardSpec(dram_grid, [B * attn_copies * rpb * TILE, HD], ttnn.ShardOrientation.ROW_MAJOR),
         )
 
-        def cache(which):
-            flat = self._kv_host(sts, which)
+        def cache(which, sts_=sts):
+            flat = self._kv_host(sts_, which)
             dev = ttnn.from_torch(
                 flat,
                 dtype=ttnn.bfloat8_b,
@@ -693,433 +701,514 @@ class ResidentModel:
         self.ts_t = ts_buf(grid, S, layers * 32) if timeline else None
         ts_addr = self.ts_t.buffer_address() if timeline else 0
 
-        # ---- CBs
-        full_page = TILE * TILE * 2
-        f32 = (ttnn.float32, 4096)
-        kv_page = TILE_BYTES[ttnn.bfloat8_b]
-
-        def cb(idx, grid_, pages, dt=ttnn.bfloat16, page=full_page, tiny_tile=False):
-            fd = ttnn.CBFormatDescriptor(buffer_index=idx, data_format=dt, page_size=page)
-            if tiny_tile:
-                fd = ttnn.CBFormatDescriptor(
-                    buffer_index=idx, data_format=dt, page_size=page, tile=ttnn.TileDescriptor(B, TILE)
+        # ---- per sub-batch decode state (sub-batch 0's is above)
+        subs = [
+            dict(
+                hist=self.hist_t,
+                state=self.state_t,
+                K=self.K_t,
+                V=self.V_t,
+                tok=self.tok_t,
+                x=self.x_t,
+                argmax=self.argmax_t,
+                logits=self.logits_t,
+            )
+        ]
+        for k in range(1, n_sub):
+            sk = sts_all[k * B : (k + 1) * B]
+            hist_k, state_k = self._hist_host(sk), self._state_host(sk)
+            sub = dict(
+                hist=dram_t(hist_k, ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
+                state=dram_t(state_k, ttnn.float32),
+                K=settled(cache("K", sk)),
+                V=settled(cache("V", sk)),
+                tok=dram_t(torch.zeros(1, self.tok_words, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, rep),
+                x=dram_t(torch.zeros(n, B * HIDDEN), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT),
+                argmax=(
+                    l1(
+                        torch.zeros(1, S * B * 4, dtype=torch.int32),
+                        hub_grid,
+                        [1, S * B * 4],
+                        ttnn.uint32,
+                        layout=ttnn.ROW_MAJOR_LAYOUT,
+                    )
+                    if lm_head
+                    else None
+                ),
+                logits=l1(torch.zeros(S * B, nv_max * TILE), grid, [B, nv_max * TILE]) if lm_head else None,
+            )
+            self._initial.append((ttnn.from_torch(hist_k, dtype=ttnn.bfloat16, mesh_mapper=per_chip), sub["hist"]))
+            self._initial.append(
+                (
+                    ttnn.from_torch(state_k, dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, mesh_mapper=per_chip),
+                    sub["state"],
                 )
-            return ttnn.CBDescriptor(total_size=pages * page, core_ranges=grid_, format_descriptors=[fd])
-
-        def tiny_cb(idx, pages, grid_=grid):
-            return cb(idx, grid_, pages, page=64 * B, tiny_tile=True)
-
-        def aliased(tiny_idx, full_idx, tiles):
-            return ttnn.CBDescriptor(
-                total_size=tiles * 64 * B,
-                core_ranges=grid,
-                format_descriptors=[
-                    ttnn.CBFormatDescriptor(
-                        buffer_index=tiny_idx,
-                        data_format=ttnn.bfloat16,
-                        page_size=64 * B,
-                        tile=ttnn.TileDescriptor(B, TILE),
-                    ),
-                    ttnn.CBFormatDescriptor(buffer_index=full_idx, data_format=ttnn.bfloat16, page_size=full_page),
-                ],
             )
+            subs.append(sub)
 
-        T = ttnn.cb_descriptor_from_sharded_tensor
-        cbs = [
-            ttnn.CBDescriptor(
-                total_size=ring_bytes,
-                core_ranges=grid,
-                format_descriptors=[
-                    ttnn.CBFormatDescriptor(buffer_index=1 + e, data_format=dt, page_size=TILE_BYTES[dt])
-                    for e, (_, dt, _) in enumerate(entries)
-                ],
-            ),
-            cb(7, grid, 1, ttnn.uint32, 16),
-            cb(8, grid, d.It, page=64 * B, tiny_tile=True),
-            tiny_cb(9, nd_max),
-            tiny_cb(10, nd_max),
-            aliased(11, 12, d.Ht),
-            aliased(13, 14, d.Ht),
-            aliased(15, 27, blk_tiles),
-            aliased(26, 28, blk_tiles),
-            aliased(16, 29, blk_tiles),
-            aliased(17, 22, blk_tiles),
-            aliased(18, 23, blk_tiles),
-            aliased(19, 24, CONV_K * blk_tiles),
-            aliased(20, 25, (CONV_K - 1) * blk_tiles),
-            T(21, self.o_in_t),
-            cb(30, grid, blk_tiles * B // TILE),
-        ]
-        # hub: slots (2 parities x chips) and their sum x (32x32 views), fabric packet headers (2 parities x
-        # packets x 2 directions) and a word
-        hub_headers = 4 * -(-HIDDEN * 2 * B // packet_bytes)
-        x_views = HIDDEN * B // (TILE * TILE)
-        cbs.append(cb(0, hub_grid, 2 * n * x_views))
-        cbs.append(cb(2, hub_grid, x_views))
-        cbs.append(cb(1, hub_grid, 1, page=hub_headers * 160 + 16))
-        if B > 1:
-            cbs += [cb(32, grid, 1), cb(33, grid, 1), cb(34, grid, 2, *f32), cb(35, grid, 1, *f32), cb(38, grid, 1)]
-        if lm_head:
-            cbs.append(T(31, self.logits_t))
-        # GDN heads (same CB set as the per-layer benchmark)
-        bf, f4 = (ttnn.bfloat16, 2048), (ttnn.float32, 4096)
-        head_cb_spec = {
-            0: (bf, 4),
-            1: (bf, 4),
-            2: (bf, 4),
-            3: (bf, 4),
-            4: (bf, 4),
-            5: (f4, 16),
-            6: (f4, 1),
-            7: (f4, 1),
-            8: (f4, 1),
-            9: (f4, 1),
-            10: (f4, 4),
-            11: (f4, 4),
-            12: (f4, 1),
-            13: (f4, 4),
-            14: (f4, 4),
-            15: (f4, 1),
-            16: (f4, 1),
-            17: (f4, 16),
-            18: (f4, 4),
-            19: (f4, 1),
-            20: (f4, 4),
-            21: (f4, 4),
-            23: (f4, 16),
-            24: (f4, 16),
-            25: (f4, 4),
-            26: (f4, 4),
-            27: (f4, 4),
-            28: (bf, 4),
-            30: (f4, 1),
-            31: (f4, 1),
-        }
-        for idx, ((dt, page), cnt) in head_cb_spec.items():
-            cbs.append(cb(idx, head_grid, cnt, dt, page))
-        cbs.append(cb(22, head_grid, 1, page=4 * 64 * B))
-        # attention workers (chunk workers and the tail core)
-        cbs += [
-            T(0, q_t),
-            T(3, M_t),
-            T(4, one_t),
-            cb(1, work_grid, 2 * kv_block * Dt, ttnn.bfloat8_b, kv_page),
-            cb(2, work_grid, 2 * kv_block * Dt, ttnn.bfloat8_b, kv_page),
-            cb(5, work_grid, kv_block, *f32),
-            cb(6, work_grid, kv_block),
-            cb(9, chunk_grid, 2 * Dt, *f32),
-            cb(15, chunk_grid, 2, *f32),
-            cb(24, chunk_grid, 2, *f32),
-            cb(26, chunk_grid, 1, *f32),
-            cb(7, work_grid, 1),
-            cb(8, work_grid, Dt + 1),
-            cb(10, work_grid, 1, ttnn.uint32, 256),
-            cb(23, attn_grid, slots_per_node * (Dt + 1)),
-            cb(25, attn_grid, Dt + 1),
-            # leader and tail core
-            cb(13, prep_grid, Dt),
-            cb(14, prep_grid, 2),
-            cb(17, prep_grid, 3 * B),
-            T(29, mean_t),
-            # leader
-            cb(2, lead_grid, 1, page=heads_a * Dt * 64 * B),
-            cb(9, lead_grid, Dt),
-            cb(10, lead_grid, 2 * Dt),
-            cb(15, lead_grid, Dt),
-            cb(24, lead_grid, 2 * Dt),
-            cb(26, lead_grid, 2 * Dt),
-            cb(27, lead_grid, Dt),
-            cb(30, lead_grid, 1),
-            # tail core
-            cb(11, tail_grid, Dt),
-            cb(12, tail_grid, 2 * B),
-            cb(16, tail_grid, Dt),
-            cb(18, tail_grid, Dt),
-            cb(19, tail_grid, Dt),
-            cb(20, tail_grid, Dt),
-            cb(21, tail_grid, Dt),
-            cb(22, tail_grid, B),
-            cb(28, tail_grid, 2 * Dt, ttnn.bfloat8_b, kv_page),
-            cb(31, tail_grid, 2 * Dt, ttnn.bfloat8_b, kv_page),
-        ]
-        # the hub needs free semaphore ids for its fabric connections: the head-group one only on the heads
-        sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_grid, initial_value=0) for i in range(SEM_GROUP)]
-        sems.append(ttnn.SemaphoreDescriptor(id=SEM_GROUP, core_ranges=head_grid, initial_value=0))
+        def build(sub):
+            """the CBs and the per-chip programs of one launch over sub-batch `sub`'s decode state"""
+            # ---- CBs
+            full_page = TILE * TILE * 2
+            f32 = (ttnn.float32, 4096)
+            kv_page = TILE_BYTES[ttnn.bfloat8_b]
 
-        def kernel(src, core_ranges, ct, rt, config):
-            return ttnn.KernelDescriptor(
-                kernel_source=KDIR + src,
-                source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
-                core_ranges=core_ranges,
-                compile_time_args=ct,
-                runtime_args=rt,
-                config=config,
-            )
+            def cb(idx, grid_, pages, dt=ttnn.bfloat16, page=full_page, tiny_tile=False):
+                fd = ttnn.CBFormatDescriptor(buffer_index=idx, data_format=dt, page_size=page)
+                if tiny_tile:
+                    fd = ttnn.CBFormatDescriptor(
+                        buffer_index=idx, data_format=dt, page_size=page, tile=ttnn.TileDescriptor(B, TILE)
+                    )
+                return ttnn.CBDescriptor(total_size=pages * page, core_ranges=grid_, format_descriptors=[fd])
 
-        dm = lambda proc, noc: ttnn.DataMovementConfigDescriptor(processor=proc, noc=noc)
-        NCRISC, BRISC = ttnn.DataMovementProcessor.RISCV_1, ttnn.DataMovementProcessor.RISCV_0
-        NOC0, NOC1 = ttnn.NOC.RISCV_0_default, ttnn.NOC.RISCV_1_default
+            def tiny_cb(idx, pages, grid_=grid):
+                return cb(idx, grid_, pages, page=64 * B, tiny_tile=True)
 
-        def compute_cfg(fidelity, fp32, full_sync, unpack=None):
-            c = ttnn.ComputeConfigDescriptor()
-            c.math_fidelity = fidelity
-            c.fp32_dest_acc_en = fp32
-            c.dst_full_sync_en = full_sync
-            if unpack is not None:
-                c.unpack_to_dest_mode = unpack
-            return c
+            def aliased(tiny_idx, full_idx, tiles):
+                return ttnn.CBDescriptor(
+                    total_size=tiles * 64 * B,
+                    core_ranges=grid,
+                    format_descriptors=[
+                        ttnn.CBFormatDescriptor(
+                            buffer_index=tiny_idx,
+                            data_format=ttnn.bfloat16,
+                            page_size=64 * B,
+                            tile=ttnn.TileDescriptor(B, TILE),
+                        ),
+                        ttnn.CBFormatDescriptor(buffer_index=full_idx, data_format=ttnn.bfloat16, page_size=full_page),
+                    ],
+                )
 
-        streamer_compute = compute_cfg(ttnn.MathFidelity.HiFi4, True, True)
-        head_unpack = type(ttnn.ComputeConfigDescriptor().unpack_to_dest_mode)([ttnn.UnpackToDestMode.Default] * 64)
-        for i in HEAD_FP32_CBS:
-            head_unpack[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
-        head_compute = compute_cfg(ttnn.MathFidelity.HiFi4, True, False, head_unpack)
-        attn_compute = compute_cfg(ttnn.MathFidelity.HiFi4, True, True)
-        work_compute = compute_cfg(ttnn.MathFidelity.HiFi2, True, False)
+            T = ttnn.cb_descriptor_from_sharded_tensor
+            cbs = [
+                ttnn.CBDescriptor(
+                    total_size=ring_bytes,
+                    core_ranges=grid,
+                    format_descriptors=[
+                        ttnn.CBFormatDescriptor(buffer_index=1 + e, data_format=dt, page_size=TILE_BYTES[dt])
+                        for e, (_, dt, _) in enumerate(entries)
+                    ],
+                ),
+                cb(7, grid, 1, ttnn.uint32, 16),
+                cb(8, grid, d.It, page=64 * B, tiny_tile=True),
+                tiny_cb(9, nd_max),
+                tiny_cb(10, nd_max),
+                aliased(11, 12, d.Ht),
+                aliased(13, 14, d.Ht),
+                aliased(15, 27, blk_tiles),
+                aliased(26, 28, blk_tiles),
+                aliased(16, 29, blk_tiles),
+                aliased(17, 22, blk_tiles),
+                aliased(18, 23, blk_tiles),
+                aliased(19, 24, CONV_K * blk_tiles),
+                aliased(20, 25, (CONV_K - 1) * blk_tiles),
+                T(21, self.o_in_t),
+                cb(30, grid, blk_tiles * B // TILE),
+            ]
+            # hub: slots (2 parities x chips) and their sum x (32x32 views), fabric packet headers (2 parities x
+            # packets x 2 directions) and a word
+            hub_headers = 4 * -(-HIDDEN * 2 * B // packet_bytes)
+            x_views = HIDDEN * B // (TILE * TILE)
+            cbs.append(cb(0, hub_grid, 2 * n * x_views))
+            cbs.append(cb(2, hub_grid, x_views))
+            cbs.append(cb(1, hub_grid, 1, page=hub_headers * 160 + 16))
+            if B > 1:
+                cbs += [cb(32, grid, 1), cb(33, grid, 1), cb(34, grid, 2, *f32), cb(35, grid, 1, *f32), cb(38, grid, 1)]
+            if lm_head:
+                cbs.append(T(31, sub["logits"]))
+            # GDN heads (same CB set as the per-layer benchmark)
+            bf, f4 = (ttnn.bfloat16, 2048), (ttnn.float32, 4096)
+            head_cb_spec = {
+                0: (bf, 4),
+                1: (bf, 4),
+                2: (bf, 4),
+                3: (bf, 4),
+                4: (bf, 4),
+                5: (f4, 16),
+                6: (f4, 1),
+                7: (f4, 1),
+                8: (f4, 1),
+                9: (f4, 1),
+                10: (f4, 4),
+                11: (f4, 4),
+                12: (f4, 1),
+                13: (f4, 4),
+                14: (f4, 4),
+                15: (f4, 1),
+                16: (f4, 1),
+                17: (f4, 16),
+                18: (f4, 4),
+                19: (f4, 1),
+                20: (f4, 4),
+                21: (f4, 4),
+                23: (f4, 16),
+                24: (f4, 16),
+                25: (f4, 4),
+                26: (f4, 4),
+                27: (f4, 4),
+                28: (bf, 4),
+                30: (f4, 1),
+                31: (f4, 1),
+            }
+            for idx, ((dt, page), cnt) in head_cb_spec.items():
+                cbs.append(cb(idx, head_grid, cnt, dt, page))
+            cbs.append(cb(22, head_grid, 1, page=4 * 64 * B))
+            # attention workers (chunk workers and the tail core)
+            cbs += [
+                T(0, q_t),
+                T(3, M_t),
+                T(4, one_t),
+                cb(1, work_grid, 2 * kv_block * Dt, ttnn.bfloat8_b, kv_page),
+                cb(2, work_grid, 2 * kv_block * Dt, ttnn.bfloat8_b, kv_page),
+                cb(5, work_grid, kv_block, *f32),
+                cb(6, work_grid, kv_block),
+                cb(9, chunk_grid, 2 * Dt, *f32),
+                cb(15, chunk_grid, 2, *f32),
+                cb(24, chunk_grid, 2, *f32),
+                cb(26, chunk_grid, 1, *f32),
+                cb(7, work_grid, 1),
+                cb(8, work_grid, Dt + 1),
+                cb(10, work_grid, 1, ttnn.uint32, 256),
+                cb(23, attn_grid, slots_per_node * (Dt + 1)),
+                cb(25, attn_grid, Dt + 1),
+                # leader and tail core
+                cb(13, prep_grid, Dt),
+                cb(14, prep_grid, 2),
+                cb(17, prep_grid, 3 * B),
+                T(29, mean_t),
+                # leader
+                cb(2, lead_grid, 1, page=heads_a * Dt * 64 * B),
+                cb(9, lead_grid, Dt),
+                cb(10, lead_grid, 2 * Dt),
+                cb(15, lead_grid, Dt),
+                cb(24, lead_grid, 2 * Dt),
+                cb(26, lead_grid, 2 * Dt),
+                cb(27, lead_grid, Dt),
+                cb(30, lead_grid, 1),
+                # tail core
+                cb(11, tail_grid, Dt),
+                cb(12, tail_grid, 2 * B),
+                cb(16, tail_grid, Dt),
+                cb(18, tail_grid, Dt),
+                cb(19, tail_grid, Dt),
+                cb(20, tail_grid, Dt),
+                cb(21, tail_grid, Dt),
+                cb(22, tail_grid, B),
+                cb(28, tail_grid, 2 * Dt, ttnn.bfloat8_b, kv_page),
+                cb(31, tail_grid, 2 * Dt, ttnn.bfloat8_b, kv_page),
+            ]
+            # the hub needs free semaphore ids for its fabric connections: the head-group one only on the heads
+            sems = [ttnn.SemaphoreDescriptor(id=i, core_ranges=all_grid, initial_value=0) for i in range(SEM_GROUP)]
+            sems.append(ttnn.SemaphoreDescriptor(id=SEM_GROUP, core_ranges=head_grid, initial_value=0))
 
-        entry_rt = []
-        attn_ct = [self.n_attn, attn_copies, WORKERS, S, kv_block, heads_a, Dt, ROT // TILE]
-        attn_ct += [
-            SEM_ROWS,
-            SEM_Q,
-            SEM_m,
-            SEM_M,
-            SEM_PART,
-            SEM_HEADS,
-            f32_bits(EPS),
-            SEM_ADDR,
-            slots_per_node,
-            banks,
-            SEM_LOCAL,
-            B,
-        ]
-        group = d.nv // d.nk
-        kv_addrs = [self.K_t.buffer_address(), self.V_t.buffer_address()]
-        tok_addr = self.tok_t.buffer_address()
-        # GDN row runs per streamer: (first tile of its block, tiles, first head core, head cores), and the
-        # row writes each head core gets per layer
-        regions = []  # (first tile, end tile, first head core, head cores) of the GDN projection row
-        for kh in range(d.nk):
-            dests = (kh * group * G, group * G)
-            regions += [(kh * 4, kh * 4 + 4, *dests), (d.gq // TILE + kh * 4, d.gq // TILE + kh * 4 + 4, *dests)]
-        for hh in range(d.nv):
-            dests = (hh * G, G)
-            regions += [(2 * d.gq // TILE + hh * 4, 2 * d.gq // TILE + hh * 4 + 4, *dests)]
-            regions += [(d.z0 // TILE + hh * 4, d.z0 // TILE + hh * 4 + 4, *dests)]
-        regions.append((d.a0 // TILE, (d.b0 + d.nv - 1) // TILE + 1, 0, d.nv * G))
-        runs, row_writes = [], [0] * len(heads)
-        for i in range(S):
-            bank, j = divmod(i, PER_BANK)
-            nqg, qgf = nqg_split[j]
-            b0 = bank * qg_bank + qgf
-            mine = []
-            for r0, r1, df, dn in regions:
-                lo, hi = max(r0, b0), min(r1, b0 + nqg)
-                if lo < hi:
-                    mine.append([lo - b0, hi - lo, df, dn])
-                    for hc in range(df, df + dn):
-                        row_writes[hc] += 1
-            runs.append(mine)
-        mesh_pd = ttnn.MeshProgramDescriptor()
-        for chip in range(n):
-            coord = ttnn.MeshCoordinate(0, chip)
-            ct = [layers, interval, n, S, d.Ht, d.It, chip, ring_bytes, f32_bits(EPS), f32_bits(1 / math.sqrt(HIDDEN))]
-            ct += [SEM_SLOTS, SEM_ACT, SEM_GATHER, SEM_HEADS, SEM_ROWS, ng_max, nd_max, nq_max, nv_max]
-            ct += [d.conv_tiles, d.Ot, d.nv * G, int(lm_head)]
-            for (Kt, _, _), (sb, pages, page, block) in zip(entries, geo):
-                ct += [Kt, sb, pages, page, block]
-            ct += [SEM_LOCAL, B, SEM_ADDR, d.nv, blk_tiles, SEM_FLAG]
-            rr, wr, cr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
-            peers = [v for p in sphys for v in (p.x, p.y)]
-            head_xy = [v for p in head_p for v in (p.x, p.y)]
-            for i, c in enumerate(cores):
+            def kernel(src, core_ranges, ct, rt, config):
+                return ttnn.KernelDescriptor(
+                    kernel_source=KDIR + src,
+                    source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
+                    core_ranges=core_ranges,
+                    compile_time_args=ct,
+                    runtime_args=rt,
+                    config=config,
+                )
+
+            dm = lambda proc, noc: ttnn.DataMovementConfigDescriptor(processor=proc, noc=noc)
+            NCRISC, BRISC = ttnn.DataMovementProcessor.RISCV_1, ttnn.DataMovementProcessor.RISCV_0
+            NOC0, NOC1 = ttnn.NOC.RISCV_0_default, ttnn.NOC.RISCV_1_default
+
+            def compute_cfg(fidelity, fp32, full_sync, unpack=None):
+                c = ttnn.ComputeConfigDescriptor()
+                c.math_fidelity = fidelity
+                c.fp32_dest_acc_en = fp32
+                c.dst_full_sync_en = full_sync
+                if unpack is not None:
+                    c.unpack_to_dest_mode = unpack
+                return c
+
+            streamer_compute = compute_cfg(ttnn.MathFidelity.HiFi4, True, True)
+            head_unpack = type(ttnn.ComputeConfigDescriptor().unpack_to_dest_mode)([ttnn.UnpackToDestMode.Default] * 64)
+            for i in HEAD_FP32_CBS:
+                head_unpack[i] = ttnn.UnpackToDestMode.UnpackToDestFp32
+            head_compute = compute_cfg(ttnn.MathFidelity.HiFi4, True, False, head_unpack)
+            attn_compute = compute_cfg(ttnn.MathFidelity.HiFi4, True, True)
+            work_compute = compute_cfg(ttnn.MathFidelity.HiFi2, True, False)
+
+            entry_rt = []
+            attn_ct = [self.n_attn, attn_copies, WORKERS, S, kv_block, heads_a, Dt, ROT // TILE]
+            attn_ct += [
+                SEM_ROWS,
+                SEM_Q,
+                SEM_m,
+                SEM_M,
+                SEM_PART,
+                SEM_HEADS,
+                f32_bits(EPS),
+                SEM_ADDR,
+                slots_per_node,
+                banks,
+                SEM_LOCAL,
+                B,
+            ]
+            group = d.nv // d.nk
+            kv_addrs = [sub["K"].buffer_address(), sub["V"].buffer_address()]
+            tok_addr = sub["tok"].buffer_address()
+            # GDN row runs per streamer: (first tile of its block, tiles, first head core, head cores), and the
+            # row writes each head core gets per layer
+            regions = []  # (first tile, end tile, first head core, head cores) of the GDN projection row
+            for kh in range(d.nk):
+                dests = (kh * group * G, group * G)
+                regions += [(kh * 4, kh * 4 + 4, *dests), (d.gq // TILE + kh * 4, d.gq // TILE + kh * 4 + 4, *dests)]
+            for hh in range(d.nv):
+                dests = (hh * G, G)
+                regions += [(2 * d.gq // TILE + hh * 4, 2 * d.gq // TILE + hh * 4 + 4, *dests)]
+                regions += [(d.z0 // TILE + hh * 4, d.z0 // TILE + hh * 4 + 4, *dests)]
+            regions.append((d.a0 // TILE, (d.b0 + d.nv - 1) // TILE + 1, 0, d.nv * G))
+            runs, row_writes = [], [0] * len(heads)
+            for i in range(S):
                 bank, j = divmod(i, PER_BANK)
                 nqg, qgf = nqg_split[j]
-                nqa, qaf = nqa_split[j]
-                nd, dfirst = nd_split[j]
-                ng, gfirst = ng_split[j]
-                nvv, vfirst = nv_split[j]
-                v0 = (bank * v_bank + vfirst) * TILE
-                counts = [nqg, nqa, nd, 2 * ng, nd, nvv]
-                ent = []
-                for cnt, (t, stride, copies) in zip(counts, self.w_entries):
-                    ent += [cnt if t is not None else 0, t.buffer_address() if t is not None else 0, stride, copies]
-                rr[c.x][c.y] = (
-                    [bank, i & 0x3, j, PER_BANK]
-                    + ent
-                    + [
-                        taps_t.buffer_address(),
-                        self.hist_t.buffer_address(),
-                        i * gdn_copies,
-                        gdn_copies,
-                        tok_addr,
-                        ts_addr,
-                        max(0, min(nqg, d.conv_tiles - (bank * qg_bank + qgf))),
-                    ]
-                )
-                n_conv = max(0, min(nqg, d.conv_tiles - (bank * qg_bank + qgf)))
-                wr[c.x][c.y] = (
-                    [ng, bank * it_bank + gfirst, nd, bank * ht_bank + dfirst, hub_p.x, hub_p.y]
-                    + [int(i == 0), 0]
-                    + [nqg, bank * qg_bank + qgf, nqa, bank * qa_bank + qaf, rows_t.buffer_address(), n_conv]
-                    + [self.hist_t.buffer_address(), i * gdn_copies, gdn_copies, tok_addr]
-                    + head_xy
-                    + [lead_p.x, lead_p.y, tail_p.x, tail_p.y]
-                    + peers
-                    + [ts_addr]
-                    + [self.argmax_t.buffer_address() if lm_head else 0]
-                    + [max(0, min(nvv * TILE, d.vocab_chip - v0)), chip * d.vocab_chip + v0, i]
-                    + [len(runs[i])]
-                    + [v for r in runs[i] for v in r]
-                )
-                cr[c.x][c.y] = [ng, nd, bank * ht_bank + dfirst, nqg, nqa, n_conv, nvv, ts_addr]
-
-            hub_rt = ttnn.RuntimeArgs()
-            hub_rt[hub.x][hub.y] = [
-                self.x_t.buffer_address(),
-                *[ttnn.get_global_semaphore_address(s) for s in self.ccl_sems],
-                0,
-            ] + rect_cover(mesh, cores)
-            hub_ct = [n, chip, HIDDEN * 2 * B, packet_bytes, 2 * layers, S, SEM_GATHER, SEM_SLOTS]
-            hub_ct += [SEM_FLAG, int(lm_head), 1, 1, SEM_ADDR]
-
-            # GDN heads
-            hr, hw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
-            for hc, c in enumerate(heads):
-                hh, gi = divmod(hc, G)
-                nu = B // G
-                kh = hh // group
-                a_col, b_col = d.a0 + hh, d.b0 + hh
-                gates = []
-                for wg in w["gdn"] or [None]:
-                    cw = wg["chips"][chip] if wg else None
-                    gates += [f32_bits(float(cw["dt"][hh])) if cw else 0, f32_bits(float(cw["neg_a"][hh])) if cw else 0]
-                hr[c.x][c.y] = (
-                    [
-                        rows_t.buffer_address(),
-                        self.state_t.buffer_address(),
-                        norm_t.buffer_address(),
-                        kh * 4,
-                        d.gq // TILE + kh * 4,
-                        2 * d.gq // TILE + hh * 4,
-                        d.z0 // TILE + hh * 4,
-                        a_col // TILE,
-                        a_col % TILE,
-                        b_col // TILE,
-                        b_col % TILE,
-                        hh,
-                    ]
-                    + gates
-                    + [0, gi * nu, nu, row_writes[hc]]
-                )
-                col = head_p[hh * G]
-                hw[c.x][c.y] = (
-                    [self.state_t.buffer_address(), self.o_in_t.buffer_address(), hh]
-                    + peers
-                    + [0, gi * nu, nu, G, col.x, col.y]
-                )
-            head_ct = [4, 4, self.n_gdn, gdn_copies, S]
-            head_compute_ct = [d.nk, d.nv, 4, 4, group, f32_bits(DK**-0.5), f32_bits(1e-6), f32_bits(1e-6)]
-            head_compute_ct += [f32_bits(1.0 / DV), self.n_gdn * (B // G)]
-
-            # attention cores
-            parent = {}
-            for g_i, grp in enumerate(groups_):
-                parent[grp[0]] = (lead_p, g_i)
-                for k, w_i in enumerate(grp[1:]):
-                    parent[w_i] = (wphys[grp[0]], k)
-            kids = {grp[0]: grp[1:] for grp in groups_}
-            ar, aw, ac = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
-            for w_i, c in enumerate(workers):
-                is_tail = w_i == WORKERS - 1
-                role = 2 if is_tail else 1
-                ch = kids.get(w_i, [])
-                pp, slot = parent[w_i]
-                ar[c.x][c.y] = (
-                    [role, w_i]
-                    + kv_addrs
-                    + [kv_stride, len(ch), 0, tok_addr, self.rope_off]
-                    + ([rows_t.buffer_address(), kw_t.buffer_address()] if is_tail else [])
-                )
-                aw[c.x][c.y] = (
-                    [role, w_i, lead_p.x, lead_p.y, m_slots_t.buffer_address(), pp.x, pp.y, slot, len(ch)]
-                    + [v for k in ch for v in (wphys[k].x, wphys[k].y)]
-                    + [0]
-                    + (kv_addrs + [kv_stride, tok_addr] if is_tail else [])
-                )
-                ac[c.x][c.y] = [role, len(ch)]
-            lr, lw, lc = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
-            lr[leader.x][leader.y] = [rows_t.buffer_address(), len(groups_), 0, tok_addr, self.rope_off]
-            lr[leader.x][leader.y].append(qw_t.buffer_address())
-            w0p, w1p = wphys[0], wphys[-1]
-            lw[leader.x][leader.y] = (
-                [q_t.buffer_address(), M_t.buffer_address(), m_slots_t.buffer_address(), WORKERS]
-                + [w0p.x, w0p.y, w1p.x, w1p.y, self.o_in_t.buffer_address()]
-                + peers
-                + [len(groups_)]
-                + [v for grp in groups_ for v in (wphys[grp[0]].x, wphys[grp[0]].y)]
-                + [0]
-            )
-            lc[leader.x][leader.y] = [len(groups_)]
-
-            kernels = [
-                kernel("streamer_reader.cpp", grid, ct, rr, dm(NCRISC, NOC0)),
-                kernel("streamer_writer.cpp", grid, ct, wr, dm(BRISC, NOC1)),
-                kernel("streamer_compute.cpp", grid, ct, cr, streamer_compute),
-                kernel("mlp_hub.cpp", hub_grid, hub_ct, hub_rt, dm(BRISC, NOC0)),
-                kernel("hub_compute.cpp", hub_grid, [n, x_views, 2 * layers], ttnn.RuntimeArgs(), streamer_compute),
-            ]
-            if self.n_gdn:
-                kernels += [
-                    kernel(
-                        "gdn_head_reader.cpp", head_grid, head_ct + [SEM_ROWS, d.nv, SEM_LOCAL, B], hr, dm(NCRISC, NOC1)
-                    ),
-                    kernel(
-                        "gdn_head_writer.cpp",
-                        head_grid,
-                        head_ct + [SEM_HEADS, d.nv, SEM_LOCAL, B, SEM_GROUP],
-                        hw,
-                        dm(BRISC, NOC0),
-                    ),
-                    kernel("gdn_head_compute.cpp", head_grid, head_compute_ct, ttnn.RuntimeArgs(), head_compute),
+                b0 = bank * qg_bank + qgf
+                mine = []
+                for r0, r1, df, dn in regions:
+                    lo, hi = max(r0, b0), min(r1, b0 + nqg)
+                    if lo < hi:
+                        mine.append([lo - b0, hi - lo, df, dn])
+                        for hc in range(df, df + dn):
+                            row_writes[hc] += 1
+                runs.append(mine)
+            mesh_pd = ttnn.MeshProgramDescriptor()
+            for chip in range(n):
+                coord = ttnn.MeshCoordinate(0, chip)
+                ct = [
+                    layers,
+                    interval,
+                    n,
+                    S,
+                    d.Ht,
+                    d.It,
+                    chip,
+                    ring_bytes,
+                    f32_bits(EPS),
+                    f32_bits(1 / math.sqrt(HIDDEN)),
                 ]
-            if self.n_attn:
-                kernels += [
-                    kernel("attn_worker_reader.cpp", work_grid, attn_ct, ar, dm(NCRISC, NOC1)),
-                    kernel("attn_worker_writer.cpp", work_grid, attn_ct, aw, dm(BRISC, NOC0)),
-                    kernel("attn_worker_compute.cpp", chunk_grid, attn_ct, ac, work_compute),
-                    kernel("attn_worker_compute.cpp", tail_grid, attn_ct, ac, attn_compute),
-                    kernel("attn_leader_reader.cpp", lead_grid, attn_ct, lr, dm(NCRISC, NOC1)),
-                    kernel("attn_leader_writer.cpp", lead_grid, attn_ct, lw, dm(BRISC, NOC0)),
-                    kernel("attn_leader_compute.cpp", lead_grid, attn_ct, lc, attn_compute),
-                ]
-            program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
-            args = program.kernels[3].runtime_args[hub.x][hub.y]
-            for nb in (chip + 1, chip - 1):
-                if 0 <= nb < n:
-                    me = mesh.get_fabric_node_id(coord)
-                    args.append(1)
-                    args.extend(
-                        ttnn.setup_fabric_connection(
-                            me, mesh.get_fabric_node_id(ttnn.MeshCoordinate(0, nb)), 0, program, hub
-                        )
+                ct += [SEM_SLOTS, SEM_ACT, SEM_GATHER, SEM_HEADS, SEM_ROWS, ng_max, nd_max, nq_max, nv_max]
+                ct += [d.conv_tiles, d.Ot, d.nv * G, int(lm_head)]
+                for (Kt, _, _), (sb, pages, page, block) in zip(entries, geo):
+                    ct += [Kt, sb, pages, page, block]
+                ct += [SEM_LOCAL, B, SEM_ADDR, d.nv, blk_tiles, SEM_FLAG]
+                rr, wr, cr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+                peers = [v for p in sphys for v in (p.x, p.y)]
+                head_xy = [v for p in head_p for v in (p.x, p.y)]
+                for i, c in enumerate(cores):
+                    bank, j = divmod(i, PER_BANK)
+                    nqg, qgf = nqg_split[j]
+                    nqa, qaf = nqa_split[j]
+                    nd, dfirst = nd_split[j]
+                    ng, gfirst = ng_split[j]
+                    nvv, vfirst = nv_split[j]
+                    v0 = (bank * v_bank + vfirst) * TILE
+                    counts = [nqg, nqa, nd, 2 * ng, nd, nvv]
+                    ent = []
+                    for cnt, (t, stride, copies) in zip(counts, self.w_entries):
+                        ent += [cnt if t is not None else 0, t.buffer_address() if t is not None else 0, stride, copies]
+                    rr[c.x][c.y] = (
+                        [bank, i & 0x3, j, PER_BANK]
+                        + ent
+                        + [
+                            taps_t.buffer_address(),
+                            sub["hist"].buffer_address(),
+                            i * gdn_copies,
+                            gdn_copies,
+                            tok_addr,
+                            ts_addr,
+                            max(0, min(nqg, d.conv_tiles - (bank * qg_bank + qgf))),
+                        ]
                     )
-                else:
-                    args.append(0)
-            mesh_pd[ttnn.MeshCoordinateRange(coord, coord)] = program
-        self.mesh_pd = mesh_pd
-        self.io = [self.x_t, self.o_in_t, rows_t, q_t, M_t, m_slots_t, one_t, mean_t]
-        self.io += [taps_t, self.hist_t, self.state_t, norm_t, qw_t, kw_t, self.K_t, self.V_t, self.tok_t]
-        self.io += self._keep
-        if lm_head:
-            self.io += [self.logits_t, self.argmax_t]
-        if timeline:
-            self.io.append(self.ts_t)
+                    n_conv = max(0, min(nqg, d.conv_tiles - (bank * qg_bank + qgf)))
+                    wr[c.x][c.y] = (
+                        [ng, bank * it_bank + gfirst, nd, bank * ht_bank + dfirst, hub_p.x, hub_p.y]
+                        + [int(i == 0), 0]
+                        + [nqg, bank * qg_bank + qgf, nqa, bank * qa_bank + qaf, rows_t.buffer_address(), n_conv]
+                        + [sub["hist"].buffer_address(), i * gdn_copies, gdn_copies, tok_addr]
+                        + head_xy
+                        + [lead_p.x, lead_p.y, tail_p.x, tail_p.y]
+                        + peers
+                        + [ts_addr]
+                        + [sub["argmax"].buffer_address() if lm_head else 0]
+                        + [max(0, min(nvv * TILE, d.vocab_chip - v0)), chip * d.vocab_chip + v0, i]
+                        + [len(runs[i])]
+                        + [v for r in runs[i] for v in r]
+                    )
+                    cr[c.x][c.y] = [ng, nd, bank * ht_bank + dfirst, nqg, nqa, n_conv, nvv, ts_addr]
+
+                hub_rt = ttnn.RuntimeArgs()
+                hub_rt[hub.x][hub.y] = [
+                    sub["x"].buffer_address(),
+                    *[ttnn.get_global_semaphore_address(s) for s in self.ccl_sems],
+                    0,
+                ] + rect_cover(mesh, cores)
+                hub_ct = [n, chip, HIDDEN * 2 * B, packet_bytes, 2 * layers, S, SEM_GATHER, SEM_SLOTS]
+                hub_ct += [SEM_FLAG, int(lm_head), 1, 1, SEM_ADDR]
+
+                # GDN heads
+                hr, hw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+                for hc, c in enumerate(heads):
+                    hh, gi = divmod(hc, G)
+                    nu = B // G
+                    kh = hh // group
+                    a_col, b_col = d.a0 + hh, d.b0 + hh
+                    gates = []
+                    for wg in w["gdn"] or [None]:
+                        cw = wg["chips"][chip] if wg else None
+                        gates += [
+                            f32_bits(float(cw["dt"][hh])) if cw else 0,
+                            f32_bits(float(cw["neg_a"][hh])) if cw else 0,
+                        ]
+                    hr[c.x][c.y] = (
+                        [
+                            rows_t.buffer_address(),
+                            sub["state"].buffer_address(),
+                            norm_t.buffer_address(),
+                            kh * 4,
+                            d.gq // TILE + kh * 4,
+                            2 * d.gq // TILE + hh * 4,
+                            d.z0 // TILE + hh * 4,
+                            a_col // TILE,
+                            a_col % TILE,
+                            b_col // TILE,
+                            b_col % TILE,
+                            hh,
+                        ]
+                        + gates
+                        + [0, gi * nu, nu, row_writes[hc]]
+                    )
+                    col = head_p[hh * G]
+                    hw[c.x][c.y] = (
+                        [sub["state"].buffer_address(), self.o_in_t.buffer_address(), hh]
+                        + peers
+                        + [0, gi * nu, nu, G, col.x, col.y]
+                    )
+                head_ct = [4, 4, self.n_gdn, gdn_copies, S]
+                head_compute_ct = [d.nk, d.nv, 4, 4, group, f32_bits(DK**-0.5), f32_bits(1e-6), f32_bits(1e-6)]
+                head_compute_ct += [f32_bits(1.0 / DV), self.n_gdn * (B // G)]
+
+                # attention cores
+                parent = {}
+                for g_i, grp in enumerate(groups_):
+                    parent[grp[0]] = (lead_p, g_i)
+                    for k, w_i in enumerate(grp[1:]):
+                        parent[w_i] = (wphys[grp[0]], k)
+                kids = {grp[0]: grp[1:] for grp in groups_}
+                ar, aw, ac = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+                for w_i, c in enumerate(workers):
+                    is_tail = w_i == WORKERS - 1
+                    role = 2 if is_tail else 1
+                    ch = kids.get(w_i, [])
+                    pp, slot = parent[w_i]
+                    ar[c.x][c.y] = (
+                        [role, w_i]
+                        + kv_addrs
+                        + [kv_stride, len(ch), 0, tok_addr, self.rope_off]
+                        + ([rows_t.buffer_address(), kw_t.buffer_address()] if is_tail else [])
+                    )
+                    aw[c.x][c.y] = (
+                        [role, w_i, lead_p.x, lead_p.y, m_slots_t.buffer_address(), pp.x, pp.y, slot, len(ch)]
+                        + [v for k in ch for v in (wphys[k].x, wphys[k].y)]
+                        + [0]
+                        + (kv_addrs + [kv_stride, tok_addr] if is_tail else [])
+                    )
+                    ac[c.x][c.y] = [role, len(ch)]
+                lr, lw, lc = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+                lr[leader.x][leader.y] = [rows_t.buffer_address(), len(groups_), 0, tok_addr, self.rope_off]
+                lr[leader.x][leader.y].append(qw_t.buffer_address())
+                w0p, w1p = wphys[0], wphys[-1]
+                lw[leader.x][leader.y] = (
+                    [q_t.buffer_address(), M_t.buffer_address(), m_slots_t.buffer_address(), WORKERS]
+                    + [w0p.x, w0p.y, w1p.x, w1p.y, self.o_in_t.buffer_address()]
+                    + peers
+                    + [len(groups_)]
+                    + [v for grp in groups_ for v in (wphys[grp[0]].x, wphys[grp[0]].y)]
+                    + [0]
+                )
+                lc[leader.x][leader.y] = [len(groups_)]
+
+                kernels = [
+                    kernel("streamer_reader.cpp", grid, ct, rr, dm(NCRISC, NOC0)),
+                    kernel("streamer_writer.cpp", grid, ct, wr, dm(BRISC, NOC1)),
+                    kernel("streamer_compute.cpp", grid, ct, cr, streamer_compute),
+                    kernel("mlp_hub.cpp", hub_grid, hub_ct, hub_rt, dm(BRISC, NOC0)),
+                    kernel("hub_compute.cpp", hub_grid, [n, x_views, 2 * layers], ttnn.RuntimeArgs(), streamer_compute),
+                ]
+                if self.n_gdn:
+                    kernels += [
+                        kernel(
+                            "gdn_head_reader.cpp",
+                            head_grid,
+                            head_ct + [SEM_ROWS, d.nv, SEM_LOCAL, B],
+                            hr,
+                            dm(NCRISC, NOC1),
+                        ),
+                        kernel(
+                            "gdn_head_writer.cpp",
+                            head_grid,
+                            head_ct + [SEM_HEADS, d.nv, SEM_LOCAL, B, SEM_GROUP],
+                            hw,
+                            dm(BRISC, NOC0),
+                        ),
+                        kernel("gdn_head_compute.cpp", head_grid, head_compute_ct, ttnn.RuntimeArgs(), head_compute),
+                    ]
+                if self.n_attn:
+                    kernels += [
+                        kernel("attn_worker_reader.cpp", work_grid, attn_ct, ar, dm(NCRISC, NOC1)),
+                        kernel("attn_worker_writer.cpp", work_grid, attn_ct, aw, dm(BRISC, NOC0)),
+                        kernel("attn_worker_compute.cpp", chunk_grid, attn_ct, ac, work_compute),
+                        kernel("attn_worker_compute.cpp", tail_grid, attn_ct, ac, attn_compute),
+                        kernel("attn_leader_reader.cpp", lead_grid, attn_ct, lr, dm(NCRISC, NOC1)),
+                        kernel("attn_leader_writer.cpp", lead_grid, attn_ct, lw, dm(BRISC, NOC0)),
+                        kernel("attn_leader_compute.cpp", lead_grid, attn_ct, lc, attn_compute),
+                    ]
+                program = ttnn.ProgramDescriptor(kernels=kernels, semaphores=sems, cbs=cbs)
+                args = program.kernels[3].runtime_args[hub.x][hub.y]
+                for nb in (chip + 1, chip - 1):
+                    if 0 <= nb < n:
+                        me = mesh.get_fabric_node_id(coord)
+                        args.append(1)
+                        args.extend(
+                            ttnn.setup_fabric_connection(
+                                me, mesh.get_fabric_node_id(ttnn.MeshCoordinate(0, nb)), 0, program, hub
+                            )
+                        )
+                    else:
+                        args.append(0)
+                mesh_pd[ttnn.MeshCoordinateRange(coord, coord)] = program
+            io = [sub["x"], self.o_in_t, rows_t, q_t, M_t, m_slots_t, one_t, mean_t]
+            io += [taps_t, sub["hist"], sub["state"], norm_t, qw_t, kw_t, sub["K"], sub["V"], sub["tok"]]
+            io += self._keep
+            if lm_head:
+                io += [sub["logits"], sub["argmax"]]
+            if timeline:
+                io.append(self.ts_t)
+            return mesh_pd, io
+
+        built = [build(sub) for sub in subs]
+        self.subs = subs
+        self.mesh_pds = [m for m, _ in built]
+        self.ios = [io for _, io in built]
+        self.mesh_pd, self.io = built[0]
         self.nv_split, self.v_bank = nv_split, v_bank
 
     def token_state(self, x0, pos, ring=None):
-        """host tensor of the token state: x0 [HIDDEN] at pos, or per user x0 [batch, HIDDEN] at positions pos
-        (a list); ring is the conv ring step (default: the position, batch 1)"""
+        """host tensor of the token state: x0 [HIDDEN] at pos, or per user x0 [users, HIDDEN] at positions pos
+        (a list); ring is the conv ring step (default: the position, batch 1). With sub-batches, one host
+        tensor per sub-batch."""
+        if self.n_sub > 1:
+            x0 = x0.reshape(self.users, HIDDEN)
+            B = self.batch
+            return [
+                self._token_state(x0[k * B : (k + 1) * B], pos[k * B : (k + 1) * B], ring) for k in range(self.n_sub)
+            ]
+        return self._token_state(x0, pos, ring)
+
+    def _token_state(self, x0, pos, ring):
         B = self.batch
         x0 = x0.reshape(B, HIDDEN)
         pos = [pos] if B == 1 and not isinstance(pos, (list, tuple)) else list(pos)
@@ -1256,10 +1345,11 @@ class ResidentModel:
         ttnn.synchronize_device(self.mesh)
 
     def capture_trace(self):
-        """record the step's launch into a trace (the device needs a trace region): step() then replays it,
+        """record the step's launches into a trace (the device needs a trace region): step() then replays it,
         which skips the host's per-launch work (~0.5 ms); the token state is written before each replay"""
         self.trace_id = ttnn.begin_trace_capture(self.mesh, cq_id=0)
-        ttnn.generic_op(self.io, self.mesh_pd)
+        for io, pd in zip(self.ios, self.mesh_pds):
+            ttnn.generic_op(io, pd)
         ttnn.end_trace_capture(self.mesh, self.trace_id, cq_id=0)
         ttnn.synchronize_device(self.mesh)
 
@@ -1269,21 +1359,26 @@ class ResidentModel:
             self.trace_id = None
 
     def step(self, tok_host):
-        ttnn.copy_host_to_device_tensor(tok_host, self.tok_t)
+        for t, sub in zip(tok_host if isinstance(tok_host, list) else [tok_host], self.subs):
+            ttnn.copy_host_to_device_tensor(t, sub["tok"])
         if getattr(self, "trace_id", None) is not None:
             ttnn.execute_trace(self.mesh, self.trace_id, cq_id=0, blocking=False)
         else:
-            ttnn.generic_op(self.io, self.mesh_pd)
+            for io, pd in zip(self.ios, self.mesh_pds):
+                ttnn.generic_op(io, pd)
 
     def x(self):
-        """x after the step: [HIDDEN], or [batch, HIDDEN]"""
-        got = ttnn.to_torch(self.x_t, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
-        n, B = self.d.n, self.batch
-        x = tiny_unorder(got[0], B)
-        return x[0] if B == 1 else x
+        """x after the step: [HIDDEN], or [users, HIDDEN]"""
+        xs = []
+        for sub in self.subs:
+            got = ttnn.to_torch(sub["x"], mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
+            xs.append(tiny_unorder(got[0], self.batch))
+        x = torch.cat(xs)
+        return x[0] if self.users == 1 else x
 
     def mixer_output(self):
-        """the last layer's mixer output as received by streamer 0 of each chip: [n, gv], or [n, batch, gv]"""
+        """the last layer's mixer output as received by streamer 0 of each chip: [n, gv], or [n, batch, gv]
+        (the last sub-batch's users: the launches share the buffer)"""
         o = ttnn.to_torch(self.o_in_t, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
         o = o.reshape(self.d.n, self.S, self.batch, -1)[:, 0]
         return o[:, 0] if self.batch == 1 else o
@@ -1291,24 +1386,29 @@ class ResidentModel:
     def argmax(self):
         """vocab index of the largest logit (the first one on ties) from the streamers' candidates; a list
         per user for batch > 1"""
-        raw = ttnn.to_torch(self.argmax_t, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0))
-        c = raw.reshape(-1, self.S, self.batch, 4)[..., :2].to(torch.int64) & 0xFFFFFFFF
         out = []
-        for u in range(self.batch):
-            cu = c[:, :, u].reshape(-1, 2)
-            best = cu[:, 0].max()
-            out.append(int(cu[cu[:, 0] == best, 1].min()))
-        return out[0] if self.batch == 1 else out
+        for sub in self.subs:
+            raw = ttnn.to_torch(sub["argmax"], mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0))
+            c = raw.reshape(-1, self.S, self.batch, 4)[..., :2].to(torch.int64) & 0xFFFFFFFF
+            for u in range(self.batch):
+                cu = c[:, :, u].reshape(-1, 2)
+                best = cu[:, 0].max()
+                out.append(int(cu[cu[:, 0] == best, 1].min()))
+        return out[0] if self.users == 1 else out
 
     def logits(self):
-        """per-chip logits [n, vocab_chip] in vocab order, or [batch, n, vocab_chip]"""
-        raw = ttnn.to_torch(self.logits_t, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
+        """per-chip logits [n, vocab_chip] in vocab order, or [users, n, vocab_chip]"""
         B = self.batch
-        raw = raw.reshape(self.d.n, self.S, B, -1)
-        out = torch.zeros(B, self.d.n, self.d.vocab)
-        for i in range(self.S):
-            bank, j = divmod(i, PER_BANK)
-            cnt, first = self.nv_split[j]
-            c0 = (bank * self.v_bank + first) * TILE
-            out[:, :, c0 : c0 + cnt * TILE] = raw[:, i, :, : cnt * TILE].permute(1, 0, 2)
-        return out[0] if B == 1 else out
+        outs = []
+        for sub in self.subs:
+            raw = ttnn.to_torch(sub["logits"], mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
+            raw = raw.reshape(self.d.n, self.S, B, -1)
+            out = torch.zeros(B, self.d.n, self.d.vocab)
+            for i in range(self.S):
+                bank, j = divmod(i, PER_BANK)
+                cnt, first = self.nv_split[j]
+                c0 = (bank * self.v_bank + first) * TILE
+                out[:, :, c0 : c0 + cnt * TILE] = raw[:, i, :, : cnt * TILE].permute(1, 0, 2)
+            outs.append(out)
+        out = torch.cat(outs)
+        return out[0] if self.users == 1 else out

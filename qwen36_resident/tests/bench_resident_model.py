@@ -67,6 +67,7 @@ def test_resident_decode_steps(mesh_device, pos):
         ttnn.synchronize_device(mesh_device)
         x_got, o_got = model.x().reshape(B, -1), model.mixer_output()
         o_got = o_got if B > 1 else o_got[:, None]
+        last0 = model.users - model.batch  # the mixer output buffer holds the last sub-batch's users
         lg_got = model.logits().reshape(B, n, -1) if lm_head else None
         am = model.argmax() if lm_head else None
         am = am if B > 1 else [am]
@@ -80,7 +81,7 @@ def test_resident_decode_steps(mesh_device, pos):
                 pos=positions[u],
                 x_pcc=pcc(x_got[u], x_ref),
                 x_rel=rel(x_got[u], x_ref),
-                mixer_pcc=pcc(o_got[:, u], o_ref),
+                mixer_pcc=pcc(o_got[:, u - last0], o_ref) if u >= last0 else None,
             )
             if lm_head:
                 lg_ref = torch.stack(out[1])
@@ -96,7 +97,9 @@ def test_resident_decode_steps(mesh_device, pos):
     # the random states of some users drift faster over steps (user 3 of a batch of 8 replayed alone: x pcc
     # 0.991 at the third step), so later steps of a batch get a looser floor
     floor = lambda r: 0.99 if r["pos"] == pos + 7 * r["user"] or B == 1 else 0.98
-    assert all(r["x_pcc"] > floor(r) and r["mixer_pcc"] > floor(r) and r.get("logits_pcc", 1) > floor(r) for r in recs)
+    assert all(
+        r["x_pcc"] > floor(r) and (r["mixer_pcc"] or 1) > floor(r) and r.get("logits_pcc", 1) > floor(r) for r in recs
+    )
 
 
 def timed_steps(mesh, model, tok, reps=5):
