@@ -28,6 +28,7 @@ import torch
 import ttnn
 from models.demos.blackhole.qwen36.tt import tp_common as tpc
 from models.experimental.qwen36_resident.prefill import pp_weights as PW
+from models.experimental.qwen36_resident.prefill.smm import SmallMatmul
 from models.experimental.qwen36_resident.tests.bench_resident_mlp import EPS, HIDDEN, INTER
 from models.experimental.qwen36_resident.tests.resident_model import (
     CONV_K,
@@ -85,7 +86,12 @@ MM_BEST = {
 
 # a 64-layer tick at chunk C takes about base + slope * (mean context in K tokens) ms (QB2, traced: the
 # attention part grows with the context)
-TICK_MS = {128: (25.3, 1.6), 256: (32.5, 2.9), 512: (45.5, 3.2), 1024: (81.0, 3.0)}
+# chunks up to this many tokens are weight-read bound: their big projections use SmallMatmul (kernels/smm_*)
+SMM_MAX_C = 128
+SMM_SHAPES = dict(
+    gu=(HIDDEN, INTER, ttnn.bfloat4_b), gdn=(HIDDEN, GDN_COLS, ttnn.bfloat8_b), attn=(HIDDEN, ATTN_COLS, ttnn.bfloat8_b)
+)
+TICK_MS = {128: (22.4, 1.6), 256: (32.5, 2.9), 512: (45.5, 3.2), 1024: (81.0, 3.0)}
 
 
 def rope_cos_sin(positions):
@@ -137,6 +143,13 @@ class PPPrefill:
             mesh.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, packer_l1_acc=False
         )
 
+        # chunks up to SMM_MAX_C stream the big projections through SmallMatmul, from their own
+        # bank-major copies of those weights (the layout does not depend on the chunk)
+        self.small = [c for c in self.chunks if c <= SMM_MAX_C]
+        if self.small:
+            m = min(self.small)
+            self.smm_layout = {key: SmallMatmul(mesh, m, K, N, dt) for key, (K, N, dt) in SMM_SHAPES.items()}
+
         # ---- weights: stage-layer j of chip p is layer p * Ls + j
         self.w = []
         for j in range(self.Ls):
@@ -148,8 +161,13 @@ class PPPrefill:
                 D=dev(stack("mlp", lambda m: m["D"]), ttnn.bfloat8_b),
                 out=dev(stack("mixer", lambda m: m["out"]), ttnn.bfloat8_b),
             )
+            if self.small:
+                e["G_s"] = self.smm_layout["gu"].weights(stack("mlp", lambda m: m["G"])[:, 0])
+                e["U_s"] = self.smm_layout["gu"].weights(stack("mlp", lambda m: m["U"])[:, 0])
             if self.kinds[j]:
                 e["W"] = dev(stack("mixer", lambda m: m["W"]), ttnn.bfloat8_b)
+                if self.small:
+                    e["W_s"] = self.smm_layout["attn"].weights(stack("mixer", lambda m: m["W"])[:, 0])
                 row = lambda v: v.reshape(1, -1)
                 e["wq"] = dev(stack("mixer", lambda m: row(m["wq"] / math.sqrt(HD))), ttnn.bfloat16)
                 e["wk"] = dev(stack("mixer", lambda m: row(m["wk"])), ttnn.bfloat16)
@@ -167,6 +185,8 @@ class PPPrefill:
                     return t
 
                 e["W"] = dev(stack("mixer", padded), ttnn.bfloat8_b)
+                if self.small:
+                    e["W_s"] = self.smm_layout["gdn"].weights(stack("mixer", padded)[:, 0])
                 e["taps"] = dev(stack("mixer", taps), ttnn.bfloat16)
 
                 def row0(v):  # values in row 0 of 32 x 64 (two tiles), broadcast down the rows by the gates
@@ -222,7 +242,7 @@ class PPPrefill:
     GEOMETRY = (
         "C", "pc", "x_in", "x_last", "x_out", "h_buf", "ids", "q_t", "k_t", "v_t", "g_t", "beta_t", "gate_y",
         "cos", "sin", "fill_pt", "cstart", "_shift_pd", "_shift_sems", "_conv_cores", "_conv_groups",
-        "_conv_spec", "_conv_dims", "trace_id",
+        "_conv_spec", "_conv_dims", "trace_id", "smm", "smm_out",
     )  # fmt: skip
 
     def _geometry(self, C):
@@ -249,6 +269,11 @@ class PPPrefill:
         self.cstart = dev(torch.zeros(n, dtype=torch.int32), ttnn.int32, ttnn.ROW_MAJOR_LAYOUT)
         self._conv_program()
         self.trace_id = None
+        self.smm = self.smm_out = None
+        if C in self.small:
+            self.smm = {key: SmallMatmul(self.mesh, C, K, N, dt) for key, (K, N, dt) in SMM_SHAPES.items()}
+            cols = dict(g=INTER, u=INTER, gdn=GDN_COLS, attn=ATTN_COLS)
+            self.smm_out = {k: dev(torch.zeros(n, 1, C, v), ttnn.bfloat16) for k, v in cols.items()}
         return {k: getattr(self, k) for k in self.GEOMETRY}
 
     def _use(self, C):
@@ -727,6 +752,17 @@ class PPPrefill:
             fuse_batch=False,
         )
 
+    def _proj(self, h, j, name):
+        """the big projections: G (with SiLU), U, or the mixer's W (gdn / attn), through SmallMatmul at
+        short chunks"""
+        w = self.w[j]
+        key = {"G": "gu", "U": "gu"}.get(name, "attn" if self.kinds[j] else "gdn")
+        if self.smm is not None:
+            out = {"G": "g", "U": "u"}.get(name, key)
+            ws = {"G": "G_s", "U": "U_s"}.get(name, "W_s")
+            return self.smm[key](h, w[ws], self.smm_out[out], silu=name == "G")
+        return self._linear(h, w[name], key, activation="silu" if name == "G" else None)
+
     def _linear(self, x, w, key, activation=None):
         pc = self.pc[key]
         if activation is not None and pc is not None:
@@ -745,7 +781,7 @@ class PPPrefill:
 
     def _gdn(self, h, j):
         C, w = self.C, self.w[j]
-        p = self._linear(h, w["W"], "gdn")
+        p = self._proj(h, j, "W")
         # q, k, v rows and the gates go to the delta-rule op token-major: it L2-normalizes q and k per head
         # itself (folding q's scale) and returns o head-major
         self._conv(p, j)
@@ -777,7 +813,7 @@ class PPPrefill:
 
     def _attn(self, h, j):
         C, w = self.C, self.w[j]
-        p = self._linear(h, w["W"], "attn")
+        p = self._proj(h, j, "W")
         qkv_d = (NQ + 2 * NKV) * HD
         qkv = ttnn.slice(p, (0, 0, 0, 0), (1, 1, C, qkv_d))
         gate = ttnn.slice(p, (0, 0, 0, qkv_d), (1, 1, C, ATTN_COLS))
@@ -805,8 +841,8 @@ class PPPrefill:
 
     def _mlp(self, h, j):
         C, w = self.C, self.w[j]
-        g = self._linear(h, w["G"], "gu", activation="silu")
-        u = self._linear(h, w["U"], "gu")
+        g = self._proj(h, j, "G")
+        u = self._proj(h, j, "U")
         a = ttnn.multiply(g, u)
         out = self._linear(a, w["D"], "down")
         return out
