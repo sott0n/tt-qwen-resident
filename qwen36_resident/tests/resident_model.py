@@ -56,6 +56,7 @@ PROJ_DT, OUT_DT, GU_DT, DOWN_DT, HEAD_DT = (
     ttnn.bfloat8_b,
 )
 WORKERS, FANIN = 32, 8
+KV_BLOCK = 8  # KV position tiles per streamed block of an attention worker
 (
     SEM_SLOTS,
     SEM_ACT,
@@ -599,7 +600,8 @@ class ResidentModel:
             return dev
 
         self.K_t, self.V_t = settled(cache("K")), settled(cache("V"))
-        chunk_max = max([chunk_of(wi, tp, banks)[3] for tp in range(max_tp + 1) for wi in range(WORKERS - 1)] + [1])
+        # a chunk worker streams its KV tiles in blocks of kv_block (L1 independent of the context length)
+        kv_block = min(KV_BLOCK, max(chunk_of(wi, max_tp, banks)[3] for wi in range(WORKERS - 1)) or 1)
         nodes = list(range(WORKERS))
         groups_ = [nodes[i : i + FANIN] for i in range(0, WORKERS, FANIN)]
         slots_per_node = max(FANIN - 1, len(groups_))
@@ -745,10 +747,14 @@ class ResidentModel:
             T(0, q_t),
             T(3, M_t),
             T(4, one_t),
-            cb(1, work_grid, 2 * chunk_max * Dt, ttnn.bfloat8_b, kv_page),
-            cb(2, work_grid, 2 * chunk_max * Dt, ttnn.bfloat8_b, kv_page),
-            cb(5, work_grid, chunk_max, *f32),
-            cb(6, work_grid, chunk_max),
+            cb(1, work_grid, 2 * kv_block * Dt, ttnn.bfloat8_b, kv_page),
+            cb(2, work_grid, 2 * kv_block * Dt, ttnn.bfloat8_b, kv_page),
+            cb(5, work_grid, kv_block, *f32),
+            cb(6, work_grid, kv_block),
+            cb(9, chunk_grid, 2 * Dt, *f32),
+            cb(15, chunk_grid, 2, *f32),
+            cb(24, chunk_grid, 2, *f32),
+            cb(26, chunk_grid, 1, *f32),
             cb(7, work_grid, 1),
             cb(8, work_grid, Dt + 1),
             cb(10, work_grid, 1, ttnn.uint32, 16),
@@ -814,7 +820,7 @@ class ResidentModel:
         work_compute = compute_cfg(ttnn.MathFidelity.HiFi2, True, False)
 
         entry_rt = []
-        attn_ct = [self.n_attn, attn_copies, WORKERS, S, chunk_max, heads_a, Dt, ROT // TILE]
+        attn_ct = [self.n_attn, attn_copies, WORKERS, S, kv_block, heads_a, Dt, ROT // TILE]
         attn_ct += [
             SEM_ROWS,
             SEM_Q,

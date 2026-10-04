@@ -3,7 +3,8 @@
 //
 // Attention worker reader. Reads the position from the token state; per attention layer a (copy
 // c = a % copies):
-//   chunk worker: reads its chunk of copy c's KV cache (complete position tiles; see attn_common.hpp);
+//   chunk worker: reads its chunk of copy c's KV cache (complete position tiles; see attn_common.hpp) in
+//     blocks of chunk_max tiles;
 //   tail core: prefetches copy c's k | v row of the position tile holding the position and the
 //     layer's k norm weight, waits for the streamers' projection row and places k and v into row 0 of
 //     cb_kraw / cb_vraw;
@@ -117,9 +118,9 @@ void kernel_main() {
         push_resident(cb_mean, 1);
     }
 
-    // rows first, first + step, ... of the bank's shard, one kv_row each
-    auto read_rows = [&](uint32_t addr, uint32_t n, uint32_t l1) {
-        for (uint32_t k = 0; k < n; k++, l1 += kKvRow) {
+    // the chunk's rows from, from + 1, ... (shard rows j + k J of the bank), one kv_row each
+    auto read_rows = [&](uint32_t addr, uint32_t from, uint32_t n, uint32_t l1) {
+        for (uint32_t k = from; k < from + n; k++, l1 += kKvRow) {
             noc_async_read(get_noc_addr_from_bank_id<true>(ch.bank, addr + (ch.j + k * ch.J) * kKvRow), l1, kKvRow);
         }
     };
@@ -129,24 +130,31 @@ void kernel_main() {
         const uint32_t copy = l % copies;
         const uint32_t k_addr = k_cache + copy * copy_stride;
         const uint32_t v_addr = v_cache + copy * copy_stride;
-        if (role == 1) {
-            if (ch.n > 0) {
+        // blocks of chunk_max rows; the ring holds two, so a block is read while the previous one is used
+        auto read_blocks = [&](uint32_t from, uint32_t to) {
+            for (uint32_t b0 = from; b0 < to; b0 += chunk_max) {
+                const uint32_t nb = ch.n - b0 < chunk_max ? ch.n - b0 : chunk_max;
                 cb_reserve_back(cb_k, chunk_max * Dt);
                 cb_reserve_back(cb_v, chunk_max * Dt);
-                read_rows(k_addr, ch.n, get_write_ptr(cb_k));
-                read_rows(v_addr, ch.n, get_write_ptr(cb_v));
+                read_rows(k_addr, b0, nb, get_write_ptr(cb_k));
+                read_rows(v_addr, b0, nb, get_write_ptr(cb_v));
                 noc_async_read_barrier();
                 cb_push_back(cb_k, chunk_max * Dt);
                 cb_push_back(cb_v, chunk_max * Dt);
             }
+        };
+        // the blocks that fit the ring are prefetched before q; the rest need compute to free slots
+        const uint32_t early = ch.n < 2 * chunk_max ? ch.n : 2 * chunk_max;
+        if (role == 1) {
+            read_blocks(0, early);
         } else {
             if (l >= copies) {
                 noc_semaphore_wait_min(
                     reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_tail)), l - copies + 1);
             }
             cb_reserve_back(cb_tail8, 2 * Dt);
-            read_rows(k_addr, 1, get_write_ptr(cb_tail8));
-            read_rows(v_addr, 1, get_write_ptr(cb_tail8) + kKvRow);
+            read_rows(k_addr, 0, 1, get_write_ptr(cb_tail8));
+            read_rows(v_addr, 0, 1, get_write_ptr(cb_tail8) + kKvRow);
             cb_reserve_back(cb_kw, Dt);
             for (uint32_t d = 0; d < Dt; d++) {
                 noc_async_read_page(copy * Dt + d, kw_dram, get_write_ptr(cb_kw) + d * kTile);
@@ -170,6 +178,9 @@ void kernel_main() {
         noc_semaphore_wait_min(q_sem, l + 1);
         mark(l, 1);
         push_resident(cb_q, Dt);
+        if (role == 1) {
+            read_blocks(early, ch.n);
+        }
         noc_semaphore_wait_min(M_sem, l + 1);
         mark(l, 2);
         push_resident(cb_M, 1);

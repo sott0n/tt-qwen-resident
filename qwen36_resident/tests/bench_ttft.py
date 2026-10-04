@@ -17,6 +17,7 @@ from models.experimental.qwen36_resident.tests import qwen36_weights as Q
 from models.experimental.qwen36_resident.tests.resident_model import Dims, ResidentModel, State
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/resident_ttft.jsonl")
+DECODE_STEPS = int(os.environ.get("RESIDENT_DECODE_STEPS", "32"))
 
 
 @pytest.mark.parametrize(
@@ -36,7 +37,7 @@ def test_ttft(mesh_device):
     C = max(chunks)
     max_len = (max(prompts) + C - 1) // C * C
     w = Q.load(ck, d, layers, interval)
-    st = State(d, layers - n_attn, n_attn, 0, max_pos=max_len + 64, zero=True)
+    st = State(d, layers - n_attn, n_attn, 0, max_pos=max_len + 64 + DECODE_STEPS, zero=True)
     model = ResidentModel(mesh_device, d, w, st, layers, interval, lm_head=True)
     del w
     model.step(model.token_state(emb[0].float(), 0))  # compile outside the trace
@@ -61,6 +62,14 @@ def test_ttft(mesh_device):
             model.step(model.token_state(emb[ids[T]].float(), T))
             model.argmax()
             t3 = time.perf_counter()
+        # greedy decode after the prompt: one step and the argmax read-back per token
+        toks = [model.token_state(emb[ids[k % (T + 1)]].float(), T + 1 + k) for k in range(DECODE_STEPS)]
+        step_s = []
+        for tok in toks:
+            s0 = time.perf_counter()
+            model.step(tok)
+            model.argmax()
+            step_s.append(time.perf_counter() - s0)
         rec = dict(
             layers=layers,
             prompt=T,
@@ -70,6 +79,7 @@ def test_ttft(mesh_device):
             handoff_s=t2 - t1,
             first_step_s=t3 - t2,
             handoff_parts={k: round(v, 4) for k, v in parts.items()},
+            decode_ms_median=round(sorted(step_s)[len(step_s) // 2] * 1e3, 2),
         )
         logger.info(rec)
         with open(OUT, "a") as f:

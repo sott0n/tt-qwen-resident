@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Attention worker compute (see attn_common.hpp). Per attention layer:
-//   chunk worker: the partial attention of q over this core's KV chunk (a zero partial without one);
+//   chunk worker: the partial attention of q over this core's KV chunk, block by block with an online
+//     softmax (a zero partial without one);
 //   tail core: k = rope(rmsnorm_rows(k) * w_k), the new k / v row into the tail tiles, the partial over
 //     the tail tile (masked), then the tail tiles as bf8 for the DRAM write-back;
 // a group head adds its children's partials to its own.
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/eltwise_unary/fill.h"
+#include "api/compute/binary_max_min.h"
 #include "attn_compute_common.hpp"
 
 using namespace resident_attn;
@@ -33,6 +35,177 @@ FORCE_INLINE void zero_partial() {
     cb_push_back(cb_o, kPart);
 }
 
+// DEST tile 0 = row max of the block's nb score tiles
+FORCE_INLINE void block_max(uint32_t nb) {
+    reconfig_data_format(cb_s, cb_one);
+    reduce_init<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_s, cb_one, cb_mrun);
+    for (uint32_t j = 0; j < nb; j++) {
+        reduce_tile<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_s, cb_one, j, 0, 0);
+    }
+    reduce_uninit();
+}
+
+// cb_p = exp(s - m) over the block (m: column 0 of m_cb's front tile); consumes cb_s
+FORCE_INLINE void block_probs(uint32_t m_cb, uint32_t nb) {
+    cb_reserve_back(cb_p, chunk_max);
+    reconfig_data_format(cb_s, m_cb);
+    pack_reconfig_data_format(cb_p);
+    sub_bcast_cols_init(cb_s, m_cb);
+    exp_tile_init();
+    for (uint32_t j = 0; j < nb; j++) {
+        tile_regs_acquire();
+        sub_tiles_bcast_cols(cb_s, m_cb, j, 0, 0);
+        exp_tile(0, VectorMode::R);  // head rows live in the top faces
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(0, cb_p, j);
+        tile_regs_release();
+    }
+    cb_push_back(cb_p, chunk_max);
+    cb_pop_front(cb_s, chunk_max);
+}
+
+// DEST tile 0 = old * alpha (column broadcast); old is tile i of old_cb
+FORCE_INLINE void rescaled(uint32_t old_cb, uint32_t i) {
+    reconfig_data_format(old_cb, cb_alpha);
+    mul_bcast_cols_init(old_cb, cb_alpha);
+    mul_tiles_bcast_cols(old_cb, cb_alpha, i, 0, 0);
+}
+
+// one block of the online softmax: m = max(m, rowmax s), alpha = exp(m_old - m), p = exp(s - m),
+// o = o alpha + p v, l = l alpha + rowsum p (the first block starts from o = l = 0, alpha unused)
+FORCE_INLINE void online_block(uint32_t nb, bool first) {
+    cb_wait_front(cb_s, chunk_max);
+    cb_reserve_back(cb_mrun, 1);
+    if (!first) {
+        cb_reserve_back(cb_alpha, 1);
+    }
+    tile_regs_acquire();
+    block_max(nb);
+    if (!first) {
+        reconfig_data_format_srca(cb_mrun);
+        copy_init(cb_mrun);
+        copy_tile(cb_mrun, 0, 1);
+        binary_max_tile_init();
+        binary_max_tile(0, 1, 2);
+        sub_binary_tile_init();
+        sub_binary_tile(1, 2, 3);
+        exp_tile_init();
+        exp_tile(3, VectorMode::R);
+    }
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_reconfig_data_format(cb_mrun);
+    pack_tile(first ? 0 : 2, cb_mrun);
+    if (!first) {
+        pack_reconfig_data_format(cb_alpha);
+        pack_tile(3, cb_alpha);
+    }
+    tile_regs_release();
+    cb_push_back(cb_mrun, 1);
+    if (!first) {
+        cb_push_back(cb_alpha, 1);
+        cb_pop_front(cb_mrun, 1);
+        cb_wait_front(cb_alpha, 1);
+    }
+    cb_wait_front(cb_mrun, 1);
+    block_probs(cb_mrun, nb);
+
+    cb_wait_front(cb_p, chunk_max);
+    cb_reserve_back(cb_orun, Dt);
+    pack_reconfig_data_format(cb_orun);
+    for (uint32_t d = 0; d < Dt; d++) {
+        tile_regs_acquire();
+        if (!first) {
+            rescaled(cb_orun, d);
+        }
+        reconfig_data_format(cb_v, cb_p);
+        matmul_init(cb_p, cb_v, 0);
+        for (uint32_t j = 0; j < nb; j++) {
+            matmul_tiles(cb_p, cb_v, j, j * Dt + d, 0);
+        }
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(0, cb_orun, d);
+        tile_regs_release();
+    }
+    cb_push_back(cb_orun, Dt);
+    cb_reserve_back(cb_lrun, 1);
+    pack_reconfig_data_format(cb_lrun);
+    tile_regs_acquire();
+    if (!first) {
+        rescaled(cb_lrun, 0);
+    }
+    reconfig_data_format(cb_one, cb_p);
+    reduce_init<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_p, cb_one, cb_lrun);
+    for (uint32_t j = 0; j < nb; j++) {
+        reduce_tile<PoolType::SUM, ReduceDim::REDUCE_ROW>(cb_p, cb_one, j, 0, 0);
+    }
+    reduce_uninit();
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_tile(0, cb_lrun);
+    tile_regs_release();
+    cb_push_back(cb_lrun, 1);
+    if (!first) {
+        cb_pop_front(cb_orun, Dt);
+        cb_pop_front(cb_lrun, 1);
+        cb_pop_front(cb_alpha, 1);
+    }
+    cb_pop_front(cb_p, chunk_max);
+}
+
+// sends m (cb_m), then with the global row max M: partial (o, l) * exp(m - M)
+FORCE_INLINE void online_finish() {
+    cb_reserve_back(cb_m, 1);
+    tile_regs_acquire();
+    reconfig_data_format_srca(cb_mrun);
+    copy_init(cb_mrun);
+    copy_tile(cb_mrun, 0, 0);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_reconfig_data_format(cb_m);
+    pack_tile(0, cb_m);
+    tile_regs_release();
+    cb_push_back(cb_m, 1);
+
+    cb_wait_front(cb_M, 1);
+    cb_reserve_back(cb_alpha, 1);
+    tile_regs_acquire();
+    copy_init(cb_mrun);
+    copy_tile(cb_mrun, 0, 0);
+    reconfig_data_format_srca(cb_M);
+    copy_init(cb_M);
+    copy_tile(cb_M, 0, 1);
+    sub_binary_tile_init();
+    sub_binary_tile(0, 1, 0);
+    exp_tile_init();
+    exp_tile(0, VectorMode::R);
+    tile_regs_commit();
+    tile_regs_wait();
+    pack_reconfig_data_format(cb_alpha);
+    pack_tile(0, cb_alpha);
+    tile_regs_release();
+    cb_push_back(cb_alpha, 1);
+    cb_wait_front(cb_alpha, 1);
+
+    cb_reserve_back(cb_o, kPart);
+    pack_reconfig_data_format(cb_o);
+    for (uint32_t d = 0; d < kPart; d++) {
+        tile_regs_acquire();
+        rescaled(d < Dt ? cb_orun : cb_lrun, d < Dt ? d : 0);
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile<true>(0, cb_o, d);
+        tile_regs_release();
+    }
+    cb_push_back(cb_o, kPart);
+    cb_pop_front(cb_orun, Dt);
+    cb_pop_front(cb_lrun, 1);
+    cb_pop_front(cb_mrun, 1);
+    cb_pop_front(cb_alpha, 1);
+    cb_pop_front(cb_M, 1);
+}
 }  // namespace
 
 void kernel_main() {
@@ -46,13 +219,16 @@ void kernel_main() {
         for (uint32_t l = 0; l < layers; l++) {
             cb_wait_front(cb_q, Dt);
             if (n_tiles > 0) {
-                cb_wait_front(cb_k, chunk_max * Dt);
-                cb_wait_front(cb_v, chunk_max * Dt);
-                scores(cb_q, cb_k, 0, n_tiles, false);
-                row_max(n_tiles);
-                probs_and_partial(cb_v, 0, n_tiles);
-                cb_pop_front(cb_k, chunk_max * Dt);
-                cb_pop_front(cb_v, chunk_max * Dt);
+                for (uint32_t b0 = 0; b0 < n_tiles; b0 += chunk_max) {
+                    const uint32_t nb = n_tiles - b0 < chunk_max ? n_tiles - b0 : chunk_max;
+                    cb_wait_front(cb_k, chunk_max * Dt);
+                    cb_wait_front(cb_v, chunk_max * Dt);
+                    scores(cb_q, cb_k, 0, nb, false);
+                    online_block(nb, b0 == 0);
+                    cb_pop_front(cb_k, chunk_max * Dt);
+                    cb_pop_front(cb_v, chunk_max * Dt);
+                }
+                online_finish();
             } else {
                 cb_wait_front(cb_M, 1);
                 zero_partial();

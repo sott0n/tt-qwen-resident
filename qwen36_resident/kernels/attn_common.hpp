@@ -11,22 +11,25 @@
 //           tile (the KV tile holding this position, positions tp * 32 .. tp * 32 + 31), read from the
 //           set's DRAM cache and written back as bf8 (bf8 shares exponents within a row, so the other
 //           rows round-trip exactly); its chunk is the tail tile (causal mask on the columns past r);
-//   workers: each owns a chunk of the complete KV tiles in DRAM (prefetched before q arrives), derived
-//           from the position; a worker without one sends a zero partial and a -inf row max;
+//   workers: each owns a chunk of the complete KV tiles in DRAM, derived from the position, streamed in
+//           blocks of chunk_max tiles (the first block prefetched before q arrives); a worker without one
+//           sends a zero partial and a -inf row max;
 // The KV cache of a layer copy is DRAM height-sharded over the banks: position tile t (Dt bf8 tiles,
 // one kv_row of bytes) lives in bank t % banks at row t / banks of that bank's shard, copies at a fixed
 // per-bank stride. Chunk worker w (of workers - 1) takes bank w % L (L = banks holding complete
 // tiles) and, as worker j of the J on that bank, rows j, j + J, ..., so each bank sees one stream.
 // The position, and the rope tables of it, come from the token state (see streamer_common.hpp).
-//   every worker: s = q k^T, sends its row max to the leader, receives the global row max M, then
-//           p = exp(s - M), partial o = p v and l = rowsum(p); the partials are summed up a tree (a
+//   every worker: online softmax over its blocks (s = q k^T, running row max m, p = exp(s - m), o and
+//           l = rowsum(p) rescaled by exp(m_old - m_new) as m grows), sends m to the leader, receives the
+//           global row max M and scales o and l by exp(m - M) into its partial (the tail core has one
+//           tile: p = exp(s - M) directly); the partials are summed up a tree (a
 //           group head adds its children's partials to its own and sends the sum on; the group heads'
 //           sums go to the leader), sending only the top two faces of each tile (head rows < 16);
 //   leader: o = sum of the partials / row sum * gs, written into every streamer.
 // All attention tiles are 32x32 with head h in row h (heads <= 32 rows).
 //
 // Compile-time args (all attention-core kernels): 0 attention layers, 1 copies, 2 workers, 3 num_streamers,
-// 4 chunk_tiles_max (KV tiles per worker chunk, CB sizing), 5 heads, 6 Dt (head_dim tiles),
+// 4 kv_block (KV tiles per streamed block of a worker's chunk, CB sizing), 5 heads, 6 Dt (head_dim tiles),
 // 7 rot_tiles (rotated head_dim tiles), 8 sem_rows, 9 sem_q, 10 sem_m, 11 sem_M, 12 sem_part, 13 sem_heads
 // (the streamers' head-output semaphore), 14 eps bits, 15 sem_addr (a worker learns the leader's partial
 // buffer address through it), 16 fanin (partial slots per node of the reduction tree), 17 banks,
@@ -42,7 +45,7 @@ constexpr uint32_t layers = get_compile_time_arg_val(0);
 constexpr uint32_t copies = get_compile_time_arg_val(1);
 constexpr uint32_t workers = get_compile_time_arg_val(2);
 constexpr uint32_t num_streamers = get_compile_time_arg_val(3);
-constexpr uint32_t chunk_max = get_compile_time_arg_val(4);
+constexpr uint32_t chunk_max = get_compile_time_arg_val(4);  // KV tiles per streamed block
 constexpr uint32_t heads = get_compile_time_arg_val(5);
 constexpr uint32_t Dt = get_compile_time_arg_val(6);
 constexpr uint32_t rot_tiles = get_compile_time_arg_val(7);
@@ -71,15 +74,20 @@ constexpr uint32_t kKvRow = Dt * kKvTile;  // one position tile of k (or v) in t
 
 // shared CBs
 constexpr uint32_t cb_q = 0;  // worker: q (Dt tiles, multicast target); leader: its own copy of q
-constexpr uint32_t cb_k = 1;  // worker: KV chunk, 2 x chunk_max x Dt bf8 tiles
+constexpr uint32_t cb_k = 1;  // worker: KV blocks of its chunk, 2 x chunk_max x Dt bf8 tiles
 constexpr uint32_t cb_v = 2;
 constexpr uint32_t cb_M = 3;    // global row max (1 tile, multicast target)
 constexpr uint32_t cb_one = 4;  // reduce scaler 1.0
-constexpr uint32_t cb_s = 5;    // scores (fp32), chunk_max tiles
-constexpr uint32_t cb_p = 6;    // exp(s - M), chunk_max tiles
+constexpr uint32_t cb_s = 5;    // scores (fp32) of one block, chunk_max tiles
+constexpr uint32_t cb_p = 6;    // exp(s - M) of one block, chunk_max tiles
 constexpr uint32_t cb_m = 7;    // this core's row max
 constexpr uint32_t cb_o = 8;    // this core's partial (kPart tiles)
 constexpr uint32_t cb_ntiles = 10;  // worker: its chunk's KV tiles (one uint32, for compute and writer)
+// chunk worker: online-softmax state over the chunk's blocks (fp32): output, row sum, row max, rescale
+constexpr uint32_t cb_orun = 9;    // 2 x Dt
+constexpr uint32_t cb_lrun = 15;   // 2
+constexpr uint32_t cb_mrun = 24;   // 2
+constexpr uint32_t cb_alpha = 26;  // 1
 // leader / tail-core CBs
 constexpr uint32_t cb_q_mc = 9;   // q for the multicast
 constexpr uint32_t cb_qraw = 10;  // q rows as placed from the streamers' row
