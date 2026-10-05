@@ -54,12 +54,25 @@ card:
   description: >
     Qwen3.6-27B on four Blackhole P150 chips with a resident decode design: one persistent program per
     chip runs the whole decode step, and a pipeline-parallel prefill hands its state to it on device.
-  performance: >
-    Teacher-forced token accuracy 99.41% top-1 / 100% top-5 against the Hugging Face reference (512
-    scored tokens). Through vLLM on p150x4: 51 tok/s end to end on a 231-token greedy reply.
+  performance: |
+    Served through vLLM by this package on p150x4: one user, greedy, 128 generated tokens, measured
+    from a streaming client.
+
+    | Prompt (tokens) | Time to first token | Decode |
+    | --- | --- | --- |
+    | 128 | 0.17 s | 83 tok/s (12.0 ms/token) |
+    | 2,048 | 0.45 s | 83 tok/s (12.1 ms/token) |
+    | 8,192 | 1.16 s | 81 tok/s (12.3 ms/token) |
+    | 32,000 | 4.56 s | 74 tok/s (13.6 ms/token) |
+
+    Token accuracy, teacher-forced against the Hugging Face reference (512 scored tokens): 99.41% top-1,
+    100% top-5.
   limitations: >
     One user at a time (max_num_seqs 1). Text only: image and video input are not supported. Served
-    context is 32768 tokens. Sampling runs on the host from full logits, which costs decode speed.
+    context is 32,768 tokens. The decode speed above holds for greedy requests (temperature 0 or
+    top_k 1, no penalties or logprobs): they are sampled on device and run asynchronously. Any other
+    request samples on the host from the full logits and runs synchronously: about 60 tok/s measured
+    on that path with greedy requests; stochastic sampling itself was not measured.
   architecture: 27B dense hybrid (48 Gated DeltaNet + 16 full-attention layers)
   status: Experimental
   out_of_scope_use: Image or video input; this port serves the language model only.
