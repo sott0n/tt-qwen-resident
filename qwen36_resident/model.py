@@ -26,7 +26,7 @@ import torch
 
 import ttnn
 from qwen36_resident import PKG_DIR
-from qwen36_resident.tests.bench_resident_mlp import (
+from qwen36_resident.common import (
     EPS,
     HIDDEN,
     INTER,

@@ -249,7 +249,10 @@ At batch 32 the total is 7% below the demo, because sub-batches do not share the
 qwen36_resident/
   kernels/   resident decode kernels (streamers, GDN heads, attention, hub)
   prefill/   pipeline-parallel prefill (pp_prefill.py) and its kernels
-  tests/     model builder (resident_model.py), accuracy tests and benchmarks
+  model.py   resident decode model builder
+  weights.py checkpoint -> per-chip weights
+  common.py  dimensions and streamer layout helpers
+  tests/     accuracy tests and benchmarks
 patches/     changes to tt-metal's ttnn this code needs (applied to the submodule)
 tt-metal/    submodule, pinned to the tt-metal commit this code is built against
 ```

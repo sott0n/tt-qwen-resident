@@ -9,7 +9,7 @@ import torch
 
 import ttnn
 from qwen36_resident.prefill.pp_prefill import PPPrefill
-from qwen36_resident.tests import qwen36_weights as Q
+from qwen36_resident import weights as Q
 
 
 @pytest.mark.parametrize(

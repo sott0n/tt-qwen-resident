@@ -19,7 +19,7 @@ from qwen36_resident.prefill.pp_prefill import (
     Z0,
     PPPrefill,
 )
-from qwen36_resident.tests.resident_model import (
+from qwen36_resident.model import (
     DK,
     DV,
     HD,

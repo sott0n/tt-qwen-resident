@@ -38,7 +38,7 @@ def weights(L, real):
         mk = lambda k, n: torch.randn(k, n, generator=g) / math.sqrt(k)
         return [dict(G=mk(HIDDEN, INTER), U=mk(HIDDEN, INTER), D=mk(INTER, HIDDEN)) for _ in range(L)]
     from qwen36_resident.prefill import pp_weights as PW
-    from qwen36_resident.tests import qwen36_weights as QW
+    from qwen36_resident import weights as QW
 
     ck = QW.Checkpoint()
     return [{k: v.float() for k, v in PW.mlp(ck, i).items()} for i in range(L)]
@@ -48,7 +48,7 @@ def inputs(C, real):
     g = torch.Generator().manual_seed(0)
     if not real:
         return torch.randn(C, HIDDEN, generator=g).bfloat16().float()
-    from qwen36_resident.tests import qwen36_weights as QW
+    from qwen36_resident import weights as QW
 
     e = QW.embedding(QW.Checkpoint())
     return e[torch.randint(0, e.shape[0], (C,), generator=g)].bfloat16().float()

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Qwen3.6-27B checkpoint -> the per-chip weights of the resident decode model (see resident_model.py).
+"""Qwen3.6-27B checkpoint -> the per-chip weights of the resident decode model (see model.py).
 
 TP over n chips: chip c holds GDN key heads [4c, 4c+4) and value heads [12c, 12c+12), attention query heads
 [6c, 6c+6) and KV head c, MLP columns [c*I/n, (c+1)*I/n) and lm_head vocab columns [c*V/n, (c+1)*V/n).
@@ -8,20 +8,22 @@ The (1 + w) RMSNorm weights are folded into the rows of the projection that foll
 """
 import json
 import os
-from glob import glob
 
 import torch
+from huggingface_hub import snapshot_download
 from safetensors import safe_open
 
-from qwen36_resident.tests.resident_model import DK, DV, HD, NK, NQ, NV, is_attn
+from qwen36_resident.model import DK, DV, HD, NK, NQ, NV, is_attn
 
 PREFIX = "model.language_model."
 
 
-def checkpoint_dir(model="Qwen/Qwen3.6-27B"):
-    root = os.path.expanduser(f"~/.cache/huggingface/hub/models--{model.replace('/', '--')}/snapshots/")
-    (snap,) = glob(root + "*/")
-    return snap
+def checkpoint_dir(model=None):
+    """a local checkpoint directory: HF_MODEL (a path or a repo id) else Qwen/Qwen3.6-27B, from the HF cache"""
+    model = model or os.environ.get("HF_MODEL", "Qwen/Qwen3.6-27B")
+    if os.path.isdir(model):
+        return model
+    return snapshot_download(model, local_files_only=True)
 
 
 class Checkpoint:

@@ -3,7 +3,7 @@
 """Full-layer (untiled by TP) Qwen3.6-27B weights for the pipeline-parallel prefill (see pp_prefill.py).
 
 The (1 + w) RMSNorm weights are folded into the rows of the projection that follows them, as for the
-resident decode (tests/qwen36_weights.py); column orders:
+resident decode (weights.py); column orders:
   GDN in-projection   q (16 x 128) | k (16 x 128) | v (48 x 128) | z (48 x 128) | a (48) | b (48)
   attention in-proj   q (24 x 256) | gate (24 x 256) | k (4 x 256) | v (4 x 256)
   MLP                 gate, up, down
@@ -11,8 +11,8 @@ The GDN output norm's weight (per head dim) is folded into the out-projection ro
 """
 import torch
 
-from qwen36_resident.tests.qwen36_weights import _fold
-from qwen36_resident.tests.resident_model import DV, HD, NQ, NV, is_attn
+from qwen36_resident.weights import _fold
+from qwen36_resident.model import DV, HD, NQ, NV, is_attn
 
 VD = NV * DV
 

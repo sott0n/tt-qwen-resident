@@ -30,8 +30,8 @@ from qwen36_resident import PKG_DIR
 from models.demos.blackhole.qwen36.tt import tp_common as tpc
 from qwen36_resident.prefill import pp_weights as PW
 from qwen36_resident.prefill.smm import SmallMatmul
-from qwen36_resident.tests.bench_resident_mlp import EPS, HIDDEN, INTER
-from qwen36_resident.tests.resident_model import (
+from qwen36_resident.common import EPS, HIDDEN, INTER
+from qwen36_resident.model import (
     CONV_K,
     DK,
     DV,
