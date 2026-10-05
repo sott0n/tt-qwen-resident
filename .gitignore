@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 generated/
 .pytest_cache/
+.venv-vllm/
+.serve/
