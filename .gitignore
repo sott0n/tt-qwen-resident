@@ -4,3 +4,4 @@ generated/
 .pytest_cache/
 .venv-vllm/
 .serve/
+.tt-metal-cache/

@@ -1,0 +1,64 @@
+# Container (v5.1) package of the resident Qwen3.6-27B for tt-model:
+#   tt-model package --container tt-model.yaml --out ~/tt-model-builds
+schema: "5.1"
+
+repo: kyamaguchi/qwen3.6-27b-resident
+name: qwen3.6-27b-resident
+weights: {repo: Qwen/Qwen3.6-27B, revision: 6a9e13bd6fc8f0983b9b99948120bc37f49c13e9}
+kind: vllm-plugin
+arch: blackhole
+
+source:
+  # the submodule with patches/ applied: the prefill needs the patched chunk_gated_delta_rule op
+  tt_metal: /home/kyamaguchi/tt-qwen-resident/tt-metal
+  code:
+    - models/common                                   # utility_functions, imported by tp_common
+    - models/demos/blackhole/qwen36/tt/tp_common.py   # prefill MLP matmul program configs
+  extra_code:
+    - root: /home/kyamaguchi/tt-qwen-resident
+      paths:
+        - qwen36_resident/__init__.py
+        - qwen36_resident/common.py
+        - qwen36_resident/model.py
+        - qwen36_resident/weights.py
+        - qwen36_resident/generator_vllm.py
+        - qwen36_resident/kernels                     # JIT-compiled at serve time
+        - qwen36_resident/prefill
+        - qwen36_resident/vllm_models                 # covers extra_models_dir
+  ubuntu: "22.04"
+  python: "3.10"
+
+runtime:
+  vllm: {version: "0.26.0"}
+  plugin: {path: /home/kyamaguchi/vllm-tt-plugin}     # at 3506696, the validated commit
+  extra_models_dir: qwen36_resident/vllm_models
+
+serve:
+  hardware: p150x4
+  mesh_device: P150x4
+  max_num_seqs: 1          # the prefill hands its state to a batch-1 decode model only
+  block_size: 64
+  max_model_len: 32768
+  additional_config:
+    tt:
+      trace_region_size: 134217728   # decode trace plus one prefill trace per chunk size
+
+verify:
+  - "from qwen36_resident.generator_vllm import Qwen36ResidentForCausalLM; assert Qwen36ResidentForCausalLM"
+  - "from pathlib import Path; assert Path('/opt/tt-metal/qwen36_resident/kernels/streamer_reader.cpp').is_file(), 'decode kernels missing'"
+  - "from pathlib import Path; assert Path('/opt/tt-metal/qwen36_resident/prefill/kernels/handoff.cpp').is_file(), 'prefill kernels missing'"
+
+card:
+  description: >
+    Qwen3.6-27B on four Blackhole P150 chips with a resident decode design: one persistent program per
+    chip runs the whole decode step, and a pipeline-parallel prefill hands its state to it on device.
+  performance: >
+    Teacher-forced token accuracy 99.41% top-1 / 100% top-5 against the Hugging Face reference (512
+    scored tokens). Through vLLM on p150x4: 51 tok/s end to end on a 231-token greedy reply.
+  limitations: >
+    One user at a time (max_num_seqs 1). Text only: image and video input are not supported. Served
+    context is 32768 tokens. Sampling runs on the host from full logits, which costs decode speed.
+  architecture: 27B dense hybrid (48 Gated DeltaNet + 16 full-attention layers)
+  status: Experimental
+  out_of_scope_use: Image or video input; this port serves the language model only.
+  license: {id: apache-2.0}
