@@ -1400,16 +1400,24 @@ class ResidentModel:
     def logits(self):
         """per-chip logits [n, vocab_chip] in vocab order, or [users, n, vocab_chip]"""
         B = self.batch
-        outs = []
-        for sub in self.subs:
-            raw = ttnn.to_torch(sub["logits"], mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
-            raw = raw.reshape(self.d.n, self.S, B, -1)
-            out = torch.zeros(B, self.d.n, self.d.vocab)
+        if not hasattr(self, "_vocab_src"):
+            # vocab column -> (streamer, column in its slice); one gather instead of a loop per streamer
+            src_i = torch.full((self.d.vocab,), -1, dtype=torch.long)
+            src_w = torch.zeros(self.d.vocab, dtype=torch.long)
             for i in range(self.S):
                 bank, j = divmod(i, PER_BANK)
                 cnt, first = self.nv_split[j]
                 c0 = (bank * self.v_bank + first) * TILE
-                out[:, :, c0 : c0 + cnt * TILE] = raw[:, i, :, : cnt * TILE].permute(1, 0, 2)
+                src_i[c0 : c0 + cnt * TILE] = i
+                src_w[c0 : c0 + cnt * TILE] = torch.arange(cnt * TILE)
+            self._vocab_src = (src_i.clamp(min=0), src_w, src_i < 0)
+        src_i, src_w, unset = self._vocab_src
+        outs = []
+        for sub in self.subs:
+            raw = ttnn.to_torch(sub["logits"], mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
+            raw = raw.reshape(self.d.n, self.S, B, -1)
+            out = raw[:, src_i, :, src_w].permute(2, 1, 0)  # [vocab, n, B] -> [B, n, vocab]
+            out[:, :, unset] = 0
             outs.append(out)
         out = torch.cat(outs)
         return out[0] if self.users == 1 else out
