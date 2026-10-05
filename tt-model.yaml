@@ -43,6 +43,7 @@ serve:
     tt:
       trace_region_size: 134217728   # decode trace plus one prefill trace per chunk size
       sample_on_device_mode: decode_only   # greedy decode steps read the device argmax
+  args: [--async-scheduling]   # greedy steps are submitted before the previous token is read back
 
 verify:
   - "from qwen36_resident.generator_vllm import Qwen36ResidentForCausalLM; assert Qwen36ResidentForCausalLM"
