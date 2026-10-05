@@ -399,10 +399,13 @@ def bf16_bits(t):
 
 
 class ResidentModel:
-    def __init__(self, mesh, d, w, st, layers, interval, lm_head=False, timeline=False, packet_bytes=4096):
+    def __init__(
+        self, mesh, d, w, st, layers, interval, lm_head=False, timeline=False, packet_bytes=4096, embed=None
+    ):
         """st: the decode state (State), or one State per user for a batch of len(st) users. More than 8 users
         run as sub-batches of 8, one launch each (the launches share the weights and buffers, each has its
-        own decode state)"""
+        own decode state). embed (the embedding table on device, one row per page; batch 1 with the lm_head):
+        each step also writes the next step's token state from its own greedy token (step(None))"""
         self.mesh, self.d, self.layers, self.interval, self.lm_head = mesh, d, layers, interval, lm_head
         sts_all = list(st) if isinstance(st, (list, tuple)) else [st]
         n_sub = -(-len(sts_all) // 8)
@@ -698,6 +701,17 @@ class ResidentModel:
             if lm_head
             else None
         )
+        # feed: the hubs' candidate slots, their semaphore and launch counters, the rope tiles of every
+        # position (a page per position, laid out as in the token state) and the (token, position) out word
+        self.feed = embed is not None
+        if self.feed:
+            assert lm_head and B == 1 and n_sub == 1, "the hub feeds batch 1 with the lm_head"
+            self.embed = embed
+            self.cand_t = l1(torch.zeros(1, n * 4, dtype=torch.int32), hub_grid, [1, n * 4], ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
+            self.feed_sems = [ttnn.create_global_semaphore(mesh, hub_grid, 0) for _ in range(2)]  # candidates, launches
+            rope = rope_words(sts[0].max_pos).reshape(sts[0].max_pos, -1).view(np.int32)
+            self.rope_t = dram_t(torch.from_numpy(rope.copy()), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, rep)
+            self.out_t = dram_t(torch.zeros(1, 16, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, rep)
 
         # ---- optional timelines
         def ts_buf(grid_, count, words):
@@ -827,7 +841,7 @@ class ResidentModel:
             x_views = HIDDEN * B // (TILE * TILE)
             cbs.append(cb(0, hub_grid, 2 * n * x_views))
             cbs.append(cb(2, hub_grid, x_views))
-            cbs.append(cb(1, hub_grid, 1, page=hub_headers * 160 + 16))
+            cbs.append(cb(1, hub_grid, 1, page=(hub_headers + 2 * self.feed) * 160 + 16))
             if B > 1:
                 cbs += [cb(32, grid, 1), cb(33, grid, 1), cb(34, grid, 2, *f32), cb(35, grid, 1, *f32), cb(38, grid, 1)]
             if lm_head:
@@ -1056,14 +1070,26 @@ class ResidentModel:
                     )
                     cr[c.x][c.y] = [ng, nd, bank * ht_bank + dfirst, nqg, nqa, n_conv, nvv, ts_addr]
 
-                hub_rt = ttnn.RuntimeArgs()
-                hub_rt[hub.x][hub.y] = [
+                hub_args = [
                     sub["x"].buffer_address(),
                     *[ttnn.get_global_semaphore_address(s) for s in self.ccl_sems],
                     0,
                 ] + rect_cover(mesh, cores)
                 hub_ct = [n, chip, HIDDEN * 2 * B, packet_bytes, 2 * layers, S, SEM_GATHER, SEM_SLOTS]
                 hub_ct += [SEM_FLAG, int(lm_head), 1, 1, SEM_ADDR]
+                hub_ct += [int(self.feed), sts[0].max_pos, self.tok_words * 4, self.rope_off, 3 * 2048]
+                if self.feed:
+                    hub_args += [
+                        sub["argmax"].buffer_address(),
+                        self.cand_t.buffer_address(),
+                        *[ttnn.get_global_semaphore_address(s) for s in self.feed_sems],
+                        tok_addr,
+                        self.embed.buffer_address(),
+                        self.rope_t.buffer_address(),
+                        self.out_t.buffer_address(),
+                    ]
+                hub_rt = ttnn.RuntimeArgs()
+                hub_rt[hub.x][hub.y] = hub_args
 
                 # GDN heads
                 hr, hw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
@@ -1201,6 +1227,8 @@ class ResidentModel:
             io += self._keep
             if lm_head:
                 io += [sub["logits"], sub["argmax"]]
+            if self.feed:
+                io += [self.cand_t, self.rope_t, self.out_t, self.embed]
             if timeline:
                 io.append(self.ts_t)
             return mesh_pd, io
@@ -1360,6 +1388,11 @@ class ResidentModel:
         for host, dev in self._initial:
             ttnn.copy_host_to_device_tensor(host, dev)
         ttnn.synchronize_device(self.mesh)
+        if self.feed:
+            # a feeding hub counts monotonically from its launch counter; zero them all while idle
+            for s in self.ccl_sems + self.feed_sems:
+                ttnn.reset_global_semaphore_value(s, 0)
+            ttnn.synchronize_device(self.mesh)
 
     def capture_trace(self):
         """record the step's launches into a trace (the device needs a trace region): step() then replays it,
@@ -1376,8 +1409,10 @@ class ResidentModel:
             self.trace_id = None
 
     def step(self, tok_host):
-        for t, sub in zip(tok_host if isinstance(tok_host, list) else [tok_host], self.subs):
-            ttnn.copy_host_to_device_tensor(t, sub["tok"])
+        """tok_host None (feed): the token state the previous step wrote"""
+        if tok_host is not None:
+            for t, sub in zip(tok_host if isinstance(tok_host, list) else [tok_host], self.subs):
+                ttnn.copy_host_to_device_tensor(t, sub["tok"])
         if getattr(self, "trace_id", None) is not None:
             ttnn.execute_trace(self.mesh, self.trace_id, cq_id=0, blocking=False)
         else:
@@ -1399,6 +1434,11 @@ class ResidentModel:
         o = ttnn.to_torch(self.o_in_t, mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0)).float()
         o = o.reshape(self.d.n, self.S, self.batch, -1)[:, 0]
         return o[:, 0] if self.batch == 1 else o
+
+    def fed_token(self):
+        """(token, position) the last step fed into the next one (feed)"""
+        out = ttnn.to_torch(ttnn.get_device_tensors(self.out_t)[0]).reshape(-1)
+        return int(out[0]), int(out[1])
 
     def argmax(self):
         """vocab index of the largest logit (the first one on ties) from the streamers' candidates; a list

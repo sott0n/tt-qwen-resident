@@ -255,6 +255,7 @@ void kernel_main() {
             noc_async_write(
                 get_write_ptr(cb_pout), get_noc_addr(hub_x, hub_y, argmax_addr + core * batch * 16), batch * 16);
             noc_async_write_barrier();
+            noc_semaphore_inc(hub_gather_sem, 1);  // the record is on the hub (a feeding hub waits for it)
         }
     }
     noc_async_atomic_barrier();

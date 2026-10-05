@@ -26,6 +26,18 @@
 // streamers' x address into sem_addr and the hub multicasts its slots address into the streamers'
 // sem_addr. The hub's compute sums each round's slots into CB 2 and only x is multicast. Arg 0 is then a
 // DRAM buffer (0 = none) that gets the last layer's x, arg 3 is unused.
+//
+// feed (batch 1, with the lm_head): after the last layer the hub writes the next step's token state, so
+// steps can run back to back with no host in between. It waits for the streamers' argmax records (one
+// more gather count each), reduces them to (order key, vocab id), exchanges that 16 B record with every
+// peer hub over fabric and picks the same token on every chip (largest key, then smallest id, the host's
+// rule). Then into tok (DRAM): ring + 1 and pos + 1, the token's embedding row as x0 and the rope tiles of
+// pos + 1; into out: (token, pos + 1). Counts on the global semaphores are monotonic: a peer can start
+// the next step and count into this chip before this hub ends, so nothing is reset here. A per-hub
+// launch counter gives each launch its base; the host zeroes all of them while the device is idle.
+// Compile-time args 13 feed, 14 max_pos, 15 tok page bytes, 16 rope offset in tok, 17 rope bytes.
+// Runtime args (feed), after the rectangles: argmax records, candidate slots (L1, num_chips x 16 B, same
+// address on every chip), candidate semaphore, launch counter, tok, embedding table, rope table, out.
 
 #include <cstdint>
 
@@ -48,8 +60,13 @@ constexpr uint32_t sem_flag = get_compile_time_arg_val(8);
 constexpr uint32_t cb_headers = get_compile_time_arg_val(10);
 constexpr bool published = get_compile_time_arg_val(11) != 0;
 constexpr uint32_t sem_addr = get_compile_time_arg_val(12);
+constexpr bool feed = get_compile_time_arg_val(13) != 0;
+constexpr uint32_t max_pos = get_compile_time_arg_val(14);
+constexpr uint32_t tok_bytes = get_compile_time_arg_val(15);
+constexpr uint32_t rope_off = get_compile_time_arg_val(16);
+constexpr uint32_t rope_bytes = get_compile_time_arg_val(17);
 constexpr uint32_t packets_per_vector = (vector_bytes + packet_bytes - 1) / packet_bytes;
-constexpr uint32_t num_headers = 2 * packets_per_vector * 2;
+constexpr uint32_t num_headers = 2 * packets_per_vector * 2 + (feed ? 2 : 0);
 constexpr bool pooled = num_headers <= NUM_PACKET_HEADERS / MaxDMProcessorsPerCoreType;
 
 void kernel_main() {
@@ -66,6 +83,18 @@ void kernel_main() {
     const uint32_t rects = get_arg_val<uint32_t>(arg_idx++);
     const size_t rect_args = arg_idx;
     arg_idx += 5 * rects;
+    uint32_t argmax_addr = 0, cand_addr = 0, cand_sem_addr = 0, launch_addr = 0;
+    uint32_t tok_addr = 0, embed_addr = 0, rope_addr = 0, out_addr = 0;
+    if constexpr (feed) {
+        argmax_addr = get_arg_val<uint32_t>(arg_idx++);
+        cand_addr = get_arg_val<uint32_t>(arg_idx++);
+        cand_sem_addr = get_arg_val<uint32_t>(arg_idx++);
+        launch_addr = get_arg_val<uint32_t>(arg_idx++);
+        tok_addr = get_arg_val<uint32_t>(arg_idx++);
+        embed_addr = get_arg_val<uint32_t>(arg_idx++);
+        rope_addr = get_arg_val<uint32_t>(arg_idx++);
+        out_addr = get_arg_val<uint32_t>(arg_idx++);
+    }
     const uint32_t flag_addr = get_semaphore(sem_flag);
     auto fabric =
         FabricConnectionManager::build_from_args<FabricConnectionManager::BUILD_AND_OPEN_CONNECTION_START_ONLY>(
@@ -100,6 +129,19 @@ void kernel_main() {
             }
         }
     }
+    volatile PACKET_HEADER_TYPE* cand_hdr[2] = {nullptr, nullptr};
+    if constexpr (feed) {
+        const uint64_t dst = get_noc_addr(my_x[0], my_y[0], cand_addr + chip * 16);
+        const uint64_t sem = get_noc_addr(my_x[0], my_y[0], cand_sem_addr);
+        for (uint32_t dir = 0; dir < 2; dir++) {
+            volatile PACKET_HEADER_TYPE* h = allocate();
+            h->to_chip_multicast(tt::tt_fabric::MulticastRoutingCommandHeader{
+                1, static_cast<uint8_t>(dir == 0 ? num_chips - 1 - chip : chip)});
+            h->to_noc_fused_unicast_write_atomic_inc(
+                tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem, 1, true}, 16);
+            cand_hdr[dir] = h;
+        }
+    }
     if (fabric.is_logically_connected()) {
         fabric.open_finish();
     }
@@ -131,6 +173,13 @@ void kernel_main() {
     }
 
     uint32_t expected[2] = {0, 0};
+    uint32_t launch = 0;
+    if constexpr (feed) {
+        volatile tt_l1_ptr uint32_t* launch_word = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(launch_addr);
+        invalidate_l1_cache();
+        launch = *launch_word;
+        expected[0] = expected[1] = launch * (layers / 2) * (num_chips - 1) * packets_per_vector;
+    }
     for (uint32_t l = 0; l < layers; l++) {
         const uint32_t par = l & 1;
         const uint32_t base = slots + par * num_chips * vector_bytes;
@@ -188,8 +237,70 @@ void kernel_main() {
         }
     }
     noc_async_write_barrier();
-    noc_semaphore_set(ccl_sem[0], 0);
-    noc_semaphore_set(ccl_sem[1], 0);
+    if constexpr (feed) {
+        // this step's records: one more gather count per streamer after its argmax write
+        noc_semaphore_wait_min(gather, num_streamers * (layers + 1));
+        invalidate_l1_cache();
+        volatile tt_l1_ptr uint32_t* rec = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(argmax_addr);
+        volatile tt_l1_ptr uint32_t* cand = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cand_addr);
+        auto better = [](uint32_t k, uint32_t i, uint32_t bk, uint32_t bi) { return k > bk || (k == bk && i < bi); };
+        uint32_t best_k = rec[0], best_i = rec[1];
+        for (uint32_t s = 1; s < num_streamers; s++) {
+            if (better(rec[4 * s], rec[4 * s + 1], best_k, best_i)) {
+                best_k = rec[4 * s];
+                best_i = rec[4 * s + 1];
+            }
+        }
+        cand[4 * chip] = best_k;
+        cand[4 * chip + 1] = best_i;
+        if constexpr (num_chips > 1) {
+            if (fabric.has_forward_connection()) {
+                perform_payload_send(fabric.get_forward_connection(), cand_addr + chip * 16, 16, cand_hdr[0]);
+            }
+            if (fabric.has_backward_connection()) {
+                perform_payload_send(fabric.get_backward_connection(), cand_addr + chip * 16, 16, cand_hdr[1]);
+            }
+            noc_semaphore_wait_min(
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cand_sem_addr), (launch + 1) * (num_chips - 1));
+            invalidate_l1_cache();
+        }
+        for (uint32_t c = 0; c < num_chips; c++) {
+            if (better(cand[4 * c], cand[4 * c + 1], best_k, best_i)) {
+                best_k = cand[4 * c];
+                best_i = cand[4 * c + 1];
+            }
+        }
+
+        // staging in the parity-1 slots: a peer writes there only after this chip's next round 0
+        const uint32_t stage = (slots + num_chips * vector_bytes + 63) & ~63u;
+        const uint32_t head = stage, x0 = stage + 64, rope = x0 + vector_bytes;
+        const InterleavedAddrGen<true> tok{.bank_base_address = tok_addr, .page_size = tok_bytes};
+        noc_async_read(tok.get_noc_addr(0), head, 64);
+        noc_async_read_barrier();
+        volatile tt_l1_ptr uint32_t* h = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head);
+        const uint32_t pos = h[1] + 1 < max_pos ? h[1] + 1 : max_pos - 1;
+        const InterleavedAddrGen<true> emb{.bank_base_address = embed_addr, .page_size = vector_bytes};
+        const InterleavedAddrGen<true> rtab{.bank_base_address = rope_addr, .page_size = rope_bytes};
+        noc_async_read(emb.get_noc_addr(best_i), x0, vector_bytes);
+        noc_async_read(rtab.get_noc_addr(pos), rope, rope_bytes);
+        noc_async_read_barrier();
+        h[0] = h[0] + 1;
+        h[1] = pos;
+        noc_async_write(head, tok.get_noc_addr(0), 64);
+        noc_async_write(x0, tok.get_noc_addr(0, 64), vector_bytes);
+        noc_async_write(rope, tok.get_noc_addr(0, rope_off), rope_bytes);
+        noc_async_write_barrier();
+        // out: (token, pos + 1), from the head block once its write to tok has left
+        h[0] = best_i;
+        h[1] = pos;
+        const InterleavedAddrGen<true> out{.bank_base_address = out_addr, .page_size = 64};
+        noc_async_write(head, out.get_noc_addr(0), 64);
+        noc_async_write_barrier();
+        *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(launch_addr) = launch + 1;
+    } else {
+        noc_semaphore_set(ccl_sem[0], 0);
+        noc_semaphore_set(ccl_sem[1], 0);
+    }
     if (fabric.is_logically_connected()) {
         fabric.close();
     }
