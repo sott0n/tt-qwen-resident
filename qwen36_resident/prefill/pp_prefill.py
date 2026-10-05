@@ -912,35 +912,22 @@ class PPPrefill:
 
     def reset(self):
         self._use(self.C)
+        if not hasattr(self, "_zeros"):
+            # built once: tilizing the zero tensors on the host costs ~0.4 s per reset
+            shard = ttnn.ShardTensorToMesh(self.mesh, dim=0)
+            z = lambda shape, dtype: ttnn.from_torch(
+                torch.zeros(shape), dtype=dtype, layout=ttnn.TILE_LAYOUT, mesh_mapper=shard
+            )
+            self._zeros = dict(
+                x={C: z((self.n, 1, C, HIDDEN), ttnn.bfloat16) for C in self._geo},
+                S=z((self.n, NV, DK, DV), ttnn.float32),
+                carry=z((self.n, 1, TILE, CONV_CH), ttnn.bfloat16),
+            )
         for C, geo in self._geo.items():
-            ttnn.copy_host_to_device_tensor(
-                ttnn.from_torch(
-                    torch.zeros(self.n, 1, C, HIDDEN),
-                    dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT,
-                    mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
-                ),
-                geo["x_last"],
-            )
+            ttnn.copy_host_to_device_tensor(self._zeros["x"][C], geo["x_last"])
         for j in self.S:
-            ttnn.copy_host_to_device_tensor(
-                ttnn.from_torch(
-                    torch.zeros(self.n, NV, DK, DV),
-                    dtype=ttnn.float32,
-                    layout=ttnn.TILE_LAYOUT,
-                    mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
-                ),
-                self.S[j],
-            )
-            ttnn.copy_host_to_device_tensor(
-                ttnn.from_torch(
-                    torch.zeros(self.n, 1, TILE, CONV_CH),
-                    dtype=ttnn.bfloat16,
-                    layout=ttnn.TILE_LAYOUT,
-                    mesh_mapper=ttnn.ShardTensorToMesh(self.mesh, dim=0),
-                ),
-                self.carry[j],
-            )
+            ttnn.copy_host_to_device_tensor(self._zeros["S"], self.S[j])
+            ttnn.copy_host_to_device_tensor(self._zeros["carry"], self.carry[j])
         ttnn.synchronize_device(self.mesh)
 
     def run(self, token_ids, timings=None, chunk=None):
