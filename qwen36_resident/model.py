@@ -360,6 +360,21 @@ def tile_bytes_rows_replicated(v):
     return np.concatenate([face_rows[0], face_rows[1], face_rows[0], face_rows[1]]).reshape(-1)
 
 
+def rope_words(n):
+    """[n, 3, 1024] uint16: for positions 0..n-1 the cos, sin and -sin tiles of rope_tables, as
+    tile_bytes_rows_replicated lays them out"""
+    inv = 1.0 / ROPE_THETA ** (torch.arange(0, ROT, 2, dtype=torch.float64) / ROT)
+    ang = torch.arange(n, dtype=torch.float64)[:, None] * inv
+    cos, sin = torch.cos(ang).float(), torch.sin(ang).float()
+    out = []
+    for v in (cos, sin, -sin):
+        b = v.bfloat16().view(torch.int16).numpy().astype(np.uint16)
+        lo = np.repeat(b[:, None, :16], 16, axis=1).reshape(n, -1)
+        hi = np.repeat(b[:, None, 16:], 16, axis=1).reshape(n, -1)
+        out.append(np.concatenate([lo, hi, lo, hi], axis=1))
+    return np.stack(out, axis=1)
+
+
 def tiny_order(mat):
     """[B, N] -> the elements of its batch x 32 tiles in device order (per tile: face 0 = columns 0..15 of
     every row, then face 1)"""
@@ -1220,11 +1235,12 @@ class ResidentModel:
             words[2 * i], words[2 * i + 1] = v & 0xFFFF, v >> 16
         words[TOK_X0 // 2 : TOK_X0 // 2 + B * HIDDEN] = bf16_bits(tiny_order(x0))
         r0 = self.rope_off // 2
+        if not hasattr(self, "_rope"):
+            # every position's tiles, built once: building them per token costs ~0.2 ms
+            self._rope = rope_words(self._sts[0].max_pos)
         for u in range(B):
-            cos, sin = rope_tables(pos[u])
-            for i, v in enumerate((cos, sin, -sin)):
-                o = r0 + (3 * u + i) * 1024
-                words[o : o + 1024] = tile_bytes_rows_replicated(v)
+            o = r0 + 3 * u * 1024
+            words[o : o + 3 * 1024] = self._rope[pos[u]].reshape(-1)
         t = torch.from_numpy(words.view(np.int32).copy()).reshape(1, -1)
         return ttnn.from_torch(
             t, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh)
