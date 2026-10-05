@@ -18,12 +18,12 @@ from qwen36_resident.model import DK, DV, HD, NK, NQ, NV, is_attn
 PREFIX = "model.language_model."
 
 
-def checkpoint_dir(model=None):
+def checkpoint_dir(model=None, revision=None):
     """a local checkpoint directory: HF_MODEL (a path or a repo id) else Qwen/Qwen3.6-27B, from the HF cache"""
     model = model or os.environ.get("HF_MODEL", "Qwen/Qwen3.6-27B")
     if os.path.isdir(model):
         return model
-    return snapshot_download(model, local_files_only=True)
+    return snapshot_download(model, revision=revision, local_files_only=True)
 
 
 class Checkpoint:

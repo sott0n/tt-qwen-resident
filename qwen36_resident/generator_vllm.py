@@ -55,7 +55,9 @@ class Qwen36ResidentForCausalLM:
     @classmethod
     def initialize_vllm_model(cls, hf_config, mesh_device, max_batch_size, max_seq_len, **kwargs):
         assert max_batch_size == 1, "the prefill hands its state to one decode user: serve with max_num_seqs=1"
-        ck = Q.Checkpoint(Q.checkpoint_dir(os.environ.get("HF_MODEL") or hf_config._name_or_path))
+        # the served revision: a cache filled for a pinned commit need not hold refs/main
+        path = Q.checkpoint_dir(os.environ.get("HF_MODEL") or hf_config._name_or_path, getattr(hf_config, "_commit_hash", None))
+        ck = Q.Checkpoint(path)
         logger.info(f"Building the resident Qwen3.6 model for up to {max_seq_len} tokens")
         return cls(mesh_device, ck, max_seq_len, mrope=uses_mrope(hf_config))
 
