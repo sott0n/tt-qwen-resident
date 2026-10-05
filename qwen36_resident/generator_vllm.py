@@ -25,7 +25,10 @@ class Qwen36ResidentForCausalLM:
     model_capabilities = {
         "supports_prefix_caching": False,
         "supports_async_decode": False,
-        "supports_sample_on_device": False,
+        # greedy decode steps take the device argmax; anything else samples on the host from the logits
+        "supports_sample_on_device": True,
+        "max_device_top_k": 1,
+        "supports_device_penalties": False,
     }
 
     def __init__(self, mesh, ck, max_seq_len, mrope):
@@ -74,10 +77,12 @@ class Qwen36ResidentForCausalLM:
     def warmup_model_decode(self, *args, **kwargs):
         pass
 
-    def _step(self, token, pos):
+    def _step(self, token, pos, greedy=False):
         assert pos < self.max_seq_len, f"position {pos} is past max_model_len {self.max_seq_len}"
         self.model.step(self.model.token_state(self.emb[int(token)].float(), int(pos)))
         ttnn.synchronize_device(self.mesh)
+        if greedy:
+            return torch.tensor([[self.model.argmax()]], dtype=torch.int32)
         # per chip [n, padded vocab slice]: drop the padding, then concatenate in vocab order
         logits = self.model.logits()[:, : self.d.vocab_chip].reshape(-1)[: self.vocab]
         return logits.view(1, 1, -1)
@@ -96,4 +101,6 @@ class Qwen36ResidentForCausalLM:
         return (logits, torch.zeros(1, dtype=torch.long)) if self.mrope else logits
 
     def decode_forward(self, tokens, start_pos, *args, **kwargs):
-        return self._step(tokens.reshape(-1)[0], start_pos.reshape(-1)[0])
+        # sampling_params arrive only on the steps the runner samples on device: all greedy (max_device_top_k 1)
+        greedy = kwargs.get("sampling_params") is not None
+        return self._step(tokens.reshape(-1)[0], start_pos.reshape(-1)[0], greedy)
