@@ -23,9 +23,10 @@ import torch
 from loguru import logger
 
 import ttnn
+from qwen36_resident import PKG_DIR
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/resident_mlp.jsonl")
-KDIR = "models/experimental/qwen36_resident/kernels/"
+KDIR = f"{PKG_DIR}/kernels/"
 TILE = 32
 TILE_BYTES = {ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 HIDDEN = 5120

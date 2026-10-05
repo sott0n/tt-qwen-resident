@@ -12,8 +12,8 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.experimental.qwen36_resident.tests.bench_resident_mlp import HIDDEN
-from models.experimental.qwen36_resident.tests.resident_model import Dims, ResidentModel, State, random_weights
+from qwen36_resident.tests.bench_resident_mlp import HIDDEN
+from qwen36_resident.tests.resident_model import Dims, ResidentModel, State, random_weights
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/resident_batch.jsonl")
 BATCHES = [int(b) for b in os.environ.get("RESIDENT_BATCHES", "1,2,4,8").split(",")]

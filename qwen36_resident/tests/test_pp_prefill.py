@@ -14,12 +14,13 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.experimental.qwen36_resident.prefill.pp_prefill import PPPrefill
-from models.experimental.qwen36_resident.tests import qwen36_weights as Q
-from models.experimental.qwen36_resident.tests.bench_resident_mlp import pcc
-from models.experimental.qwen36_resident.tests.resident_model import Dims, ResidentModel, State
+from qwen36_resident.prefill.pp_prefill import PPPrefill
+from qwen36_resident.tests import qwen36_weights as Q
+from qwen36_resident.tests.bench_resident_mlp import pcc
+from qwen36_resident.tests.resident_model import Dims, ResidentModel, State
+from qwen36_resident import TT_METAL_HOME
 
-REFPT = os.environ.get("RESIDENT_REFPT", "models/tt_transformers/tests/reference_outputs/Qwen3.6-27B.refpt")
+REFPT = os.environ.get("RESIDENT_REFPT", os.path.join(TT_METAL_HOME, "models/tt_transformers/tests/reference_outputs/Qwen3.6-27B.refpt"))
 
 
 @pytest.mark.parametrize(

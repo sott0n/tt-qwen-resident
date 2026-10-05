@@ -12,9 +12,9 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.experimental.qwen36_resident.prefill.pp_prefill import PPPrefill
-from models.experimental.qwen36_resident.tests import qwen36_weights as Q
-from models.experimental.qwen36_resident.tests.resident_model import Dims, ResidentModel, State
+from qwen36_resident.prefill.pp_prefill import PPPrefill
+from qwen36_resident.tests import qwen36_weights as Q
+from qwen36_resident.tests.resident_model import Dims, ResidentModel, State
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/resident_ttft.jsonl")
 DECODE_STEPS = int(os.environ.get("RESIDENT_DECODE_STEPS", "32"))

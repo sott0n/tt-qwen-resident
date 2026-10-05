@@ -14,8 +14,8 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.experimental.qwen36_resident.tests.bench_resident_mlp import HIDDEN, pcc
-from models.experimental.qwen36_resident.tests.resident_model import (
+from qwen36_resident.tests.bench_resident_mlp import HIDDEN, pcc
+from qwen36_resident.tests.resident_model import (
     Dims,
     ResidentModel,
     State,

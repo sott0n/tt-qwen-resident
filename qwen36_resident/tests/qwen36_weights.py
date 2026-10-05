@@ -13,7 +13,7 @@ from glob import glob
 import torch
 from safetensors import safe_open
 
-from models.experimental.qwen36_resident.tests.resident_model import DK, DV, HD, NK, NQ, NV, is_attn
+from qwen36_resident.tests.resident_model import DK, DV, HD, NK, NQ, NV, is_attn
 
 PREFIX = "model.language_model."
 

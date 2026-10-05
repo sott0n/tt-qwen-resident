@@ -26,11 +26,12 @@ import math
 import torch
 
 import ttnn
+from qwen36_resident import PKG_DIR
 from models.demos.blackhole.qwen36.tt import tp_common as tpc
-from models.experimental.qwen36_resident.prefill import pp_weights as PW
-from models.experimental.qwen36_resident.prefill.smm import SmallMatmul
-from models.experimental.qwen36_resident.tests.bench_resident_mlp import EPS, HIDDEN, INTER
-from models.experimental.qwen36_resident.tests.resident_model import (
+from qwen36_resident.prefill import pp_weights as PW
+from qwen36_resident.prefill.smm import SmallMatmul
+from qwen36_resident.tests.bench_resident_mlp import EPS, HIDDEN, INTER
+from qwen36_resident.tests.resident_model import (
     CONV_K,
     DK,
     DV,
@@ -46,7 +47,7 @@ from models.experimental.qwen36_resident.tests.resident_model import (
     quantize_rows,
 )
 
-KDIR = "models/experimental/qwen36_resident/prefill/kernels/"
+KDIR = f"{PKG_DIR}/prefill/kernels/"
 QD, VD = NK * DK, NV * DV  # 2048, 6144
 CONV_CH = 2 * QD + VD  # 10240
 Z0, A0 = CONV_CH, CONV_CH + VD  # z | a | b columns

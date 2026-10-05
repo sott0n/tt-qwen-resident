@@ -12,8 +12,8 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.experimental.qwen36_resident.prefill.pp_prefill import PPPrefill
-from models.experimental.qwen36_resident.tests import qwen36_weights as Q
+from qwen36_resident.prefill.pp_prefill import PPPrefill
+from qwen36_resident.tests import qwen36_weights as Q
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/resident_prefill.jsonl")
 

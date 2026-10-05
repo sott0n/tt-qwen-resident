@@ -17,9 +17,10 @@ import torch
 from loguru import logger
 
 import ttnn
+from qwen36_resident import PKG_DIR
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/ccl_allreduce.jsonl")
-KERNEL = "models/experimental/qwen36_resident/kernels/ccl_allreduce_bench.cpp"
+KERNEL = f"{PKG_DIR}/kernels/ccl_allreduce_bench.cpp"
 CORE = ttnn.CoreCoord(0, 0)
 
 

@@ -72,7 +72,7 @@ def test_pp_matmul_sweep(mesh_device):
                 res.append((timeit(None), "auto"))
             except Exception as e:
                 pass
-            from models.experimental.qwen36_resident.prefill.pp_prefill import PPPrefill
+            from qwen36_resident.prefill.pp_prefill import PPPrefill
 
             cur = PPPrefill.__new__(PPPrefill)
             cur.C, cur.mm_cols = C, 10

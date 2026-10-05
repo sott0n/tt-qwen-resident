@@ -11,8 +11,8 @@ The GDN output norm's weight (per head dim) is folded into the out-projection ro
 """
 import torch
 
-from models.experimental.qwen36_resident.tests.qwen36_weights import _fold
-from models.experimental.qwen36_resident.tests.resident_model import DV, HD, NQ, NV, is_attn
+from qwen36_resident.tests.qwen36_weights import _fold
+from qwen36_resident.tests.resident_model import DV, HD, NQ, NV, is_attn
 
 VD = NV * DV
 

@@ -12,8 +12,9 @@ import torch
 from loguru import logger
 
 import ttnn
+from qwen36_resident import PKG_DIR
 
-KDIR = "models/experimental/qwen36_resident/prefill/kernels/"
+KDIR = f"{PKG_DIR}/prefill/kernels/"
 TILE = 32
 
 
@@ -40,8 +41,8 @@ def build(device, C, K, N, wdtype, R=8, Q=13, kb=4, sh=4, sw=2):
     w = (torch.randn(K, N, generator=g) / math.sqrt(K)).bfloat16().float()
     if os.environ.get("ENG_REAL"):
         # the checkpoint's layer-0 MLP gate (norm folded), rows of real embeddings normalized
-        from models.experimental.qwen36_resident.prefill import pp_weights as PW
-        from models.experimental.qwen36_resident.tests import qwen36_weights as QW
+        from qwen36_resident.prefill import pp_weights as PW
+        from qwen36_resident.tests import qwen36_weights as QW
 
         ck = QW.Checkpoint()
         w = PW.mlp(ck, 0)["G"].float()[:K, :N]

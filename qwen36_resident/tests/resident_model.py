@@ -25,7 +25,8 @@ import numpy as np
 import torch
 
 import ttnn
-from models.experimental.qwen36_resident.tests.bench_resident_mlp import (
+from qwen36_resident import PKG_DIR
+from qwen36_resident.tests.bench_resident_mlp import (
     EPS,
     HIDDEN,
     INTER,
@@ -43,7 +44,7 @@ from models.experimental.qwen36_resident.tests.bench_resident_mlp import (
     streamer_cores,
 )
 
-KDIR = "models/experimental/qwen36_resident/kernels/"
+KDIR = f"{PKG_DIR}/kernels/"
 # GDN
 NK, NV, DK, DV, CONV_K = 16, 48, 128, 128, 4
 # attention

@@ -11,7 +11,7 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.experimental.qwen36_resident.prefill.smm import SmallMatmul
+from qwen36_resident.prefill.smm import SmallMatmul
 
 SHAPES = dict(
     gdn=(5120, 16512, ttnn.bfloat8_b),

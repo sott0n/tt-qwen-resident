@@ -17,10 +17,11 @@ import torch
 from loguru import logger
 
 import ttnn
-import models.experimental.qwen36_resident.tests.bench_resident_mlp as M
+import qwen36_resident.tests.bench_resident_mlp as M
+from qwen36_resident import PKG_DIR
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/dram_read.jsonl")
-KERNEL = "models/experimental/qwen36_resident/kernels/dram_read_bench.cpp"
+KERNEL = f"{PKG_DIR}/kernels/dram_read_bench.cpp"
 BANK_BYTES = 8 << 20
 MAX_DEPTH = 15
 

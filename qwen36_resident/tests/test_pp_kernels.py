@@ -8,7 +8,7 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.experimental.qwen36_resident.prefill.pp_prefill import (
+from qwen36_resident.prefill.pp_prefill import (
     A0,
     CONV_CH,
     EPS,
@@ -19,7 +19,7 @@ from models.experimental.qwen36_resident.prefill.pp_prefill import (
     Z0,
     PPPrefill,
 )
-from models.experimental.qwen36_resident.tests.resident_model import (
+from qwen36_resident.tests.resident_model import (
     DK,
     DV,
     HD,
@@ -59,7 +59,7 @@ def _cat(mesh, t):
 @pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
 def test_qkrope(mesh_device, C, heads):
     """per-head rmsnorm times the weight, then RoPE on the first ROT dims, in place"""
-    from models.experimental.qwen36_resident.prefill.pp_prefill import ROT, rope_cos_sin, rotate_half_matrix
+    from qwen36_resident.prefill.pp_prefill import ROT, rope_cos_sin, rotate_half_matrix
 
     n = mesh_device.get_num_devices()
     pp = _bare(mesh_device, C)
@@ -86,7 +86,7 @@ def test_qkrope(mesh_device, C, heads):
 @pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
 def test_addnorm(mesh_device, C):
     """x += b in place and h = rmsnorm(x)"""
-    from models.experimental.qwen36_resident.prefill.pp_prefill import HIDDEN
+    from qwen36_resident.prefill.pp_prefill import HIDDEN
 
     n = mesh_device.get_num_devices()
     pp = _bare(mesh_device, C)

@@ -13,10 +13,11 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.experimental.qwen36_resident.prefill.pp_prefill import MM_BEST
-from models.experimental.qwen36_resident.tests.bench_resident_mlp import EPS, HIDDEN, INTER
+from qwen36_resident.prefill.pp_prefill import MM_BEST
+from qwen36_resident.tests.bench_resident_mlp import EPS, HIDDEN, INTER
+from qwen36_resident import PKG_DIR
 
-KDIR = "models/experimental/qwen36_resident/prefill/kernels/"
+KDIR = f"{PKG_DIR}/prefill/kernels/"
 TILE = 32
 TB = {ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 
@@ -36,8 +37,8 @@ def weights(L, real):
     if not real:
         mk = lambda k, n: torch.randn(k, n, generator=g) / math.sqrt(k)
         return [dict(G=mk(HIDDEN, INTER), U=mk(HIDDEN, INTER), D=mk(INTER, HIDDEN)) for _ in range(L)]
-    from models.experimental.qwen36_resident.prefill import pp_weights as PW
-    from models.experimental.qwen36_resident.tests import qwen36_weights as QW
+    from qwen36_resident.prefill import pp_weights as PW
+    from qwen36_resident.tests import qwen36_weights as QW
 
     ck = QW.Checkpoint()
     return [{k: v.float() for k, v in PW.mlp(ck, i).items()} for i in range(L)]
@@ -47,7 +48,7 @@ def inputs(C, real):
     g = torch.Generator().manual_seed(0)
     if not real:
         return torch.randn(C, HIDDEN, generator=g).bfloat16().float()
-    from models.experimental.qwen36_resident.tests import qwen36_weights as QW
+    from qwen36_resident.tests import qwen36_weights as QW
 
     e = QW.embedding(QW.Checkpoint())
     return e[torch.randint(0, e.shape[0], (C,), generator=g)].bfloat16().float()

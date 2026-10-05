@@ -10,9 +10,10 @@ import math
 import torch
 
 import ttnn
+from qwen36_resident import PKG_DIR
 
 TILE = 32
-KDIR = "models/experimental/qwen36_resident/prefill/kernels/"
+KDIR = f"{PKG_DIR}/prefill/kernels/"
 TILE_BYTES = {ttnn.bfloat16: 2048, ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 
 

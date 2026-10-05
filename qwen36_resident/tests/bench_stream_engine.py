@@ -18,13 +18,14 @@ import torch
 from loguru import logger
 
 import ttnn
+from qwen36_resident import PKG_DIR
 from models.demos.deepseek_v3_b1.tests.unit_tests.test_dram_streaming_matmul import (
     pad_to_dram_banks,
     shuffle_tensor_tiles,
 )
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/stream_engine.jsonl")
-KDIR = "models/experimental/qwen36_resident/kernels/"
+KDIR = f"{PKG_DIR}/kernels/"
 TILE = 32
 TILE_BYTES = {ttnn.bfloat8_b: 1088, ttnn.bfloat4_b: 576}
 
