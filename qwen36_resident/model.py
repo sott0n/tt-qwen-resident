@@ -413,15 +413,19 @@ class ResidentModel:
         packet_bytes=4096,
         embed=None,
         verify=False,
+        fc=None,
     ):
         """st: the decode state (State), or one State per user for a batch of len(st) users. More than 8 users
         run as sub-batches of 8, one launch each (the launches share the weights and buffers, each has its
         own decode state). embed (the embedding table on device, one row per page; batch 1 with the lm_head):
         each step also writes the next step's token state from its own greedy token (step(None)).
         verify: st is one user's State and a step runs two rows of it, at positions p and p + 1 (a token
-        and its draft); see token_state for continuing from either row"""
+        and its draft); see token_state for continuing from either row. fc (the MTP draft layer): per chip
+        its K slice [2 HIDDEN / n, HIDDEN] of the fc that makes x0 from the token state's two vectors per row
+        (see streamer_common.hpp)"""
         self.mesh, self.d, self.layers, self.interval, self.lm_head = mesh, d, layers, interval, lm_head
         self.verify = verify
+        self.fc = fc is not None
         if verify:
             assert isinstance(st, State) and embed is None
             st = [st, st]
@@ -534,8 +538,9 @@ class ResidentModel:
         self._blk = blk_tiles
 
         # ---- DRAM weights: per entry, copies stacked along K (a fixed per-bank stride)
+        # (fc: the GDN projection entry carries the fc, columns split as the out-projection's)
         entries = [
-            (d.Ht, PROJ_DT, d.g_cols),
+            (2 * d.Ht // n, PROJ_DT, HIDDEN) if self.fc else (d.Ht, PROJ_DT, d.g_cols),
             (d.Ht, PROJ_DT, d.a_cols),
             (d.Ot, OUT_DT, HIDDEN),
             (d.Ht, GU_DT, 2 * d.ic),
@@ -544,7 +549,7 @@ class ResidentModel:
         ]
         geo = [block_geometry(Kt, dt) for Kt, dt, _ in entries]
         cols_of = [
-            bank_core_cols(d.g_cols // TILE, banks),
+            bank_core_cols(d.Ht if self.fc else d.g_cols // TILE, banks),
             bank_core_cols(d.a_cols // TILE, banks),
             bank_core_cols(d.Ht, banks),
             gate_up_core_cols(d.It, banks, g_extra),
@@ -552,7 +557,7 @@ class ResidentModel:
             bank_core_cols(d.vocab // TILE, banks) if d.vocab else None,
         ]
         per_entry_mats = [
-            [[c["Wq"] for c in wg["chips"]] for wg in w["gdn"]],
+            [list(fc)] if self.fc else [[c["Wq"] for c in wg["chips"]] for wg in w["gdn"]],
             [[c["Wq"] for c in wa["chips"]] for wa in w["attn"]],
             [list(o) for o in w["out"]],
             [[torch.cat([cm["G"], cm["U"]], dim=1) for cm in m] for m in w["mlp"]],
@@ -705,7 +710,7 @@ class ResidentModel:
         slots_per_node = max(FANIN - 1, len(groups_))
 
         # ---- token state: ring step, positions, x0, rope tables of the positions
-        self.rope_off = TOK_X0 + d.Ht * 64 * B
+        self.rope_off = TOK_X0 + (2 if self.fc else 1) * d.Ht * 64 * B
         self.tok_words = (self.rope_off + 3 * 2048 * B) // 4
         self.tok_t = dram_t(torch.zeros(1, self.tok_words, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, rep)
 
@@ -1051,7 +1056,7 @@ class ResidentModel:
                 ct += [d.conv_tiles, d.Ot, d.nv * G, int(lm_head)]
                 for (Kt, _, _), (sb, pages, page, block) in zip(entries, geo):
                     ct += [Kt, sb, pages, page, block]
-                ct += [SEM_LOCAL, B, SEM_ADDR, d.nv, blk_tiles, SEM_FLAG, int(self.verify)]
+                ct += [SEM_LOCAL, B, SEM_ADDR, d.nv, blk_tiles, SEM_FLAG, int(self.verify), int(self.fc)]
                 rr, wr, cr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
                 peers = [v for p in sphys for v in (p.x, p.y)]
                 head_xy = [v for p in head_p for v in (p.x, p.y)]
@@ -1063,7 +1068,7 @@ class ResidentModel:
                     ng, gfirst = ng_split[j]
                     nvv, vfirst = nv_split[j]
                     v0 = (bank * v_bank + vfirst) * TILE
-                    counts = [nqg, nqa, nd, 2 * ng, nd, nvv]
+                    counts = [nd if self.fc else nqg, nqa, nd, 2 * ng, nd, nvv]
                     ent = []
                     for cnt, (t, stride, copies) in zip(counts, self.w_entries):
                         ent += [cnt if t is not None else 0, t.buffer_address() if t is not None else 0, stride, copies]
@@ -1102,7 +1107,8 @@ class ResidentModel:
                     *[ttnn.get_global_semaphore_address(s) for s in self.ccl_sems],
                     0,
                 ] + rect_cover(mesh, cores)
-                hub_ct = [n, chip, HIDDEN * 2 * B, packet_bytes, 2 * layers, S, SEM_GATHER, SEM_SLOTS]
+                rounds = 2 * layers + int(self.fc)
+                hub_ct = [n, chip, HIDDEN * 2 * B, packet_bytes, rounds, S, SEM_GATHER, SEM_SLOTS]
                 hub_ct += [SEM_FLAG, int(lm_head), 1, 1, SEM_ADDR]
                 hub_ct += [int(self.feed), sts[0].max_pos, self.tok_words * 4, self.rope_off, 3 * 2048]
                 if self.feed:
@@ -1206,7 +1212,7 @@ class ResidentModel:
                     kernel("streamer_writer.cpp", grid, ct, wr, dm(BRISC, NOC1)),
                     kernel("streamer_compute.cpp", grid, ct, cr, streamer_compute),
                     kernel("mlp_hub.cpp", hub_grid, hub_ct, hub_rt, dm(BRISC, NOC0)),
-                    kernel("hub_compute.cpp", hub_grid, [n, x_views, 2 * layers], ttnn.RuntimeArgs(), streamer_compute),
+                    kernel("hub_compute.cpp", hub_grid, [n, x_views, rounds], ttnn.RuntimeArgs(), streamer_compute),
                 ]
                 if self.n_gdn:
                     kernels += [
@@ -1283,7 +1289,7 @@ class ResidentModel:
 
     def _token_state(self, x0, pos, ring, slot=0):
         B = self.batch
-        x0 = x0.reshape(B, HIDDEN)
+        x0 = x0.reshape(B, -1)
         pos = [pos] if B == 1 and not isinstance(pos, (list, tuple)) else list(pos)
         assert len(pos) == B and (ring is not None or B == 1)
         ring = pos[0] if ring is None else ring
@@ -1292,7 +1298,7 @@ class ResidentModel:
             words[2 * i], words[2 * i + 1] = v & 0xFFFF, v >> 16
         if self.verify:
             words[2 * TOK_SLOT] = slot
-        words[TOK_X0 // 2 : TOK_X0 // 2 + B * HIDDEN] = bf16_bits(tiny_order(x0))
+        words[TOK_X0 // 2 : TOK_X0 // 2 + x0.numel()] = bf16_bits(tiny_order(x0))
         r0 = self.rope_off // 2
         if not hasattr(self, "_rope"):
             # every position's tiles, built once: building them per token costs ~0.2 ms

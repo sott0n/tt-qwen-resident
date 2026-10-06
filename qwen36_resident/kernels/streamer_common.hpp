@@ -26,7 +26,13 @@
 //   page_size, block_bytes, then 53 sem_local (conv history write-backs done, for the reader), 54 batch
 //   (users per step, 1 / 2 / 4 / 8), 55 sem_addr (CB addresses exchanged with the hub), 56 o_heads (GDN
 //   head cores that write o, one per value head), 57 column block tiles (kBlk), 58 sem_ring (local: the
-//   ring step + 1, from the reader to the writer), 59 verify (0 / 1)
+//   ring step + 1, from the reader to the writer), 59 verify (0 / 1), 60 fc (0 / 1)
+//
+// fc (the MTP draft layer, no GDN layers): x of layer 0 is fc([norm_e(e) | norm_h(h)]) for the token state's
+// two vectors per row (embedding e, then the main model's last x as h). Chip c's K slice of the fc is slice
+// c % (chips / 2) of rmsnorm(e) (first half of the chips) or rmsnorm(h) (second half), the norm weights folded
+// into the fc rows; its weights stream through entry kQkvz and the partials make an extra hub round 0, so the
+// layers' rounds start at 1.
 //
 // Verify: the batch is two rows of one user at positions p and p + 1 (a token and its draft), so row 1's
 // conv window holds row 0's input of the same step. The history of a GDN layer is then a ring of 4 pair
@@ -127,7 +133,7 @@ constexpr uint32_t Ot = get_compile_time_arg_val(20);
 constexpr uint32_t gdn_heads = get_compile_time_arg_val(21);
 constexpr bool lm_head = get_compile_time_arg_val(22) != 0;
 constexpr uint32_t Hf = Ht / 32;
-constexpr uint32_t kTokRope = kTokX0 + Ht * kTileBytes;
+constexpr uint32_t kTokRope = kTokX0 + (get_compile_time_arg_val(60) ? 2 : 1) * Ht * kTileBytes;
 constexpr uint32_t kTokBytes = kTokRope + 3 * 2048 * batch;
 static_assert(
     get_compile_time_arg_val(15) <= 32 && get_compile_time_arg_val(17) <= 32, "column blocks exceed one full tile");
@@ -140,6 +146,9 @@ constexpr bool verify = get_compile_time_arg_val(59) != 0;
 static_assert(!verify || batch == 2, "verify runs two rows of one user");
 constexpr uint32_t kHistSlots = verify ? 4 : 3;  // conv history slots per (streamer, GDN copy) row
 constexpr uint32_t gdn_layers = layers - (attn_interval > 0 ? layers / attn_interval : 0);
+constexpr bool fc_in = get_compile_time_arg_val(60) != 0;
+static_assert(!fc_in || gdn_layers == 0, "fc streams through the GDN projection entry");
+constexpr uint32_t kRound0 = fc_in ? 1 : 0;  // hub round of layer 0's mixer half
 
 FORCE_INLINE bool is_attn(uint32_t l) { return attn_interval > 0 && (l + 1) % attn_interval == 0; }
 

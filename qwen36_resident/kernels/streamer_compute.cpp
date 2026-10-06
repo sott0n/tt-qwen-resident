@@ -421,6 +421,18 @@ void kernel_main() {
         cb_wait_front(cb_shift, 3);
     }
 
+    if constexpr (fc_in) {
+        // this chip's K slice of the fc (see streamer_common.hpp); no residual
+        constexpr uint32_t skip = (chip % (num_chips / 2)) * (2 * Ht / num_chips);
+        rmsnorm();
+        if (skip > 0) {
+            cb_wait_front(cb_h, Ht);
+            cb_pop_front(cb_h, skip);
+        }
+        matmul<kQkvz>(cb_h, cb_pout, nd, nd_max);
+        cb_pop_front(cb_h, Ht - skip);
+        cb_pop_front(cb_x, Ht);
+    }
     for (uint32_t l = 0; l < layers; l++) {
         const bool attn = is_attn(l);
         // mixer half

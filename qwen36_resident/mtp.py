@@ -6,16 +6,17 @@ The main model runs the verify step (ResidentModel(verify=True)): rows t at p an
 Its greedy tokens a0, a1 accept the draft when a0 == d: the step then commits d and a1, else a0. The
 MTP model is one full-attention decoder layer with its own KV cache and the main model's lm_head (folded
 with mtp.norm), run as a verify step too: its entry at position q takes x0 = fc([norm_e(embed(tok[q + 1])),
-norm_h(h_q)]) for the main model's final hidden h_q (after the final norm) and predicts tok[q + 2]. After
-a main step at p it adds the entries p (and p + 1 when the draft was accepted) and its row on the kept
-path drafts the next step's d. The fc runs on the host.
+norm_h(h_q)]) for the main model's final hidden h_q and predicts tok[q + 2]. After a main step at p it
+adds the entries p (and p + 1 when the draft was accepted) and its row on the kept path drafts the next
+step's d. The fc runs on device (ResidentModel fc) on the main model's last x: norm_h(rmsnorm(x)) without
+the final norm's weight in between (drafts accepted on the reference text: 84.7% instead of 86.4%).
 """
 import time
 
 import torch
 
 from qwen36_resident import weights as Q
-from qwen36_resident.model import Dims, ResidentModel, State, rmsnorm
+from qwen36_resident.model import Dims, ResidentModel, State
 
 MTP = "mtp."
 
@@ -44,6 +45,16 @@ def mtp_weights(ck, d):
     return w
 
 
+def mtp_fc(ck, d):
+    """per chip its K slice of the fc (see streamer_common.hpp): [2 H / n, H], the pre-fc norm weights folded"""
+    w = ck.get(f"{MTP}fc.weight").float().T  # [2 H, H]: rows for embedding | hidden
+    H = w.shape[1]
+    scale = 1 + torch.cat([ck.get(f"{MTP}pre_fc_norm_{v}.weight").float() for v in ("embedding", "hidden")])
+    w = (scale[:, None] * w).bfloat16()
+    k = 2 * H // d.n
+    return [w[c * k : (c + 1) * k].contiguous() for c in range(d.n)]
+
+
 class SpecDecoder:
     def __init__(self, mesh, ck, layers, max_pos, trace=True):
         n = mesh.get_num_devices()
@@ -56,35 +67,37 @@ class SpecDecoder:
         )
         del w
         self.draft = ResidentModel(
-            mesh, d, mtp_weights(ck, d), State(d, 0, 1, 0, max_pos, zero=True), 1, 1, True, verify=True
+            mesh,
+            d,
+            mtp_weights(ck, d),
+            State(d, 0, 1, 0, max_pos, zero=True),
+            1,
+            1,
+            True,
+            verify=True,
+            fc=mtp_fc(ck, d),
         )
         self.mesh = mesh
         self.emb = Q.embedding(ck).float()
-        self.norm_w = 1 + ck.get(f"{Q.PREFIX}norm.weight").float()
-        self.norm_e = 1 + ck.get(f"{MTP}pre_fc_norm_embedding.weight").float()
-        self.norm_h = 1 + ck.get(f"{MTP}pre_fc_norm_hidden.weight").float()
-        self.fc_t = ck.get(f"{MTP}fc.weight").float().T.contiguous()  # [2 H, H]
         if trace:
             for m in (self.main, self.draft):
-                m.step(m.token_state(torch.zeros(2, self.emb.shape[1]), [0, 1], ring=0, slot=0))
+                width = (2 if m.fc else 1) * self.emb.shape[1]
+                m.step(m.token_state(torch.zeros(2, width), [0, 1], ring=0, slot=0))
                 m.reset()
                 m.capture_trace()
 
     def _main(self, toks, p, ring, slot):
         m = self.main
         m.step(m.token_state(self.emb[toks], [p, p + 1], ring=ring, slot=slot))
-        a = m.argmax()
-        h = rmsnorm(m.x()) * self.norm_w  # the final norm, as the lm_head sees it
-        return a, h.bfloat16().float()
+        return m.argmax(), m.x()
 
     draft_t = []
 
     def _draft(self, toks, h, q, ring, slot):
-        """MTP entries at q, q + 1 for (toks[i], h[i]); its argmax per row"""
+        """MTP entries at q, q + 1 for (toks[i], the main model's x of row i); its argmax per row"""
         t0 = time.perf_counter()
-        x0 = torch.cat([rmsnorm(self.emb[toks]) * self.norm_e, rmsnorm(h) * self.norm_h], dim=1) @ self.fc_t
         m = self.draft
-        tok = m.token_state(x0.bfloat16().float(), [q, q + 1], ring=ring, slot=slot)
+        tok = m.token_state(torch.cat([self.emb[toks], h], dim=1), [q, q + 1], ring=ring, slot=slot)
         t1 = time.perf_counter()
         m.step(tok)
         a = m.argmax()

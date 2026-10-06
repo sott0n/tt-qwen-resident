@@ -160,12 +160,15 @@ void kernel_main() {
         }
     };
 
+    if constexpr (fc_in) {
+        send_partial(0);
+    }
     uint32_t g = 0;
     uint32_t o_expected = 0;  // o writes so far: o_heads per GDN layer, the leader per attention layer
     for (uint32_t l = 0; l < layers; l++) {
         const bool attn = is_attn(l);
         // mixer half
-        take_slots(2 * l);
+        take_slots(2 * l + kRound0);
         mark(l, 0);
         cb_wait_front(cb_qkvz_out, kBlk);
         mark(l, 1);
@@ -198,11 +201,11 @@ void kernel_main() {
         mark(l, 2);
         cb_reserve_back(cb_o_in, Ot);
         cb_push_back(cb_o_in, Ot);
-        send_partial(2 * l);
+        send_partial(2 * l + kRound0);
         mark(l, 3);
 
         // mlp half
-        take_slots(2 * l + 1);
+        take_slots(2 * l + 1 + kRound0);
         mark(l, 4);
         cb_wait_front(cb_aslice, kBlk);
         mark(l, 5);
@@ -223,11 +226,11 @@ void kernel_main() {
         mark(l, 6);
         cb_reserve_back(cb_act, It);
         cb_push_back(cb_act, It);
-        send_partial(2 * l + 1);
+        send_partial(2 * l + 1 + kRound0);
         mark(l, 7);
     }
     if constexpr (lm_head) {
-        take_slots(2 * layers);
+        take_slots(2 * layers + kRound0);
         if (argmax_addr) {
             // bf16 bits -> unsigned key in the order of the values; per user, record slot core * batch + u.
             // Column c of user u: tile c / 32, face (c % 32) / 16, face row u

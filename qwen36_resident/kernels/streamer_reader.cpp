@@ -115,8 +115,12 @@ void kernel_main() {
     const InterleavedAddrGen<true> hist{.bank_base_address = hist_addr, .page_size = kHistSlots * kBlkBytes};
 
     // x of round 0 = x0; the ring step (for the conv slot order) lands in cb_dout, unused until compute runs
+    // (fc: this chip's half of the fc input instead, see streamer_common.hpp)
     cb_reserve_back(cb_x, Ht);
-    noc_async_read(tok.get_noc_addr(0, kTokX0), get_write_ptr(cb_x), Ht * kTileBytes);
+    noc_async_read(
+        tok.get_noc_addr(0, kTokX0 + (fc_in && chip >= num_chips / 2 ? Ht * kTileBytes : 0)),
+        get_write_ptr(cb_x),
+        Ht * kTileBytes);
     noc_async_read(tok.get_noc_addr(0), get_write_ptr(cb_dout), 16);
     noc_async_read_barrier();
     const uint32_t ring = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_dout));
@@ -163,6 +167,9 @@ void kernel_main() {
         stall_cycles = 0;
     };
     stall_cycles = 0;
+    if constexpr (fc_in) {
+        stream_entry<kQkvz>(bank_id, vc, slot, slots, 0);
+    }
     uint32_t g = 0, a = 0;  // GDN / attention layers so far
     for (uint32_t l = 0; l < layers; l++) {
         if (is_attn(l)) {
