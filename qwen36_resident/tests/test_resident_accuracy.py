@@ -36,6 +36,8 @@ CHUNK = int(os.environ.get("RESIDENT_CHUNK", "512"))
 TRACE_REGION = 64 << 20
 BATCH = int(os.environ.get("RESIDENT_BATCH", "1"))
 DUMP = os.environ.get("RESIDENT_DUMP")  # path: save x and the argmax after every step (batch 1)
+# verify: per step 1 = continue from row 1 (draft accepted), 0 = from row 0; the pattern repeats
+VERIFY_ACCEPT = [int(a) for a in os.environ.get("RESIDENT_VERIFY_ACCEPT", "1,1,0").split(",")]
 
 
 @pytest.mark.parametrize(
@@ -139,6 +141,79 @@ def test_resident_accuracy(mesh_device):
         step_ms_median=1e3 * steady[len(steady) // 2],
         step_ms_p10=1e3 * steady[len(steady) // 10],
         token_ms_median=1e3 * tokens_steady[len(tokens_steady) // 2],
+    )
+    logger.info(rec)
+    with open(OUT, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+@pytest.mark.parametrize(
+    "device_params", [{"fabric_config": ttnn.FabricConfig.FABRIC_1D, "trace_region_size": TRACE_REGION}], indirect=True
+)
+@pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
+def test_resident_verify_accuracy(mesh_device):
+    """The verify step teacher forced over the reference: rows 0 and 1 take the reference tokens at p and
+    p + 1, and the next step continues from row 1 or row 0 per VERIFY_ACCEPT. Every position from 511 on
+    is scored once, by the row that predicts it on the kept path."""
+    ref = torch.load(REFPT, weights_only=False)
+    tokens = ref["reference_tokens"][0]
+    top5 = ref["top5_tokens"]
+    split = tokens.shape[-1] // 2
+    ck = Q.Checkpoint()
+    n = mesh_device.get_num_devices()
+    d = Dims(n, mesh_device.dram_grid_size().x, vocab=ck.config["vocab_size"])
+    interval = ck.config["full_attention_interval"]
+    w = Q.load(ck, d, LAYERS, interval)
+    emb = Q.embedding(ck)
+    n_attn = sum((l + 1) % interval == 0 for l in range(LAYERS))
+    st = State(d, LAYERS - n_attn, n_attn, 0, max_pos=tokens.shape[-1] + 64, zero=True)
+    model = ResidentModel(mesh_device, d, w, st, LAYERS, interval, lm_head=True, verify=True)
+    del w
+
+    def token_state(p, ring, slot):
+        x0 = torch.stack([emb[tokens[p]].float(), emb[tokens[p + 1]].float()])
+        return model.token_state(x0, [p, p + 1], ring=ring, slot=slot)
+
+    if TRACE:
+        model.step(token_state(0, 0, 0))  # compile outside the trace
+        model.reset()
+        model.capture_trace()
+    hits = {0: [0, 0, 0], 1: [0, 0, 0]}  # per row: top-1, top-5, scored
+    p = ring = slot = k = 0
+    step_times = []
+    while p + 1 <= tokens.shape[-1] - 2:
+        accept = VERIFY_ACCEPT[k % len(VERIFY_ACCEPT)]
+        tok = token_state(p, ring, slot)
+        t0 = time.perf_counter()
+        model.step(tok)
+        ttnn.synchronize_device(mesh_device)
+        step_times.append(time.perf_counter() - t0)
+        preds = model.argmax()
+        for row in (0, 1) if accept else (0,):
+            pos = p + row
+            if pos >= split - 1:
+                h = hits[row]
+                h[0] += preds[row] == int(top5[pos, 0])
+                h[1] += preds[row] in top5[pos].tolist()
+                h[2] += 1
+        if accept:
+            p, ring, slot = p + 2, ring + 2, slot ^ 1
+        else:
+            p, ring = p + 1, ring + 1
+        k += 1
+    model.release_trace()
+    scored = hits[0][2] + hits[1][2]
+    steady = sorted(step_times[16:])
+    rec = dict(
+        test="verify_accuracy",
+        layers=LAYERS,
+        trace=TRACE,
+        accept=VERIFY_ACCEPT,
+        top1=100 * (hits[0][0] + hits[1][0]) / scored,
+        top5=100 * (hits[0][1] + hits[1][1]) / scored,
+        top1_row1=100 * hits[1][0] / max(hits[1][2], 1),
+        scored=scored,
+        step_ms_median=1e3 * steady[len(steady) // 2],
     )
     logger.info(rec)
     with open(OUT, "a") as f:
