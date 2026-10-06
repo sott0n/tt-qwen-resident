@@ -26,7 +26,15 @@
 //   page_size, block_bytes, then 53 sem_local (conv history write-backs done, for the reader), 54 batch
 //   (users per step, 1 / 2 / 4 / 8), 55 sem_addr (CB addresses exchanged with the hub), 56 o_heads (GDN
 //   head cores that write o, one per value head), 57 column block tiles (kBlk), 58 sem_ring (local: the
-//   ring step + 1, from the reader to the writer)
+//   ring step + 1, from the reader to the writer), 59 verify (0 / 1)
+//
+// Verify: the batch is two rows of one user at positions p and p + 1 (a token and its draft), so row 1's
+// conv window holds row 0's input of the same step. The history of a GDN layer is then a ring of 4 pair
+// slots: T(j) holds (v_j, v_j+1) as rows (0, 1) of every 32x32 view, for the layer's inputs v. At ring
+// step k (token state word 0) the window is T(k), T(k + 1) and T(k + 2) with row 1 of T(k + 2) masked off
+// and replaced by row 0 of this step's input y (a 0/1 matmul moves view row R - 1 to odd row R); the
+// step writes T(k + 2) = (v_k+2, y0), T(k + 3) = y and T(k + 4) = (y1, -). The next step starts at ring
+// step k + 1 (row 0 kept) or k + 2 (both rows kept); only row 0 of the third slot is ever read.
 //
 // Batch: every activation tile is a batch x 32 tile, row u for user u (face 0 holds columns 0..15 of
 // all rows, face 1 columns 16..31). The weights stream once per step for all users.
@@ -85,6 +93,7 @@ constexpr uint32_t cb_fold = 33;
 constexpr uint32_t cb_sumsq = 34;  // fp32 scratch, 2 tiles
 constexpr uint32_t cb_rinv = 35;   // fp32, per-row 1 / rms on the view rows
 constexpr uint32_t cb_eye = 38;    // rmsnorm of a batch > 1: the identity (bf16 32x32)
+constexpr uint32_t cb_shift = 36;  // verify: even-row identity, row R - 1 -> odd R, row R + 1 -> even R
 
 // token state (DRAM, uint32 words): [0] conv ring step (advances once per step), [1 + u] position of
 // user u; x0 (hidden bf16 as batch x 32 tiles) at kTokX0; per user the rope cos, sin, -sin tiles of its
@@ -127,6 +136,9 @@ constexpr uint32_t sem_local = get_compile_time_arg_val(53);
 constexpr uint32_t sem_addr = get_compile_time_arg_val(55);
 constexpr uint32_t o_heads = get_compile_time_arg_val(56);
 constexpr uint32_t sem_ring = get_compile_time_arg_val(58);
+constexpr bool verify = get_compile_time_arg_val(59) != 0;
+static_assert(!verify || batch == 2, "verify runs two rows of one user");
+constexpr uint32_t kHistSlots = verify ? 4 : 3;  // conv history slots per (streamer, GDN copy) row
 constexpr uint32_t gdn_layers = layers - (attn_interval > 0 ? layers / attn_interval : 0);
 
 FORCE_INLINE bool is_attn(uint32_t l) { return attn_interval > 0 && (l + 1) % attn_interval == 0; }

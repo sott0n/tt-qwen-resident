@@ -10,7 +10,7 @@
 //
 // Runtime args: 0 bank_id, 1 vc, 2 slot j of this core in its bank, 3 cores_per_bank, then per entry e:
 // 4 + 4e n_tiles, base address, per-copy stride (bytes per bank), copies; then 28 conv taps address
-// (DRAM rows of 4 x kBlk 1x32 tiles), 29 conv history address (rows of 3 x kBlk), 30 this core's first
+// (DRAM rows of 4 x kBlk 1x32 tiles), 29 conv history address (rows of kHistSlots x kBlk), 30 this core's first
 // row (core index x GDN copies), 31 GDN copies, 32 token state address, 33 optional timeline buffer
 // (0 = off): per layer, the wall clock at the end of each entry's stream and the cycles each entry
 // spent waiting for ring room, 34 n_conv (q|k|v tiles of this core: only the 32x32 views holding them of
@@ -112,7 +112,7 @@ void kernel_main() {
     }
     const InterleavedAddrGen<true> tok{.bank_base_address = tok_addr, .page_size = kTokBytes};
     const InterleavedAddrGen<true> taps{.bank_base_address = conv_w_addr, .page_size = 4 * kBlkBytes};
-    const InterleavedAddrGen<true> hist{.bank_base_address = hist_addr, .page_size = 3 * kBlkBytes};
+    const InterleavedAddrGen<true> hist{.bank_base_address = hist_addr, .page_size = kHistSlots * kBlkBytes};
 
     // x of round 0 = x0; the ring step (for the conv slot order) lands in cb_dout, unused until compute runs
     cb_reserve_back(cb_x, Ht);
@@ -139,6 +139,19 @@ void kernel_main() {
         cb_push_back(cb_ones_full, 1);
         cb_push_back(cb_fold, 1);
         cb_push_back(cb_eye, 1);
+    }
+    if constexpr (verify) {
+        // the conv's row selections (see streamer_common.hpp), bf16 32x32: [0] keeps the even rows, [1] moves
+        // row R - 1 to odd row R, [2] moves row R + 1 to even row R
+        cb_reserve_back(cb_shift, 3);
+        volatile tt_l1_ptr uint16_t* sel = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(get_write_ptr(cb_shift));
+        for (uint32_t i = 0; i < 1024; i++) {
+            const uint32_t face = i / 256, row = (face / 2) * 16 + (i % 256) / 16, col = (face % 2) * 16 + i % 16;
+            sel[i] = row % 2 == 0 && col == row ? 0x3f80 : 0;
+            sel[1024 + i] = row % 2 == 1 && col + 1 == row ? 0x3f80 : 0;
+            sel[2048 + i] = row % 2 == 0 && col == row + 1 ? 0x3f80 : 0;
+        }
+        cb_push_back(cb_shift, 3);
     }
 
     volatile tt_l1_ptr uint32_t* ts = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ts_addr);
@@ -173,7 +186,7 @@ void kernel_main() {
                 }
                 for (uint32_t j = 0; j < 3; j++) {
                     noc_async_read(
-                        hist.get_noc_addr(row, ((step + j) % 3) * kBlkBytes),
+                        hist.get_noc_addr(row, ((step + j) % kHistSlots) * kBlkBytes),
                         get_write_ptr(cb_conv_hist) + j * kBlkBytes,
                         conv_bytes);
                 }

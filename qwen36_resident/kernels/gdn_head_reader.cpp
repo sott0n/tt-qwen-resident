@@ -12,13 +12,18 @@
 //
 // Compile-time args: 0 Kt, 1 Vt, 2 GDN layers, 3 copies, 4 num_streamers, 5 sem_rows, 6 heads (per chip),
 //   7 sem_state (count of state write-backs done by the writer, one per layer and user; a copy's state is
-//   re-read within a step only after its previous write-back), 8 batch
+//   re-read within a step only after its previous write-back), 8 batch, 9 verify (0 / 1), 10 sem_slot (local:
+//   the state slot + 1, from the reader to the writer)
+// Verify (one core per head, two rows of one user at p and p + 1): the state tensor holds two slots per
+// (copy, head) instead of users; row 0 reads and updates slot `cur` (token state word kTokSlot), row 1
+// starts from row 0's updated state (copied from L1 once the writer has stored it) and writes it to slot
+// cur ^ 1, so the next step continues from either row by its slot.
 // Runtime args: 0 rows_addr, 1 state address (DRAM, [copies][heads][batch][Kt * Vt] fp32 tiles), 2 norm weight
 //   address (DRAM, [copies][Vt] bf16 row-0 tiles), 3 q_tile, 4 k_tile, 5 v_tile, 6 z_tile, 7 a_tile,
 //   8 a_elem, 9 b_tile, 10 b_elem, 11 head index, then copies x (dt_bias_h bits, neg_exp_A_h bits), then an
 //   optional timeline buffer (0 = off): per layer 4 words, the reader writes [0] rows arrived, [1] inputs
 //   pushed; then this core's users u0 .. u0 + nu and the row writes it gets per layer (one per streamer run
-//   that covers it)
+//   that covers it), then the token state address
 
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
@@ -34,10 +39,13 @@ constexpr uint32_t sem_rows = get_compile_time_arg_val(5);
 constexpr uint32_t num_heads = get_compile_time_arg_val(6);
 constexpr uint32_t sem_state = get_compile_time_arg_val(7);
 constexpr uint32_t batch = get_compile_time_arg_val(8);
+constexpr bool verify = get_compile_time_arg_val(9) != 0;
+constexpr uint32_t sem_slot = get_compile_time_arg_val(10);
 constexpr uint32_t st = Kt * Vt;
+constexpr uint32_t kTokSlot = 4;  // token state word: the state slot row 0 continues from (verify)
 
 constexpr uint32_t cb_q_in = 0, cb_k_in = 1, cb_v_in = 2, cb_z_in = 3, cb_norm_w = 4, cb_s_in = 5;
-constexpr uint32_t cb_a_full = 6, cb_b_full = 7, cb_ones = 8, cb_row_mask = 9, cb_s_mm = 17;
+constexpr uint32_t cb_a_full = 6, cb_b_full = 7, cb_ones = 8, cb_row_mask = 9, cb_s_mm = 17, cb_s_new_out = 24;
 constexpr uint32_t cb_neg_a_full = 30, cb_dt_bias_full = 31;
 constexpr uint32_t kBf16Tile = 2048, kF32Tile = 4096, kFaceBytes = 512, kFaceRow = 32;
 constexpr uint32_t kRowTile = 64 * batch;  // a batch x 32 bf16 tile of the row buffer
@@ -112,6 +120,7 @@ void kernel_main() {
     const uint32_t u0 = get_arg_val<uint32_t>(gates_base + 2 * copies + 1);
     const uint32_t nu = get_arg_val<uint32_t>(gates_base + 2 * copies + 2);
     const uint32_t row_writes = get_arg_val<uint32_t>(gates_base + 2 * copies + 3);
+    const uint32_t tok_addr = get_arg_val<uint32_t>(gates_base + 2 * copies + 4);
     const InterleavedAddrGenFast<true> state_dram{
         .bank_base_address = state, .page_size = kF32Tile, .data_format = DataFormat::Float32};
     const InterleavedAddrGenFast<true> norm_dram{
@@ -136,6 +145,17 @@ void kernel_main() {
         }
     }
     cb_push_back(cb_row_mask, 1);
+    uint32_t cur = 0;
+    if constexpr (verify) {
+        // the slot word lands in the state CB, unused until the first state read
+        const uint32_t scratch = get_write_ptr(cb_s_in);
+        noc_async_read(get_noc_addr_from_bank_id<true>(0, tok_addr), scratch, 32);
+        noc_async_read_barrier();
+        cur = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scratch)[kTokSlot] & 1;
+        *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_slot)) = cur + 1;
+    }
+    auto& s_new_iface = get_local_cb_interface(cb_s_new_out);
+    const uint32_t s_new = s_new_iface.fifo_limit - s_new_iface.fifo_size;
 
     volatile tt_l1_ptr uint32_t* rows_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_rows));
     volatile tt_l1_ptr uint32_t* state_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_state));
@@ -150,11 +170,21 @@ void kernel_main() {
         if (l >= copies) {
             noc_semaphore_wait_min(state_sem, i - copies * nu + 1);
         }
-        const uint32_t first = ((set * num_heads + head) * batch + u) * st;
         cb_reserve_back(cb_s_in, st);
-        push_pages(cb_s_mm, state_dram, first, st, kF32Tile);  // then a local copy: one DRAM read per state
-        noc_async_read(get_noc_addr(get_read_ptr(cb_s_mm)), get_write_ptr(cb_s_in), st * kF32Tile);
-        noc_async_read_barrier();
+        if (verify && u == 1) {
+            // row 0's updated state, still in the writer's CB (compute packs the next one only after this push)
+            noc_semaphore_wait_min(state_sem, i);
+            cb_reserve_back(cb_s_mm, st);
+            noc_async_read(get_noc_addr(s_new), get_write_ptr(cb_s_mm), st * kF32Tile);
+            noc_async_read(get_noc_addr(s_new), get_write_ptr(cb_s_in), st * kF32Tile);
+            noc_async_read_barrier();
+            cb_push_back(cb_s_mm, st);
+        } else {
+            const uint32_t first = ((set * num_heads + head) * batch + (verify ? cur : u)) * st;
+            push_pages(cb_s_mm, state_dram, first, st, kF32Tile);  // then a local copy: one DRAM read per state
+            noc_async_read(get_noc_addr(get_read_ptr(cb_s_mm)), get_write_ptr(cb_s_in), st * kF32Tile);
+            noc_async_read_barrier();
+        }
         cb_push_back(cb_s_in, st);
         push_pages(cb_norm_w, norm_dram, set * Vt, Vt, kBf16Tile);
         if (u == u0) {

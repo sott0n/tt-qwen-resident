@@ -86,7 +86,7 @@ void kernel_main() {
     const uint32_t act_sem_addr = get_semaphore(sem_act);
     const uint32_t rows_sem_addr = get_semaphore(sem_rows);
     const uint64_t hub_gather_sem = get_noc_addr(hub_x, hub_y, get_semaphore(sem_gather));
-    const InterleavedAddrGen<true> hist{.bank_base_address = hist_addr, .page_size = 3 * kBlkBytes};
+    const InterleavedAddrGen<true> hist{.bank_base_address = hist_addr, .page_size = kHistSlots * kBlkBytes};
     // the ring step (it picks the history slot to overwrite) comes from the reader: this RISC reads nothing,
     // as the reader's NOC1 weight reads share the read counters of NOC1
     volatile tt_l1_ptr uint32_t* ring_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_ring));
@@ -175,17 +175,22 @@ void kernel_main() {
         } else {
             send_runs(q_off_gdn);
             o_expected += o_heads;
-            cb_wait_front(cb_hist_out, kBlkViews);
+            constexpr uint32_t outs = verify ? 3 : 1;  // verify: T(k + 2), T(k + 3), T(k + 4)
+            cb_wait_front(cb_hist_out, outs * kBlkViews);
             if (n_conv > 0) {
                 // the 32x32 views holding the q|k|v tiles
-                noc_async_write(
-                    get_read_ptr(cb_hist_out),
-                    hist.get_noc_addr(first_row + g % gdn_copies, (conv_step(ring, g, gdn_copies) % 3) * kBlkBytes),
-                    views_of(n_conv) * 2048);
+                const uint32_t step = conv_step(ring, g, gdn_copies);
+                for (uint32_t j = 0; j < outs; j++) {
+                    noc_async_write(
+                        get_read_ptr(cb_hist_out) + j * kBlkViews * 2048,
+                        hist.get_noc_addr(
+                            first_row + g % gdn_copies, ((step + (verify ? 2 + j : 0)) % kHistSlots) * kBlkBytes),
+                        views_of(n_conv) * 2048);
+                }
                 noc_async_write_barrier();
             }
             *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_local)) = g + 1;
-            cb_pop_front(cb_hist_out, kBlkViews);
+            cb_pop_front(cb_hist_out, outs * kBlkViews);
             g++;
         }
         cb_pop_front(cb_qkvz_out, kBlk);

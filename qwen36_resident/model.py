@@ -76,6 +76,7 @@ KV_BLOCK = 8  # KV position tiles per streamed block of an attention worker
 ) = range(13)
 HEAD_FP32_CBS = (5, 6, 7, 15, 30, 31)
 TOK_X0 = 64
+TOK_SLOT = 4  # token state word: the GDN state slot of row 0 (verify)
 KV_ROW = (HD // TILE) * TILE_BYTES[ttnn.bfloat8_b]
 
 
@@ -400,13 +401,30 @@ def bf16_bits(t):
 
 class ResidentModel:
     def __init__(
-        self, mesh, d, w, st, layers, interval, lm_head=False, timeline=False, packet_bytes=4096, embed=None
+        self,
+        mesh,
+        d,
+        w,
+        st,
+        layers,
+        interval,
+        lm_head=False,
+        timeline=False,
+        packet_bytes=4096,
+        embed=None,
+        verify=False,
     ):
         """st: the decode state (State), or one State per user for a batch of len(st) users. More than 8 users
         run as sub-batches of 8, one launch each (the launches share the weights and buffers, each has its
         own decode state). embed (the embedding table on device, one row per page; batch 1 with the lm_head):
-        each step also writes the next step's token state from its own greedy token (step(None))"""
+        each step also writes the next step's token state from its own greedy token (step(None)).
+        verify: st is one user's State and a step runs two rows of it, at positions p and p + 1 (a token
+        and its draft); see token_state for continuing from either row"""
         self.mesh, self.d, self.layers, self.interval, self.lm_head = mesh, d, layers, interval, lm_head
+        self.verify = verify
+        if verify:
+            assert isinstance(st, State) and embed is None
+            st = [st, st]
         sts_all = list(st) if isinstance(st, (list, tuple)) else [st]
         n_sub = -(-len(sts_all) // 8)
         assert len(sts_all) % n_sub == 0
@@ -421,6 +439,10 @@ class ResidentModel:
         gdn_copies, attn_copies = max(len(w["gdn"]), 1), max(len(w["attn"]), 1)
         mlp_copies = len(w["mlp"])
         assert len(w["out"]) == mlp_copies
+        if verify:
+            # row 1 continues each layer's state from row 0 of the same step: no state is reused within a step
+            assert self.n_attn == 0, "verify: GDN layers only so far"
+            assert gdn_copies == self.n_gdn, "verify: one GDN copy (state) per GDN layer"
 
         # ---- cores
         groups, used = streamer_cores(mesh)
@@ -438,7 +460,7 @@ class ResidentModel:
         free = [ttnn.CoreCoord(x, y) for y in range(cgrid.y) for x in range(cgrid.x) if (x, y) not in used]
         # GDN head cores: G per value head (head-major: core hh * G + g), core g of a head takes users
         # g * B / G .. (g + 1) * B / G
-        G = int(os.environ.get("RESIDENT_HEAD_GROUPS", "0")) or max(
+        G = 1 if verify else int(os.environ.get("RESIDENT_HEAD_GROUPS", "0")) or max(
             g for g in range(1, B + 1) if B % g == 0 and 1 + d.nv * g <= len(free)
         )
         assert B % G == 0 and 1 + d.nv * G <= len(free), (B, G, len(free))
@@ -581,6 +603,8 @@ class ResidentModel:
 
         # (each further sub-batch has its own logits, an L1 tensor)
         extra = (n_sub - 1) * B * 2 * nv_max * TILE if lm_head else 0
+        # verify: two more conv history outputs and the row selections
+        extra += (2 * blk_tiles * 64 * B + 3 * 2048) if verify else 0
         ring_bytes = ((L1_WEIGHT_BUDGET - act_bytes(B) + act_bytes(1) - extra) // lcm) * lcm
         self.ring_bytes = ring_bytes
 
@@ -833,8 +857,10 @@ class ResidentModel:
                 aliased(19, 24, CONV_K * blk_tiles),
                 aliased(20, 25, (CONV_K - 1) * blk_tiles),
                 T(21, self.o_in_t),
-                cb(30, grid, blk_tiles * B // TILE),
+                cb(30, grid, (3 if self.verify else 1) * blk_tiles * B // TILE),
             ]
+            if self.verify:
+                cbs.append(cb(36, grid, 3))
             # hub: slots (2 parities x chips) and their sum x (32x32 views), fabric packet headers (2 parities x
             # packets x 2 directions) and a word
             hub_headers = 4 * -(-HIDDEN * 2 * B // packet_bytes)
@@ -1024,7 +1050,7 @@ class ResidentModel:
                 ct += [d.conv_tiles, d.Ot, d.nv * G, int(lm_head)]
                 for (Kt, _, _), (sb, pages, page, block) in zip(entries, geo):
                     ct += [Kt, sb, pages, page, block]
-                ct += [SEM_LOCAL, B, SEM_ADDR, d.nv, blk_tiles, SEM_FLAG]
+                ct += [SEM_LOCAL, B, SEM_ADDR, d.nv, blk_tiles, SEM_FLAG, int(self.verify)]
                 rr, wr, cr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
                 peers = [v for p in sphys for v in (p.x, p.y)]
                 head_xy = [v for p in head_p for v in (p.x, p.y)]
@@ -1121,7 +1147,7 @@ class ResidentModel:
                             hh,
                         ]
                         + gates
-                        + [0, gi * nu, nu, row_writes[hc]]
+                        + [0, gi * nu, nu, row_writes[hc], tok_addr]
                     )
                     col = head_p[hh * G]
                     hw[c.x][c.y] = (
@@ -1185,14 +1211,14 @@ class ResidentModel:
                         kernel(
                             "gdn_head_reader.cpp",
                             head_grid,
-                            head_ct + [SEM_ROWS, d.nv, SEM_LOCAL, B],
+                            head_ct + [SEM_ROWS, d.nv, SEM_LOCAL, B, int(self.verify), SEM_ADDR],
                             hr,
                             dm(NCRISC, NOC1),
                         ),
                         kernel(
                             "gdn_head_writer.cpp",
                             head_grid,
-                            head_ct + [SEM_HEADS, d.nv, SEM_LOCAL, B, SEM_GROUP],
+                            head_ct + [SEM_HEADS, d.nv, SEM_LOCAL, B, SEM_GROUP, int(self.verify), SEM_ADDR],
                             hw,
                             dm(BRISC, NOC0),
                         ),
@@ -1240,19 +1266,20 @@ class ResidentModel:
         self.mesh_pd, self.io = built[0]
         self.nv_split, self.v_bank = nv_split, v_bank
 
-    def token_state(self, x0, pos, ring=None):
+    def token_state(self, x0, pos, ring=None, slot=0):
         """host tensor of the token state: x0 [HIDDEN] at pos, or per user x0 [users, HIDDEN] at positions pos
         (a list); ring is the conv ring step (default: the position, batch 1). With sub-batches, one host
-        tensor per sub-batch."""
+        tensor per sub-batch. Verify: rows [t, draft] at [p, p + 1]; after a step at ring k and slot s the
+        next one continues from row 0 at ring k + 1, slot s, or from row 1 at ring k + 2, slot s ^ 1."""
         if self.n_sub > 1:
             x0 = x0.reshape(self.users, HIDDEN)
             B = self.batch
             return [
                 self._token_state(x0[k * B : (k + 1) * B], pos[k * B : (k + 1) * B], ring) for k in range(self.n_sub)
             ]
-        return self._token_state(x0, pos, ring)
+        return self._token_state(x0, pos, ring, slot)
 
-    def _token_state(self, x0, pos, ring):
+    def _token_state(self, x0, pos, ring, slot=0):
         B = self.batch
         x0 = x0.reshape(B, HIDDEN)
         pos = [pos] if B == 1 and not isinstance(pos, (list, tuple)) else list(pos)
@@ -1261,6 +1288,8 @@ class ResidentModel:
         words = np.zeros(self.tok_words * 2, dtype=np.uint16)
         for i, v in enumerate([ring] + pos):
             words[2 * i], words[2 * i + 1] = v & 0xFFFF, v >> 16
+        if self.verify:
+            words[2 * TOK_SLOT] = slot
         words[TOK_X0 // 2 : TOK_X0 // 2 + B * HIDDEN] = bf16_bits(tiny_order(x0))
         r0 = self.rope_off // 2
         if not hasattr(self, "_rope"):
@@ -1308,8 +1337,18 @@ class ResidentModel:
             ring = sts[0].pos if B == 1 else 0
         d, n, S, copies, blk = self.d, self.d.n, self._S, self._gdn_copies, self._blk * TILE * B
         rows, cols, src = self.hist_index()
-        hist = torch.zeros(n, S * copies, (CONV_K - 1) * blk)
+        hist = torch.zeros(n, S * copies, (4 if self.verify else CONV_K - 1) * blk)
         rep_rows = rows.repeat_interleave(TILE)
+        if self.verify:
+            # pair slots (see streamer_common.hpp): T(ring + j) = (h_j, h_j+1), row 1 of the third unused
+            for c in range(min(len(sts[0].hist), copies)):
+                h = torch.stack(sts[0].hist[c])  # [n, 3, conv_ch]
+                for j in range(CONV_K - 1):
+                    for u in range(2):
+                        if j + u < CONV_K - 1:
+                            at = tiny_index(cols, u, B)
+                            hist[:, rep_rows * copies + c, (ring + j) % 4 * blk + at] = h[:, j + u, src]
+            return hist.reshape(n * S * copies, -1)
         for u, st in enumerate(sts):
             at = tiny_index(cols, u, B)
             for c in range(min(len(st.hist), copies)):

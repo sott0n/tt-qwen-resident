@@ -10,7 +10,8 @@
 // CB address on every head core) and bumps the collector's sem_group.
 //
 // Compile-time args: 0 Kt, 1 Vt, 2 GDN layers, 3 copies, 4 num_streamers, 5 sem_heads, 6 heads (per chip),
-//   7 sem_state (local: state write-backs done), 8 batch, 9 sem_group (collector: other cores' rows in)
+//   7 sem_state (local: state write-backs done), 8 batch, 9 sem_group (collector: other cores' rows in),
+//   10 verify (0 / 1: row u writes state slot cur ^ u, see the reader), 11 sem_slot (local: cur + 1)
 // Runtime args: 0 state address (DRAM, see the reader), 1 o_in_addr (streamers' buffer), 2 head index,
 // then num_streamers x (x, y), then an optional timeline buffer (0 = off; per layer [2] state out,
 // [3] output sent), then u0, nu, the head's cores (1: this core is the collector), the collector's x, y
@@ -28,6 +29,8 @@ constexpr uint32_t num_heads = get_compile_time_arg_val(6);
 constexpr uint32_t sem_state = get_compile_time_arg_val(7);
 constexpr uint32_t batch = get_compile_time_arg_val(8);
 constexpr uint32_t sem_group = get_compile_time_arg_val(9);
+constexpr bool verify = get_compile_time_arg_val(10) != 0;
+constexpr uint32_t sem_slot = get_compile_time_arg_val(11);
 constexpr uint32_t st = Kt * Vt;
 constexpr uint32_t cb_s_new_out = 24, cb_out = 28, cb_stage = 22;
 constexpr uint32_t kBf16Tile = 2048, kF32Tile = 4096, kFaceBytes = 512, kFaceRow = 32;
@@ -53,6 +56,14 @@ void kernel_main() {
     volatile uint32_t* clk = reinterpret_cast<volatile uint32_t*>(RISCV_DEBUG_REG_WALL_CLOCK_L);
     auto& stage_iface = get_local_cb_interface(cb_stage);
     const uint32_t stage = stage_iface.fifo_limit - stage_iface.fifo_size;
+    uint32_t cur = 0;
+    if constexpr (verify) {
+        volatile tt_l1_ptr uint32_t* slot_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_slot));
+        while (*slot_sem == 0) {
+            invalidate_l1_cache();
+        }
+        cur = *slot_sem - 1;
+    }
 
     for (uint32_t i = 0; i < layers * nu; i++) {
         const uint32_t l = i / nu, u = u0 + i % nu;
@@ -95,7 +106,7 @@ void kernel_main() {
         if (ts_addr && u == u0) {
             ts[l * 4 + 2] = *clk;
         }
-        const uint32_t first = ((set * num_heads + head) * batch + u) * st;
+        const uint32_t first = ((set * num_heads + head) * batch + (verify ? cur ^ u : u)) * st;
         for (uint32_t t = 0; t < st; t++) {
             noc_async_write_page(first + t, state_dram, get_read_ptr(cb_s_new_out) + t * kF32Tile);
         }
