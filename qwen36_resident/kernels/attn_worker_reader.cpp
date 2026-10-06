@@ -84,10 +84,11 @@ void kernel_main() {
     noc_async_read(tok.get_noc_addr(0), scratch, 4 * (1 + batch));
     noc_async_read_barrier();
     Chunk chs[batch];
-    uint32_t tail_rs[batch];
+    uint32_t tail_rs[batch], tps[batch];
     for (uint32_t u = 0; u < batch; u++) {
         const uint32_t pos = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scratch)[1 + u];
         const uint32_t tp = pos / 32;
+        tps[u] = tp;
         tail_rs[u] = pos % 32;
         chs[u] = role == 2 ? Chunk{tp % banks, tp / banks, 1, 1} : chunk_of(w, tp);
     }
@@ -137,7 +138,16 @@ void kernel_main() {
     };
 
     constexpr uint32_t k0 = 2 * heads * Dt, v0 = k0 + Dt;
-    const uint32_t user_stride = copies * copy_stride;
+    const uint32_t user_stride = verify ? 0 : copies * copy_stride;
+    // verify, p the last row of its tile: whether row 1's chunk of this worker holds that tile
+    bool waits_tail = false, same_tile = false;
+    if constexpr (verify) {
+        const Chunk& c1 = chs[1];
+        const uint32_t row = tps[0] / banks;
+        same_tile = tps[1] == tps[0];
+        waits_tail = role == 1 && !same_tile && c1.n > 0 && c1.bank == tps[0] % banks && row >= c1.j &&
+                     (row - c1.j) % c1.J == 0 && (row - c1.j) / c1.J < c1.n;
+    }
     for (uint32_t i = 0; i < iters; i++) {
         const uint32_t l = i / batch, u = i % batch;
         const Chunk& ch = chs[u];
@@ -158,13 +168,18 @@ void kernel_main() {
         };
         // the blocks that fit the ring are prefetched before q; the rest need compute to free slots
         const uint32_t early = ch.n < 2 * chunk_max ? ch.n : 2 * chunk_max;
+        volatile tt_l1_ptr uint32_t* tail_sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_tail));
         if (role == 1) {
+            if (waits_tail && u == 1) {
+                noc_semaphore_wait_min(tail_sem, l + 1);
+            }
             read_blocks(0, early);
         } else {
-            // the user's tail of this copy was written back by its previous use
-            if (l >= copies) {
-                noc_semaphore_wait_min(
-                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_tail)), i - copies * batch + 1);
+            // the user's tail of this copy was written back by its previous use (verify: by row 0, same tile)
+            if (same_tile && u == 1) {
+                noc_semaphore_wait_min(tail_sem, i);
+            } else if (l >= copies) {
+                noc_semaphore_wait_min(tail_sem, i - copies * batch + 1);
             }
             cb_reserve_back(cb_tail8, 2 * Dt);
             read_rows(ch, k_addr, 0, 1, get_write_ptr(cb_tail8));

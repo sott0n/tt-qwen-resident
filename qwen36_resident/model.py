@@ -441,8 +441,8 @@ class ResidentModel:
         assert len(w["out"]) == mlp_copies
         if verify:
             # row 1 continues each layer's state from row 0 of the same step: no state is reused within a step
-            assert self.n_attn == 0, "verify: GDN layers only so far"
-            assert gdn_copies == self.n_gdn, "verify: one GDN copy (state) per GDN layer"
+            assert gdn_copies == self.n_gdn or not self.n_gdn, "verify: one GDN copy (state) per GDN layer"
+            assert attn_copies == self.n_attn or not self.n_attn, "verify: one KV cache per attention layer"
 
         # ---- cores
         groups, used = streamer_cores(mesh)
@@ -1003,6 +1003,7 @@ class ResidentModel:
                 banks,
                 SEM_LOCAL,
                 B,
+                int(self.verify),
             ]
             group = d.nv // d.nk
             kv_addrs = [sub["K"].buffer_address(), sub["V"].buffer_address()]
@@ -1183,6 +1184,7 @@ class ResidentModel:
                         + [v for k in ch for v in (wphys[k].x, wphys[k].y)]
                         + [0]
                         + (kv_addrs + [kv_stride, tok_addr] if is_tail else [])
+                        + ([v for k in range(WORKERS - 1) for v in (wphys[k].x, wphys[k].y)] if is_tail else [])
                     )
                     ac[c.x][c.y] = [role, len(ch)]
                 lr, lw, lc = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()

@@ -15,7 +15,7 @@
 // (NOC coordinates), 4 leader row-max slots address, 5 parent x, 6 parent y, 7 slot at the parent,
 // 8 children, then children x (x, y), then an optional timeline buffer (0 = off; word [3] of the
 // reader's: partial sent), then (tail core) k cache address, v cache address, per-copy stride, token
-// state address.
+// state address, then workers - 1 x (x, y) of the chunk workers (verify: see attn_common.hpp).
 
 #include "api/dataflow/dataflow_api.h"
 #include "attn_common.hpp"
@@ -70,6 +70,7 @@ void kernel_main() {
         }
     }
     uint32_t tail_bank[batch], tail_row[batch];
+    uint64_t owner_sem = 0;  // verify: the tail-semaphore of the chunk worker reading row 0's tile for row 1
     if (role == 2) {
         const InterleavedAddrGen<true> tok{
             .bank_base_address = get_arg_val<uint32_t>(tail_args + 3), .page_size = 4 * (1 + batch)};
@@ -79,6 +80,20 @@ void kernel_main() {
             const uint32_t tp = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_flush))[1 + u] / 32;
             tail_bank[u] = tp % banks;
             tail_row[u] = tp / banks;
+        }
+        if constexpr (verify) {
+            const uint32_t tp0 = tail_row[0] * banks + tail_bank[0], tp1 = tail_row[1] * banks + tail_bank[1];
+            // chunk_of's worker for row 0's tile among row 1's complete tiles
+            const uint32_t live = tp1 < banks ? tp1 : banks;
+            const uint32_t b = tp0 % banks;
+            const uint32_t J = (workers - 1 - b + live - 1) / live;
+            const uint32_t owner = b + live * (tail_row[0] % J);
+            if (tp1 != tp0) {
+                owner_sem = get_noc_addr(
+                    get_arg_val<uint32_t>(tail_args + 4 + 2 * owner),
+                    get_arg_val<uint32_t>(tail_args + 5 + 2 * owner),
+                    get_semaphore(sem_tail));
+            }
         }
     }
     for (uint32_t i = 0; i < iters; i++) {
@@ -112,7 +127,7 @@ void kernel_main() {
         }
         if (role == 2) {
             const uint32_t copy_stride = get_arg_val<uint32_t>(tail_args + 2);
-            const uint32_t copy_off = (u * copies + l % copies) * copy_stride + tail_row[u] * kKvRow;
+            const uint32_t copy_off = ((verify ? 0 : u) * copies + l % copies) * copy_stride + tail_row[u] * kKvRow;
             cb_wait_front(cb_flush, 2 * Dt);
             for (uint32_t kv = 0; kv < 2; kv++) {
                 const uint32_t addr = get_arg_val<uint32_t>(tail_args + kv) + copy_off;
@@ -122,6 +137,9 @@ void kernel_main() {
             noc_async_write_barrier();
             cb_pop_front(cb_flush, 2 * Dt);
             *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(sem_tail)) = i + 1;
+            if (owner_sem && u == 0) {
+                noc_semaphore_inc(owner_sem, 1);
+            }
         }
     }
     noc_async_atomic_barrier();

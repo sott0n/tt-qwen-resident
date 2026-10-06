@@ -34,7 +34,12 @@
 // (the streamers' head-output semaphore), 14 eps bits, 15 sem_addr (a worker learns the leader's partial
 // buffer address through it), 16 fanin (partial slots per node of the reduction tree), 17 banks,
 // 18 sem_tail (tail core, local: tail write-backs done; a copy's tail is re-read within a step only after
-// its previous write-back), 19 batch
+// its previous write-back), 19 batch, 20 verify (0 / 1)
+//
+// Verify: the two rows are one user at positions p and p + 1 and share its KV cache (user 0's). Row 1's
+// tail tile holds row 0's new row: on the same tile the tail core reads it after row 0's write-back; when
+// p is the last row of its tile, that tile is complete for row 1 and the chunk worker reading it waits for
+// the write-back (the tail writer bumps the worker's sem_tail, unused on chunk workers otherwise).
 //
 // Batch: the users run one after another through every attention layer (iteration i = layer * batch +
 // user; the semaphores count iterations). User u has its own position (token state word 1 + u), rope
@@ -66,6 +71,8 @@ constexpr uint32_t fanin = get_compile_time_arg_val(16);
 constexpr uint32_t banks = get_compile_time_arg_val(17);
 constexpr uint32_t sem_tail = get_compile_time_arg_val(18);
 constexpr uint32_t batch = get_compile_time_arg_val(19);
+constexpr bool verify = get_compile_time_arg_val(20) != 0;
+static_assert(!verify || batch == 2, "verify runs two rows of one user");
 constexpr uint32_t iters = layers * batch;
 static_assert(heads <= 16, "head rows live in the top faces");
 static_assert(rot_tiles == 2, "rope pairs dims (i, i + 32) of the first 64 head dims");
