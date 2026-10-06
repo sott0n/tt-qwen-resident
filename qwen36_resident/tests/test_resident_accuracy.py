@@ -35,6 +35,7 @@ PREFILL = os.environ.get("RESIDENT_PREFILL", "0") == "1"
 CHUNK = int(os.environ.get("RESIDENT_CHUNK", "512"))
 TRACE_REGION = 64 << 20
 BATCH = int(os.environ.get("RESIDENT_BATCH", "1"))
+DUMP = os.environ.get("RESIDENT_DUMP")  # path: save x and the argmax after every step (batch 1)
 
 
 @pytest.mark.parametrize(
@@ -95,6 +96,8 @@ def test_resident_accuracy(mesh_device):
     top5_hits = [0] * B
     count = 0
     step_times, token_times = [], []
+    assert B == 1 or not DUMP
+    dump = dict(pos=[], x=[], argmax=[])
     for pos in range(first, tokens.shape[-1] - 1):
         # one token: host token state (embedding row, position, rope), the step, the device argmax
         t0 = time.perf_counter()
@@ -106,6 +109,10 @@ def test_resident_accuracy(mesh_device):
         preds = model.argmax()
         preds = preds if B > 1 else [preds]
         token_times.append(time.perf_counter() - t0)
+        if DUMP:
+            dump["pos"].append(pos)
+            dump["x"].append(model.x().bfloat16())
+            dump["argmax"].append(preds[0])
         if pos >= split - 1:
             for u in range(0, B, 2):
                 top1[u] += preds[u] == int(top5[pos, 0])
@@ -117,6 +124,8 @@ def test_resident_accuracy(mesh_device):
         # the time to first token: prefill, handoff and the prompt's last token through the decode step
         prefill["ttft_s"] = prefill["prefill_s"] + prefill["handoff_s"] + token_times[0]
     model.release_trace()
+    if DUMP:
+        torch.save(dict(pos=dump["pos"], x=torch.stack(dump["x"]), argmax=dump["argmax"], tokens=tokens), DUMP)
     steady = sorted(step_times[16:])
     tokens_steady = sorted(token_times[16:])
     rec = dict(
