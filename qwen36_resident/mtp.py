@@ -16,6 +16,7 @@ generate() accepts drafts on the host; generate_fed() lets the two hubs write ea
 import time
 
 import torch
+from loguru import logger
 
 import ttnn
 from qwen36_resident import weights as Q
@@ -184,6 +185,8 @@ class SpecDecoder:
             nxt = [seq[p + 1], seq[p + 2] if p + 2 < P else seq[p + 1]]
             d = self._draft(nxt, h, p, ring, slot)[accept]
             p, ring, slot = (p + 2, ring + 2, slot ^ 1) if accept else (p + 1, ring + 1, slot)
+            if p % 4096 < 2:
+                logger.info(f"prompt: {p} / {P} positions")
         return p, ring, slot, d
 
     def generate_fed(self, prompt, n_new):
