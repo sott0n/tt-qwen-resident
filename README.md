@@ -7,7 +7,7 @@ execution with a design built for Tensix.
 
 | | |
 |---|---|
-| Decode, batch 1 | 75 tok/s/user (demo: 25.5) |
+| Decode, batch 1 | 83 tok/s/user (demo: 25.5) |
 | TTFT, 511-token prompt | 0.19 s (demo: 0.31 s at 128) |
 | Batch 8 | 374 tok/s total, 46.7 tok/s/user (demo: 165 total) |
 | Longest context run end to end | 256k |
@@ -21,20 +21,23 @@ Measured on the same host.
 
 | Metric | tt-metal demo | This work | Ratio |
 |---|---|---|---|
-| Decode, batch 1, short context | 25.5 tok/s/user | 75 tok/s/user | 2.9× |
+| Decode, batch 1, short context | 25.5 tok/s/user | 83 tok/s/user | 3.3× |
 | TTFT, 128 tokens | 0.31 s | 0.12 s | 2.6× |
 | TTFT, 4k | 0.65 s | 0.63 s | 1.0× |
 | TTFT, 8k | 1.24 s | 1.07 s | 1.2× |
 | TTFT, 16k | 2.68 s | 2.06 s | 1.3× |
 | TTFT, 32k | 6.35 s | 4.49 s | 1.4× |
 | TTFT, 128k | 34.4 s | 32.7 s | 1.05× |
-| Decode, batch 1, at 32k / 128k | 24.3 / 22.9 tok/s/user | 69.7 / 54.2 tok/s/user | 2.9× / 2.4× |
+| Decode, batch 1, at 32k / 128k | 24.3 / 22.9 tok/s/user | 73.7 / 57.9 tok/s/user | 3.0× / 2.5× |
 | Batch 8: total tok/s (tok/s/user) | 165 (20.6) | 374 (46.7) | 2.3× |
 | Batch 32: total tok/s (tok/s/user) | 404 (12.6) | 374 (11.7) | 0.93× |
 | Token accuracy top-1 / top-5 | 98.63 / 100 | 99.41 / 100 | — |
 
 Rates marked tok/s/user are per user; at batch 1 that is the whole decode rate. Totals are tok/s summed over
-the batch. Decode rates include the host token setup and the argmax read-back per token. TTFT is end to end:
+the batch. Decode rates include the host's read of every generated token. At batch 1 the decode model feeds
+itself: each step's hub picks the greedy token across the chips and writes the next step's token state on
+device, so steps run back to back and the host reads each token one step late. With the host writing every
+token state and waiting for the argmax instead, batch 1 takes 12.6 ms per token at short context. TTFT is end to end:
 prefill, state handoff to the decode model, and the first decode step. The demo's batched runs use 128-token
 prompts.
 
@@ -48,7 +51,7 @@ causal attention, at 4 × 371 TFLOPS (the sustained matmul rate measured in ttnn
 | Workload | Floor | tt-metal demo | % of floor | This work | % of floor |
 |---|---|---|---|---|---|
 | Decode step, batch 1 | 10.7 ms | 38.3 ms | 28% | 12.1 ms | 88% |
-| Decode token with host, batch 1 | 10.7 ms | 39.2 ms | 27% | 13.3 ms | 80% |
+| Decode token with host, batch 1 | 10.7 ms | 39.2 ms | 27% | 12.0 ms | 89% |
 | Decode step, batch 8 | 11.9 ms | 48.5 ms | 25% | 21.4 ms | 56% |
 | Prefill, 8k prompt | 0.27 s | 1.24 s | 22% | 1.07 s | 25% |
 | Prefill, 32k prompt | 1.22 s | 6.35 s | 19% | 4.49 s | 27% |
@@ -156,6 +159,14 @@ of the hardware floor.
 - Attention layer: 155–160 µs at short context.
 - All-reduce: 3.75 µs per [1, 5120] vector, against 14 µs for the ttnn CCL op.
 
+At batch 1 the step also produces the next step's input, so the host is never between two steps. The hub
+reduces the streamers' argmax candidates, exchanges one 16-byte record per chip over fabric, and every chip
+picks the same token. It then writes the next token state to DRAM: the position + 1, the token's embedding
+row (from the prefill's table) and the RoPE tiles of the new position (from a table built at load). A token
+costs 12.0 ms with the host reading it one step late, against 12.6 ms when the host writes each state. The
+fabric semaphores count up from a per-hub launch counter and are never reset inside a step: with no host gap,
+a peer can start the next step and count into this chip before this chip's step ends.
+
 ## Pipeline-parallel prefill
 
 Each chip holds 16 complete layers and the prompt flows chip to chip in chunks. Every tick runs the same op
@@ -184,10 +195,10 @@ longer grows with the context. Logits PCC against torch is 0.998 at position 131
 
 | Prompt (batch 1) | TTFT | Decode | Demo TTFT | Demo decode |
 |---|---|---|---|---|
-| 32k | 4.49 s | 69.7 tok/s/user | 6.35 s | 24.3 tok/s/user |
-| 64k | 11.3 s | 62.9 tok/s/user | not measured | not measured |
-| 128k | 32.7 s | 54.2 tok/s/user | 34.4 s | 22.9 tok/s/user |
-| 256k | 106.8 s | 42.9 tok/s/user | not measured | not measured |
+| 32k | 4.50 s | 73.7 tok/s/user | 6.35 s | 24.3 tok/s/user |
+| 64k | 11.3 s | 67.8 tok/s/user | not measured | not measured |
+| 128k | 32.6 s | 57.9 tok/s/user | 34.4 s | 22.9 tok/s/user |
+| 256k | 107.0 s | 44.9 tok/s/user | not measured | not measured |
 
 At 128k the prefill is nearly level with the demo. Prefill attention FLOPs grow with the square of the prompt
 and dominate there; this is the next prefill lever.
@@ -243,6 +254,34 @@ At batch 32 the total is 7% below the demo, because sub-batches do not share the
 - The demo at 64k and 256k was not measured, and a clean build of this repository from its submodule has not
   been run.
 
+## Serving with vLLM
+
+`qwen36_resident/generator_vllm.py` adapts the model to vLLM through the
+[vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin), and `tt-model.yaml` packages it with
+[tt-model](https://github.com/tenstorrent/tt-model-manager) as a container on Hugging Face. On a host with
+Docker and a QB2:
+
+```bash
+tt-model serve kyamaguchiTT/qwen3.6-27b-resident-p150x4    # OpenAI API on port 20000
+```
+
+Served by that package, one user, greedy, 128 generated tokens, measured from a streaming client:
+
+| Prompt | TTFT | Decode |
+|---|---|---|
+| 128 | 0.17 s | 83 tok/s/user |
+| 2k | 0.45 s | 83 tok/s/user |
+| 8k | 1.16 s | 81 tok/s/user |
+| 32k | 4.56 s | 74 tok/s/user |
+
+Greedy steps (temperature 0 or top_k 1, no penalties or logprobs) take the device argmax and run
+asynchronously: vLLM submits step N + 1 before reading step N's token, which the hub has already fed into
+step N + 1. Any other request samples on the host from the full logits, synchronously. TTFT is 50–90 ms
+over the model's own, for the request handling and the decode state reset.
+
+Limits: one user at a time (`max_num_seqs` 1, since the prefill hands off to a batch-1 decode model only),
+text only, 32k context in the package.
+
 ## Layout
 
 ```
@@ -252,9 +291,11 @@ qwen36_resident/
   model.py   resident decode model builder
   weights.py checkpoint -> per-chip weights
   common.py  dimensions and streamer layout helpers
+  generator_vllm.py  vLLM adapter; vllm_models/ registers it with the plugin
   tests/     accuracy tests and benchmarks
 patches/     changes to tt-metal's ttnn this code needs (applied to the submodule)
 tt-metal/    submodule, pinned to the tt-metal commit this code is built against
+tt-model.yaml  container package manifest for tt-model
 ```
 
 ## Setup
@@ -280,6 +321,8 @@ the reference tokens from tt-metal (`models/tt_transformers/tests/reference_outp
 pytest qwen36_resident/tests/test_resident_accuracy.py::test_resident_accuracy        # decode accuracy (RESIDENT_BATCH=8)
 RESIDENT_PREFILL=1 pytest qwen36_resident/tests/test_resident_accuracy.py::test_resident_accuracy  # with prefill
 RESIDENT_PROMPTS=511,8192,32767 pytest qwen36_resident/tests/bench_ttft.py           # TTFT and decode speed
+RESIDENT_FEED=1 RESIDENT_PROMPTS=127,32767 pytest qwen36_resident/tests/bench_ttft.py # with the decode feeding itself
+pytest qwen36_resident/tests/test_resident_feed.py                                    # fed greedy = host-fed greedy
 RESIDENT_BATCHES=1,8,32 pytest qwen36_resident/tests/bench_resident_batch.py          # decode step per batch
 RESIDENT_BATCH=8 pytest qwen36_resident/tests/bench_resident_model.py::test_resident_decode_steps  # vs torch, random weights
 RESIDENT_LAYERS=16 pytest qwen36_resident/tests/prof_pp_tick.py                       # untraced prefill ticks for the profiler
