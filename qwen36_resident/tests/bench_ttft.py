@@ -87,7 +87,8 @@ def test_ttft(mesh_device):
                 model.step(None)
                 reads.append(ttnn.from_device(view, blocking=False))
             ttnn.synchronize_device(mesh_device)
-            fed = dict(fed_decode_ms_mean=round((time.perf_counter() - s0) * 1e3 / DECODE_STEPS, 2))
+            fed_s = (time.perf_counter() - s0) / DECODE_STEPS
+            fed = dict(fed_decode_ms_mean=round(fed_s * 1e3, 2), fed_decode_tok_s_user=round(1 / fed_s, 1))
         rec = dict(
             layers=layers,
             prompt=T,
@@ -98,6 +99,7 @@ def test_ttft(mesh_device):
             first_step_s=t3 - t2,
             handoff_parts={k: round(v, 4) for k, v in parts.items()},
             decode_ms_median=round(sorted(step_s)[len(step_s) // 2] * 1e3, 2),
+            decode_tok_s_user=round(1 / sorted(step_s)[len(step_s) // 2], 1),
             **fed,
         )
         logger.info(rec)
