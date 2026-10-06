@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Time to first token of Qwen3.6-27B on QB2 as a user sees it: the resident decode model is resident, the
 prompt goes through the pipeline-parallel prefill (chunk size picked per prompt), the state is handed to the
-decode model, and the prompt's last token runs one decode step to the first generated token."""
+decode model, and the prompt's last token runs one decode step to the first generated token.
+
+RESIDENT_FEED=1 builds the decode model with the prefill's embedding table, so its hub feeds each step's
+greedy token into the next one; the decode is then also timed fed: steps launched back to back, each
+followed by a non-blocking read of the fed token (the per-token cost a server pays)."""
 import json
 import os
 import time
@@ -18,6 +22,7 @@ from qwen36_resident.model import Dims, ResidentModel, State
 
 OUT = os.environ.get("BENCH_OUT", "/tmp/resident_ttft.jsonl")
 DECODE_STEPS = int(os.environ.get("RESIDENT_DECODE_STEPS", "32"))
+FEED = os.environ.get("RESIDENT_FEED", "0") == "1"
 
 
 @pytest.mark.parametrize(
@@ -36,14 +41,17 @@ def test_ttft(mesh_device):
     n_attn = sum((l + 1) % interval == 0 for l in range(layers))
     C = max(chunks)
     max_len = (max(prompts) + C - 1) // C * C
+    if FEED:  # the hub feeds from the prefill's embedding table
+        pp = PPPrefill(mesh_device, ck, layers, interval, chunk=chunks, max_len=max_len)
     w = Q.load(ck, d, layers, interval)
-    st = State(d, layers - n_attn, n_attn, 0, max_pos=max_len + 64 + DECODE_STEPS, zero=True)
-    model = ResidentModel(mesh_device, d, w, st, layers, interval, lm_head=True)
+    st = State(d, layers - n_attn, n_attn, 0, max_pos=max_len + 64 + 2 * DECODE_STEPS, zero=True)
+    model = ResidentModel(mesh_device, d, w, st, layers, interval, lm_head=True, embed=pp.embed if FEED else None)
     del w
     model.step(model.token_state(emb[0].float(), 0))  # compile outside the trace
     model.reset()
     model.capture_trace()
-    pp = PPPrefill(mesh_device, ck, layers, interval, chunk=chunks, max_len=max_len)
+    if not FEED:
+        pp = PPPrefill(mesh_device, ck, layers, interval, chunk=chunks, max_len=max_len)
     pp.capture()
     pp.handoff(model, 1)  # compiles the handoff kernel
     g = torch.Generator().manual_seed(0)
@@ -70,6 +78,16 @@ def test_ttft(mesh_device):
             model.step(tok)
             model.argmax()
             step_s.append(time.perf_counter() - s0)
+        fed = {}
+        if FEED:
+            view = ttnn.get_device_tensors(model.out_t)[0]
+            reads = []
+            s0 = time.perf_counter()
+            for _ in range(DECODE_STEPS):
+                model.step(None)
+                reads.append(ttnn.from_device(view, blocking=False))
+            ttnn.synchronize_device(mesh_device)
+            fed = dict(fed_decode_ms_mean=round((time.perf_counter() - s0) * 1e3 / DECODE_STEPS, 2))
         rec = dict(
             layers=layers,
             prompt=T,
@@ -80,6 +98,7 @@ def test_ttft(mesh_device):
             first_step_s=t3 - t2,
             handoff_parts={k: round(v, 4) for k, v in parts.items()},
             decode_ms_median=round(sorted(step_s)[len(step_s) // 2] * 1e3, 2),
+            **fed,
         )
         logger.info(rec)
         with open(OUT, "a") as f:
