@@ -414,6 +414,8 @@ class ResidentModel:
         embed=None,
         verify=False,
         fc=None,
+        tok=None,
+        feed_peer=None,
     ):
         """st: the decode state (State), or one State per user for a batch of len(st) users. More than 8 users
         run as sub-batches of 8, one launch each (the launches share the weights and buffers, each has its
@@ -422,12 +424,14 @@ class ResidentModel:
         verify: st is one user's State and a step runs two rows of it, at positions p and p + 1 (a token
         and its draft); see token_state for continuing from either row. fc (the MTP draft layer): per chip
         its K slice [2 HIDDEN / n, HIDDEN] of the fc that makes x0 from the token state's two vectors per row
-        (see streamer_common.hpp)"""
+        (see streamer_common.hpp). tok: the token state tensor (default: a new one, see tok_tensor).
+        verify with embed: the hub feeds the MTP draft loop (mlp_hub.cpp kinds 1 and 2), writing the next
+        token state of feed_peer's model (the draft model for the main one and back)"""
         self.mesh, self.d, self.layers, self.interval, self.lm_head = mesh, d, layers, interval, lm_head
         self.verify = verify
         self.fc = fc is not None
         if verify:
-            assert isinstance(st, State) and embed is None
+            assert isinstance(st, State)
             st = [st, st]
         sts_all = list(st) if isinstance(st, (list, tuple)) else [st]
         n_sub = -(-len(sts_all) // 8)
@@ -712,7 +716,10 @@ class ResidentModel:
         # ---- token state: ring step, positions, x0, rope tables of the positions
         self.rope_off = TOK_X0 + (2 if self.fc else 1) * d.Ht * 64 * B
         self.tok_words = (self.rope_off + 3 * 2048 * B) // 4
-        self.tok_t = dram_t(torch.zeros(1, self.tok_words, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, rep)
+        if tok is None:
+            tok = dram_t(torch.zeros(1, self.tok_words, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, rep)
+        assert tok.shape[-1] == self.tok_words
+        self.tok_t = tok
 
         # ---- hub
         # the hub's slots are a hub CB; it dumps the last layer's x here (for the host)
@@ -734,8 +741,9 @@ class ResidentModel:
         # position (a page per position, laid out as in the token state) and the (token, position) out word
         self.feed = embed is not None
         if self.feed:
-            assert lm_head and B == 1 and n_sub == 1, "the hub feeds batch 1 with the lm_head"
-            self.embed = embed
+            assert lm_head and (B == 1 or verify) and n_sub == 1, "the hub feeds batch 1 with the lm_head"
+            assert (feed_peer is not None) == verify
+            self.embed, self.feed_peer = embed, feed_peer
             self.cand_t = l1(torch.zeros(1, n * 4, dtype=torch.int32), hub_grid, [1, n * 4], ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
             self.feed_sems = [ttnn.create_global_semaphore(mesh, hub_grid, 0) for _ in range(2)]  # candidates, launches
             rope = rope_words(sts[0].max_pos).reshape(sts[0].max_pos, -1).view(np.int32)
@@ -1111,6 +1119,8 @@ class ResidentModel:
                 hub_ct = [n, chip, HIDDEN * 2 * B, packet_bytes, rounds, S, SEM_GATHER, SEM_SLOTS]
                 hub_ct += [SEM_FLAG, int(lm_head), 1, 1, SEM_ADDR]
                 hub_ct += [int(self.feed), sts[0].max_pos, self.tok_words * 4, self.rope_off, 3 * 2048]
+                feed_kind = (2 if self.fc else 1) if self.feed and verify else 0
+                hub_ct += [feed_kind, TOK_X0 + (1 if self.fc else 2) * d.Ht * 64 * B, HIDDEN * 2]
                 if self.feed:
                     hub_args += [
                         sub["argmax"].buffer_address(),
@@ -1121,6 +1131,8 @@ class ResidentModel:
                         self.rope_t.buffer_address(),
                         self.out_t.buffer_address(),
                     ]
+                    if feed_kind:
+                        hub_args.append(self.feed_peer.buffer_address())
                 hub_rt = ttnn.RuntimeArgs()
                 hub_rt[hub.x][hub.y] = hub_args
 
@@ -1263,6 +1275,8 @@ class ResidentModel:
                 io += [sub["logits"], sub["argmax"]]
             if self.feed:
                 io += [self.cand_t, self.rope_t, self.out_t, self.embed]
+                if self.feed_peer is not None:
+                    io.append(self.feed_peer)
             if timeline:
                 io.append(self.ts_t)
             return mesh_pd, io
@@ -1274,7 +1288,20 @@ class ResidentModel:
         self.mesh_pd, self.io = built[0]
         self.nv_split, self.v_bank = nv_split, v_bank
 
-    def token_state(self, x0, pos, ring=None, slot=0):
+    @staticmethod
+    def tok_tensor(mesh, d, batch, fc=False):
+        """a zero token state tensor for a model of `batch` rows (fc: the MTP draft model)"""
+        words = (TOK_X0 + (2 if fc else 1) * d.Ht * 64 * batch + 3 * 2048 * batch) // 4
+        return ttnn.from_torch(
+            torch.zeros(1, words, dtype=torch.int32),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+
+    def token_state(self, x0, pos, ring=None, slot=0, words=None):
         """host tensor of the token state: x0 [HIDDEN] at pos, or per user x0 [users, HIDDEN] at positions pos
         (a list); ring is the conv ring step (default: the position, batch 1). With sub-batches, one host
         tensor per sub-batch. Verify: rows [t, draft] at [p, p + 1]; after a step at ring k and slot s the
@@ -1285,9 +1312,9 @@ class ResidentModel:
             return [
                 self._token_state(x0[k * B : (k + 1) * B], pos[k * B : (k + 1) * B], ring) for k in range(self.n_sub)
             ]
-        return self._token_state(x0, pos, ring, slot)
+        return self._token_state(x0, pos, ring, slot, words)
 
-    def _token_state(self, x0, pos, ring, slot=0):
+    def _token_state(self, x0, pos, ring, slot=0, extra=None):
         B = self.batch
         x0 = x0.reshape(B, -1)
         pos = [pos] if B == 1 and not isinstance(pos, (list, tuple)) else list(pos)
@@ -1298,6 +1325,8 @@ class ResidentModel:
             words[2 * i], words[2 * i + 1] = v & 0xFFFF, v >> 16
         if self.verify:
             words[2 * TOK_SLOT] = slot
+        for i, v in (extra or {}).items():  # further head words (the MTP feed's, see mlp_hub.cpp)
+            words[2 * i], words[2 * i + 1] = v & 0xFFFF, v >> 16
         words[TOK_X0 // 2 : TOK_X0 // 2 + x0.numel()] = bf16_bits(tiny_order(x0))
         r0 = self.rope_off // 2
         if not hasattr(self, "_rope"):

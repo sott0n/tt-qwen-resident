@@ -10,11 +10,14 @@ norm_h(h_q)]) for the main model's final hidden h_q and predicts tok[q + 2]. Aft
 adds the entries p (and p + 1 when the draft was accepted) and its row on the kept path drafts the next
 step's d. The fc runs on device (ResidentModel fc) on the main model's last x: norm_h(rmsnorm(x)) without
 the final norm's weight in between (drafts accepted on the reference text: 84.7% instead of 86.4%).
+generate() accepts drafts on the host; generate_fed() lets the two hubs write each other's token state
+(mlp_hub.cpp feed kinds 1 and 2), so steps run back to back and the host reads each step's record late.
 """
 import time
 
 import torch
 
+import ttnn
 from qwen36_resident import weights as Q
 from qwen36_resident.model import Dims, ResidentModel, State
 
@@ -62,8 +65,28 @@ class SpecDecoder:
         interval = ck.config["full_attention_interval"]
         n_attn = sum((l + 1) % interval == 0 for l in range(layers))
         w = Q.load(ck, d, layers, interval)
+        self.emb = Q.embedding(ck).float()
+        self.emb_t = ttnn.from_torch(
+            self.emb.bfloat16(),
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            device=mesh,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+        )
+        main_tok, draft_tok = ResidentModel.tok_tensor(mesh, d, 2), ResidentModel.tok_tensor(mesh, d, 2, fc=True)
         self.main = ResidentModel(
-            mesh, d, w, State(d, layers - n_attn, n_attn, 0, max_pos, zero=True), layers, interval, True, verify=True
+            mesh,
+            d,
+            w,
+            State(d, layers - n_attn, n_attn, 0, max_pos, zero=True),
+            layers,
+            interval,
+            True,
+            verify=True,
+            embed=self.emb_t,
+            tok=main_tok,
+            feed_peer=draft_tok,
         )
         del w
         self.draft = ResidentModel(
@@ -76,9 +99,11 @@ class SpecDecoder:
             True,
             verify=True,
             fc=mtp_fc(ck, d),
+            embed=self.emb_t,
+            tok=draft_tok,
+            feed_peer=main_tok,
         )
         self.mesh = mesh
-        self.emb = Q.embedding(ck).float()
         if trace:
             for m in (self.main, self.draft):
                 width = (2 if m.fc else 1) * self.emb.shape[1]
@@ -88,7 +113,7 @@ class SpecDecoder:
 
     def _main(self, toks, p, ring, slot):
         m = self.main
-        m.step(m.token_state(self.emb[toks], [p, p + 1], ring=ring, slot=slot))
+        m.step(m.token_state(self.emb[toks], [p, p + 1], ring=ring, slot=slot, words={5: toks[1], 6: toks[0]}))
         return m.argmax(), m.x()
 
     draft_t = []
@@ -148,6 +173,60 @@ class SpecDecoder:
             tok_s=(len(seq) - P) / total,
         )
         return out, stats
+
+    def _prompt(self, seq):
+        """the prompt through both models, host driven (see generate); returns (p, ring, slot, draft)"""
+        P = len(seq)
+        p = ring = slot = 0
+        while p <= P - 2:
+            accept = int(p + 1 <= P - 2)
+            a, h = self._main([seq[p], seq[p + 1]], p, ring, slot)
+            nxt = [seq[p + 1], seq[p + 2] if p + 2 < P else seq[p + 1]]
+            d = self._draft(nxt, h, p, ring, slot)[accept]
+            p, ring, slot = (p + 2, ring + 2, slot ^ 1) if accept else (p + 1, ring + 1, slot)
+        return p, ring, slot, d
+
+    def generate_fed(self, prompt, n_new):
+        """generate() with the hubs feeding each other: the host writes only the first step's token state and
+        reads each step's (accept, a0, a1) record while the next steps run"""
+        for m in (self.main, self.draft):
+            m.reset()
+        seq = [int(t) for t in prompt]
+        P = len(seq)
+        p, ring, slot, d = self._prompt(seq)
+        m = self.main
+        m.step(m.token_state(self.emb[[seq[p], d]], [p, p + 1], ring=ring, slot=slot, words={5: d, 6: seq[p]}))
+        self.draft.step(None)
+        view = ttnn.get_device_tensors(m.out_t)[0]
+        pending = []
+        steps = accepted = 0
+        t0 = time.perf_counter()
+        first = True
+        while len(seq) < P + n_new:
+            if not first:
+                m.step(None)
+                self.draft.step(None)
+            # the main step's record was written before the draft step that follows it
+            pending.append((ttnn.from_device(view, blocking=False), ttnn.record_event(self.mesh, 0)))
+            first = False
+            if len(pending) < 2:
+                continue
+            host, ev = pending.pop(0)
+            ttnn.event_synchronize(ev)
+            rec = ttnn.to_torch(host).reshape(-1)[:4].tolist()
+            accept, a0, a1 = rec[0], rec[1], rec[2]
+            seq += [a0, a1] if accept else [a0]
+            steps += 1
+            accepted += accept
+        ttnn.synchronize_device(self.mesh)
+        total = time.perf_counter() - t0
+        return seq[: P + n_new], dict(
+            fed_steps=steps,
+            fed_accept_rate=accepted / steps,
+            fed_tokens_per_step=(len(seq) - P) / steps,
+            fed_ms_per_step=1e3 * total / steps,
+            fed_tok_s=(len(seq) - P) / total,
+        )
 
     def greedy(self, prompt, n_new):
         """plain greedy on the main model's verify step (row 1 repeats row 0's token and is never kept): the

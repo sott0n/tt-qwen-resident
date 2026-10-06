@@ -35,9 +35,21 @@
 // pos + 1; into out: (token, pos + 1). Counts on the global semaphores are monotonic: a peer can start
 // the next step and count into this chip before this hub ends, so nothing is reset here. A per-hub
 // launch counter gives each launch its base; the host zeroes all of them while the device is idle.
-// Compile-time args 13 feed, 14 max_pos, 15 tok page bytes, 16 rope offset in tok, 17 rope bytes.
+// Compile-time args 13 feed, 14 max_pos, 15 tok page bytes, 16 rope offset in tok, 17 rope bytes, 18 feed
+// kind, 19 rope offset in the peer's tok, 20 embedding row bytes.
 // Runtime args (feed), after the rectangles: argmax records, candidate slots (L1, num_chips x 16 B, same
-// address on every chip), candidate semaphore, launch counter, tok, embedding table, rope table, out.
+// address on every chip), candidate semaphore, launch counter, tok, embedding table, rope table, out, then
+// the peer's tok (verify kinds).
+//
+// Feed kinds 1 and 2 run MTP speculative decode with no host between steps: the main model's verify step
+// (kind 1, rows t at p and draft d at p + 1) and the draft model's (kind 2, see mtp.py) alternate, each
+// writing the other's token state (words: 0 ring, 1 / 2 positions, 4 GDN state slot, 5 draft (main) or
+// accept (draft), 6 t (main) or a0 (draft), 7 a1, 8 / 9 the main model's ring and slot). Both rows' greedy
+// tokens are reduced (the 16 B candidate record holds both).
+//   kind 1: accept = a0 == d; the draft model's entries are (a0, x row 0) at p and (a1, x row 1) at p + 1
+//     (x0 = both embedding rows, then this step's x); out = (accept, a0, a1, p).
+//   kind 2: d' = its row-accept token; the main model continues at p' = p + 1 + accept with rows
+//     (accept ? a1 : a0, d'), ring + 1 + accept and slot ^ accept; out = (d', t', p').
 
 #include <cstdint>
 
@@ -65,9 +77,102 @@ constexpr uint32_t max_pos = get_compile_time_arg_val(14);
 constexpr uint32_t tok_bytes = get_compile_time_arg_val(15);
 constexpr uint32_t rope_off = get_compile_time_arg_val(16);
 constexpr uint32_t rope_bytes = get_compile_time_arg_val(17);
+constexpr uint32_t feed_kind = get_compile_time_arg_val(18);
+constexpr uint32_t peer_rope_off = get_compile_time_arg_val(19);
+constexpr uint32_t row_bytes = get_compile_time_arg_val(20);
+constexpr uint32_t rows = feed_kind > 0 ? 2 : 1;  // greedy tokens per launch
 constexpr uint32_t packets_per_vector = (vector_bytes + packet_bytes - 1) / packet_bytes;
 constexpr uint32_t num_headers = 2 * packets_per_vector * 2 + (feed ? 2 : 0);
 constexpr bool pooled = num_headers <= NUM_PACKET_HEADERS / MaxDMProcessorsPerCoreType;
+
+// row `row` (row_bytes, in L1) as row u of the 2 x 32 tiles at `dst` (face rows of 32 B)
+void scatter_row(uint32_t row, uint32_t dst, uint32_t u) {
+    volatile tt_l1_ptr uint32_t* src = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(row);
+    volatile tt_l1_ptr uint32_t* out = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dst);
+    for (uint32_t t = 0; t < row_bytes / 64; t++) {
+        for (uint32_t f = 0; f < 2; f++) {
+            for (uint32_t w = 0; w < 8; w++) {
+                out[t * 32 + (2 * f + u) * 8 + w] = src[t * 16 + f * 8 + w];
+            }
+        }
+    }
+}
+
+// feed kinds 1 and 2 (see above); h: this launch's token state head (64 B, in L1 at `stage`)
+void feed_verify(
+    volatile tt_l1_ptr uint32_t* h,
+    const uint32_t* best,
+    uint32_t stage,
+    uint32_t embed_addr,
+    uint32_t rope_addr,
+    uint32_t peer_tok_addr,
+    uint32_t out_addr,
+    uint32_t x_addr) {
+    // stage: head | peer head | x0 (kind 1: 2 vectors) | rope (2 rows) | 2 embedding rows
+    const uint32_t ph = stage + 64, x0 = stage + 128;
+    const uint32_t x0_bytes = (feed_kind == 1 ? 2 : 1) * vector_bytes;
+    const uint32_t rope = x0 + x0_bytes, rows_l1 = rope + 2 * rope_bytes;
+    volatile tt_l1_ptr uint32_t* g = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(ph);
+    const uint32_t a0 = best[0], a1 = best[1];
+    uint32_t p, toks[2];
+    for (uint32_t i = 0; i < 16; i++) {
+        g[i] = 0;
+    }
+    if constexpr (feed_kind == 1) {
+        p = h[1];
+        const uint32_t accept = a0 == h[5];
+        toks[0] = a0;
+        toks[1] = a1;
+        g[1] = p;
+        g[2] = p + 1;
+        g[5] = accept;
+        g[6] = a0;
+        g[7] = a1;
+        g[8] = h[0];
+        g[9] = h[4];
+        // out: (accept, a0, a1, p), written below from the head block
+        h[0] = accept;
+        h[1] = a0;
+        h[2] = a1;
+        h[3] = p;
+    } else {
+        const uint32_t accept = h[5];
+        p = h[1] + 1 + accept;
+        const uint32_t d = accept ? a1 : a0, t = accept ? h[7] : h[6];
+        toks[0] = t;
+        toks[1] = d;
+        g[0] = h[8] + 1 + accept;
+        g[1] = p;
+        g[2] = p + 1;
+        g[4] = h[9] ^ accept;
+        g[5] = d;
+        g[6] = t;
+        h[0] = d;
+        h[1] = t;
+        h[2] = p;
+        h[3] = 0;
+    }
+    const uint32_t r0 = p < max_pos ? p : max_pos - 1, r1 = p + 1 < max_pos ? p + 1 : max_pos - 1;
+    const InterleavedAddrGen<true> emb{.bank_base_address = embed_addr, .page_size = row_bytes};
+    const InterleavedAddrGen<true> rtab{.bank_base_address = rope_addr, .page_size = rope_bytes};
+    noc_async_read(emb.get_noc_addr(toks[0]), rows_l1, row_bytes);
+    noc_async_read(emb.get_noc_addr(toks[1]), rows_l1 + row_bytes, row_bytes);
+    noc_async_read(rtab.get_noc_addr(r0), rope, rope_bytes);
+    noc_async_read(rtab.get_noc_addr(r1), rope + rope_bytes, rope_bytes);
+    if constexpr (feed_kind == 1) {
+        noc_async_read(get_noc_addr(x_addr), x0 + vector_bytes, vector_bytes);  // this step's x (row 0, 1)
+    }
+    noc_async_read_barrier();
+    scatter_row(rows_l1, x0, 0);
+    scatter_row(rows_l1 + row_bytes, x0, 1);
+    const InterleavedAddrGen<true> peer{.bank_base_address = peer_tok_addr, .page_size = 64};
+    noc_async_write(ph, peer.get_noc_addr(0), 64);
+    noc_async_write(x0, peer.get_noc_addr(0, 64), x0_bytes);
+    noc_async_write(rope, peer.get_noc_addr(0, peer_rope_off), 2 * rope_bytes);
+    const InterleavedAddrGen<true> out{.bank_base_address = out_addr, .page_size = 64};
+    noc_async_write(stage, out.get_noc_addr(0), 64);
+    noc_async_write_barrier();
+}
 
 void kernel_main() {
     size_t arg_idx = 0;
@@ -84,7 +189,7 @@ void kernel_main() {
     const size_t rect_args = arg_idx;
     arg_idx += 5 * rects;
     uint32_t argmax_addr = 0, cand_addr = 0, cand_sem_addr = 0, launch_addr = 0;
-    uint32_t tok_addr = 0, embed_addr = 0, rope_addr = 0, out_addr = 0;
+    uint32_t tok_addr = 0, embed_addr = 0, rope_addr = 0, out_addr = 0, peer_tok_addr = 0;
     if constexpr (feed) {
         argmax_addr = get_arg_val<uint32_t>(arg_idx++);
         cand_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -94,6 +199,9 @@ void kernel_main() {
         embed_addr = get_arg_val<uint32_t>(arg_idx++);
         rope_addr = get_arg_val<uint32_t>(arg_idx++);
         out_addr = get_arg_val<uint32_t>(arg_idx++);
+        if constexpr (feed_kind > 0) {
+            peer_tok_addr = get_arg_val<uint32_t>(arg_idx++);
+        }
     }
     const uint32_t flag_addr = get_semaphore(sem_flag);
     auto fabric =
@@ -178,7 +286,9 @@ void kernel_main() {
         volatile tt_l1_ptr uint32_t* launch_word = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(launch_addr);
         invalidate_l1_cache();
         launch = *launch_word;
-        expected[0] = expected[1] = launch * (layers / 2) * (num_chips - 1) * packets_per_vector;
+        // (an odd round count puts the extra round on parity 0)
+        expected[0] = launch * ((layers + 1) / 2) * (num_chips - 1) * packets_per_vector;
+        expected[1] = launch * (layers / 2) * (num_chips - 1) * packets_per_vector;
     }
     for (uint32_t l = 0; l < layers; l++) {
         const uint32_t par = l & 1;
@@ -244,15 +354,21 @@ void kernel_main() {
         volatile tt_l1_ptr uint32_t* rec = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(argmax_addr);
         volatile tt_l1_ptr uint32_t* cand = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cand_addr);
         auto better = [](uint32_t k, uint32_t i, uint32_t bk, uint32_t bi) { return k > bk || (k == bk && i < bi); };
-        uint32_t best_k = rec[0], best_i = rec[1];
-        for (uint32_t s = 1; s < num_streamers; s++) {
-            if (better(rec[4 * s], rec[4 * s + 1], best_k, best_i)) {
-                best_k = rec[4 * s];
-                best_i = rec[4 * s + 1];
+        // per row u: record of streamer s at rec[4 (s rows + u)]; candidate words 2u, 2u + 1
+        uint32_t best_ks[rows], best_is[rows];
+        for (uint32_t u = 0; u < rows; u++) {
+            uint32_t bk = rec[4 * u], bi = rec[4 * u + 1];
+            for (uint32_t s = 1; s < num_streamers; s++) {
+                if (better(rec[4 * (s * rows + u)], rec[4 * (s * rows + u) + 1], bk, bi)) {
+                    bk = rec[4 * (s * rows + u)];
+                    bi = rec[4 * (s * rows + u) + 1];
+                }
             }
+            best_ks[u] = bk;
+            best_is[u] = bi;
+            cand[4 * chip + 2 * u] = bk;
+            cand[4 * chip + 2 * u + 1] = bi;
         }
-        cand[4 * chip] = best_k;
-        cand[4 * chip + 1] = best_i;
         if constexpr (num_chips > 1) {
             if (fabric.has_forward_connection()) {
                 perform_payload_send(fabric.get_forward_connection(), cand_addr + chip * 16, 16, cand_hdr[0]);
@@ -264,12 +380,15 @@ void kernel_main() {
                 reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cand_sem_addr), (launch + 1) * (num_chips - 1));
             invalidate_l1_cache();
         }
-        for (uint32_t c = 0; c < num_chips; c++) {
-            if (better(cand[4 * c], cand[4 * c + 1], best_k, best_i)) {
-                best_k = cand[4 * c];
-                best_i = cand[4 * c + 1];
+        for (uint32_t u = 0; u < rows; u++) {
+            for (uint32_t c = 0; c < num_chips; c++) {
+                if (better(cand[4 * c + 2 * u], cand[4 * c + 2 * u + 1], best_ks[u], best_is[u])) {
+                    best_ks[u] = cand[4 * c + 2 * u];
+                    best_is[u] = cand[4 * c + 2 * u + 1];
+                }
             }
         }
+        const uint32_t best_i = best_is[0];
 
         // staging in the parity-1 slots: a peer writes there only after this chip's next round 0
         const uint32_t stage = (slots + num_chips * vector_bytes + 63) & ~63u;
@@ -278,6 +397,9 @@ void kernel_main() {
         noc_async_read(tok.get_noc_addr(0), head, 64);
         noc_async_read_barrier();
         volatile tt_l1_ptr uint32_t* h = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head);
+        if constexpr (feed_kind > 0) {
+            feed_verify(h, best_is, stage, embed_addr, rope_addr, peer_tok_addr, out_addr, cb_base(2));
+        } else {
         const uint32_t pos = h[1] + 1 < max_pos ? h[1] + 1 : max_pos - 1;
         const InterleavedAddrGen<true> emb{.bank_base_address = embed_addr, .page_size = vector_bytes};
         const InterleavedAddrGen<true> rtab{.bank_base_address = rope_addr, .page_size = rope_bytes};
@@ -296,6 +418,7 @@ void kernel_main() {
         const InterleavedAddrGen<true> out{.bank_base_address = out_addr, .page_size = 64};
         noc_async_write(head, out.get_noc_addr(0), 64);
         noc_async_write_barrier();
+        }
         *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(launch_addr) = launch + 1;
     } else {
         noc_semaphore_set(ccl_sem[0], 0);
