@@ -970,6 +970,7 @@ class PPPrefill:
     def handoff(self, model, n_tokens, timings=None):
         """move the state after n_tokens prompt tokens into the resident decode `model` (TP-sharded):
         GDN states and KV caches chip to chip on device (kernels/handoff.cpp), conv histories via the host.
+        A verify model (ResidentModel verify) takes the states in slot 0 and the histories at ring step 0.
         timings, if given, gets the seconds of each part"""
         import time
 
@@ -1022,18 +1023,23 @@ class PPPrefill:
                     a_i += 1
                 else:
                     pages = d.nv * 16
+                    # (verify: a head's 16 pages per state slot, slot 0)
+                    verify = getattr(model, "verify", False)
+                    per = [(hh * 16, 16) for hh in range(d.nv)] if verify else [(0, pages)]
                     for c in range(n):
-                        rows[p].append(
-                            torch.tensor(
-                                [
-                                    [c, self.S[j].buffer_address(), c * pages, 4096, 0, model.state_t.buffer_address()]
-                                    + [g_i * pages, pages]
-                                ],
-                                dtype=torch.int64,
+                        for off, cnt in per:
+                            dst_page = g_i * pages + off if len(per) == 1 else (g_i * d.nv + off // 16) * 2 * 16
+                            rows[p].append(
+                                torch.tensor(
+                                    [
+                                        [c, self.S[j].buffer_address(), c * pages + off, 4096, 0]
+                                        + [model.state_t.buffer_address(), dst_page, cnt]
+                                    ],
+                                    dtype=torch.int64,
+                                )
                             )
-                        )
-                        tile_of[p].append(torch.tensor([-1]))
-                        pk[p].append(torch.tensor([pages if c != p else 0]))
+                            tile_of[p].append(torch.tensor([-1]))
+                            pk[p].append(torch.tensor([cnt if c != p else 0]))
                     g_i += 1
             cat = lambda xs: [torch.cat(x) for x in xs]
             self._ho.update(model=model, rows=cat(rows), tile_of=cat(tile_of), pk=cat(pk))
@@ -1150,12 +1156,22 @@ class PPPrefill:
         G = len(order)
         hist = cat[[p for p, _ in order], [k for _, k in order]]  # [G, 3, CONV_CH], GDN copy order
         packed = hist[:, :, local[:, hsrc]].permute(2, 0, 1, 3)  # [chips, G, age, K * 32]
-        uses = torch.tensor([(model.n_gdn - g + copies - 1) // copies for g in range(G)])
-        compact = torch.zeros(d.n, G, CONV_K - 1, K * TILE, dtype=packed.dtype)
-        for age in range(CONV_K - 1):
-            compact[:, torch.arange(G), (n_tokens * uses + age) % 3] = packed[:, :, age]
+        verify = getattr(model, "verify", False)
+        if verify:
+            # pair slots at ring step 0 (see streamer_common.hpp): slot j holds ages (j, j + 1) as the rows of
+            # each conv tile (row 1 of slot 2 unused), in the 2 x 32 tile order (per face, row 0 then row 1)
+            ages = packed.reshape(d.n, G, CONV_K - 1, K, 2, 16)
+            nxt = torch.cat([ages[:, :, 1:], torch.zeros_like(ages[:, :, :1])], dim=2)
+            compact = torch.stack([ages, nxt], dim=5)  # [chips, G, slot, K, face, row, 16]
+        else:
+            uses = torch.tensor([(model.n_gdn - g + copies - 1) // copies for g in range(G)])
+            compact = torch.zeros(d.n, G, CONV_K - 1, K * TILE, dtype=packed.dtype)
+            for age in range(CONV_K - 1):
+                compact[:, torch.arange(G), (n_tokens * uses + age) % 3] = packed[:, :, age]
+        rows_per_tile, slots = (2, 4) if verify else (1, 3)
+        chunk = 64 * rows_per_tile
         compact_t = ttnn.from_torch(
-            compact.reshape(d.n * G * (CONV_K - 1) * K, TILE),
+            compact.reshape(d.n * G * (CONV_K - 1) * K, TILE * rows_per_tile),
             dtype=ttnn.bfloat16,
             layout=ttnn.ROW_MAJOR_LAYOUT,
             device=mesh,
@@ -1180,7 +1196,7 @@ class PPPrefill:
                     kernel_source=KDIR + "hist_scatter.cpp",
                     source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                     core_ranges=all_cores,
-                    compile_time_args=[K, copies],
+                    compile_time_args=[K, copies, rows_per_tile, slots, model._blk * TILE * model.batch],
                     runtime_args=rt,
                     config=ttnn.DataMovementConfigDescriptor(
                         processor=ttnn.DataMovementProcessor.RISCV_0, noc=ttnn.NOC.RISCV_0_default
@@ -1190,10 +1206,10 @@ class PPPrefill:
             semaphores=[],
             cbs=[
                 ttnn.CBDescriptor(
-                    total_size=K * 64,
+                    total_size=K * chunk,
                     core_ranges=all_cores,
                     format_descriptors=[
-                        ttnn.CBFormatDescriptor(buffer_index=0, data_format=ttnn.bfloat16, page_size=64)
+                        ttnn.CBFormatDescriptor(buffer_index=0, data_format=ttnn.bfloat16, page_size=chunk)
                     ],
                 )
             ],

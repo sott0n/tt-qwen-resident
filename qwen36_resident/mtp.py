@@ -21,8 +21,10 @@ from loguru import logger
 import ttnn
 from qwen36_resident import weights as Q
 from qwen36_resident.model import Dims, ResidentModel, State
+from qwen36_resident.prefill.pp_prefill import PPPrefill
 
 MTP = "mtp."
+PREFILL_CHUNKS = (128, 256, 512, 1024)  # as served (generator_vllm.py)
 
 
 class MtpCheckpoint:
@@ -60,21 +62,33 @@ def mtp_fc(ck, d):
 
 
 class SpecDecoder:
-    def __init__(self, mesh, ck, layers, max_pos, trace=True):
+    def __init__(self, mesh, ck, layers, max_pos, trace=True, prefill=False):
+        """prefill: also the pipeline-parallel prefill (generate_prefilled); max_pos then rounds up to its
+        largest chunk"""
         n = mesh.get_num_devices()
         self.d = d = Dims(n, mesh.dram_grid_size().x, vocab=ck.config["vocab_size"])
         interval = ck.config["full_attention_interval"]
         n_attn = sum((l + 1) % interval == 0 for l in range(layers))
-        w = Q.load(ck, d, layers, interval)
         self.emb = Q.embedding(ck).float()
-        self.emb_t = ttnn.from_torch(
-            self.emb.bfloat16(),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-            device=mesh,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
-        )
+        self.pp = None
+        if prefill:
+            C = max(PREFILL_CHUNKS)
+            max_len = -(-max_pos // C) * C
+            max_pos = max_len + 64
+            # its embedding table is also the one the hubs feed from
+            self.pp = PPPrefill(mesh, ck, layers, interval, chunk=list(PREFILL_CHUNKS), max_len=max_len)
+            self.emb_t = self.pp.embed
+            logger.info("prefill weights placed")
+        else:
+            self.emb_t = ttnn.from_torch(
+                self.emb.bfloat16(),
+                dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                device=mesh,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(mesh),
+            )
+        w = Q.load(ck, d, layers, interval)
         main_tok, draft_tok = ResidentModel.tok_tensor(mesh, d, 2), ResidentModel.tok_tensor(mesh, d, 2, fc=True)
         self.main = ResidentModel(
             mesh,
@@ -90,6 +104,7 @@ class SpecDecoder:
             feed_peer=draft_tok,
         )
         del w
+        logger.info("main model placed")
         self.draft = ResidentModel(
             mesh,
             d,
@@ -111,6 +126,9 @@ class SpecDecoder:
                 m.step(m.token_state(torch.zeros(2, width), [0, 1], ring=0, slot=0))
                 m.reset()
                 m.capture_trace()
+        if self.pp is not None:
+            self.pp.capture()
+            self.pp.handoff(self.main, 1)  # compiles the handoff kernel
 
     def _main(self, toks, p, ring, slot):
         m = self.main
@@ -195,15 +213,38 @@ class SpecDecoder:
         for m in (self.main, self.draft):
             m.reset()
         seq = [int(t) for t in prompt]
-        P = len(seq)
         p, ring, slot, d = self._prompt(seq)
+        return self._fed(seq, n_new, p, ring, slot, d, base=0, t0=time.perf_counter())
+
+    def generate_prefilled(self, prompt, n_new, timings=None):
+        """generate_fed() after the pipeline-parallel prefill of all but the last prompt token, handed off to
+        the main model. The draft model gets no prompt entries: its positions start at the last prompt
+        token (base), and the first step's draft is a placeholder (so that step decodes one token)"""
+        for m in (self.main, self.draft):
+            m.reset()
+        self.pp.reset()
+        seq = [int(t) for t in prompt]
+        p = len(seq) - 1
+        t0 = time.perf_counter()
+        if p > 0:
+            self.pp.run(torch.tensor(seq[:p]))
+            if timings is not None:
+                ttnn.synchronize_device(self.mesh)
+                timings["prefill"] = time.perf_counter() - t0
+            self.pp.handoff(self.main, p, timings)
+        return self._fed(seq, n_new, p, 0, 0, seq[p], base=p, t0=t0)
+
+    def _fed(self, seq, n_new, p, ring, slot, d, base, t0):
+        """the hub-fed loop from the main step at p with draft d; t0: when the request started"""
+        P = len(seq)
         m = self.main
-        m.step(m.token_state(self.emb[[seq[p], d]], [p, p + 1], ring=ring, slot=slot, words={5: d, 6: seq[p]}))
+        words = {5: d, 6: seq[p], 10: base}
+        m.step(m.token_state(self.emb[[seq[p], d]], [p, p + 1], ring=ring, slot=slot, words=words))
         self.draft.step(None)
         view = ttnn.get_device_tensors(m.out_t)[0]
         pending = []
         steps = accepted = 0
-        t0 = time.perf_counter()
+        ttft = None
         first = True
         while len(seq) < P + n_new:
             if not first:
@@ -216,6 +257,8 @@ class SpecDecoder:
                 continue
             host, ev = pending.pop(0)
             ttnn.event_synchronize(ev)
+            if ttft is None:
+                ttft = time.perf_counter() - t0
             rec = ttnn.to_torch(host).reshape(-1)[:4].tolist()
             accept, a0, a1 = rec[0], rec[1], rec[2]
             seq += [a0, a1] if accept else [a0]
@@ -224,6 +267,8 @@ class SpecDecoder:
         ttnn.synchronize_device(self.mesh)
         total = time.perf_counter() - t0
         return seq[: P + n_new], dict(
+            ttft_s=ttft,
+            decode_tok_s=(len(seq) - P - 1) / (total - ttft),  # after the first token
             fed_steps=steps,
             fed_accept_rate=accepted / steps,
             fed_tokens_per_step=(len(seq) - P) / steps,
@@ -231,11 +276,18 @@ class SpecDecoder:
             fed_tok_s=(len(seq) - P) / total,
         )
 
-    def greedy(self, prompt, n_new):
+    def greedy(self, prompt, n_new, prefill=False):
         """plain greedy on the main model's verify step (row 1 repeats row 0's token and is never kept): the
-        tokens speculative decode must reproduce"""
+        tokens speculative decode must reproduce (prefill: after the prefill, as generate_prefilled)"""
         seq = [int(t) for t in prompt]
         p = ring = slot = 0
+        if prefill:
+            self.main.reset()
+            self.pp.reset()
+            p = len(seq) - 1
+            if p > 0:
+                self.pp.run(torch.tensor(seq[:p]))
+                self.pp.handoff(self.main, p)
         while len(seq) < len(prompt) + n_new:
             a, _ = self._main([seq[p], seq[p]], p, ring, slot)
             if p + 1 >= len(seq):

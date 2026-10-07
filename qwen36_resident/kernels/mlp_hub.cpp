@@ -44,8 +44,9 @@
 // Feed kinds 1 and 2 run MTP speculative decode with no host between steps: the main model's verify step
 // (kind 1, rows t at p and draft d at p + 1) and the draft model's (kind 2, see mtp.py) alternate, each
 // writing the other's token state (words: 0 ring, 1 / 2 positions, 4 GDN state slot, 5 draft (main) or
-// accept (draft), 6 t (main) or a0 (draft), 7 a1, 8 / 9 the main model's ring and slot). Both rows' greedy
-// tokens are reduced (the 16 B candidate record holds both).
+// accept (draft), 6 t (main) or a0 (draft), 7 a1, 8 / 9 the main model's ring and slot, 10 base: the
+// draft model's positions are the main model's minus base, so its KV cache starts where its entries do).
+// Both rows' greedy tokens are reduced (the 16 B candidate record holds both).
 //   kind 1: accept = a0 == d; the draft model's entries are (a0, x row 0) at p and (a1, x row 1) at p + 1
 //     (x0 = both embedding rows, then this step's x); out = (accept, a0, a1, p).
 //   kind 2: d' = its row-accept token; the main model continues at p' = p + 1 + accept with rows
@@ -118,13 +119,16 @@ void feed_verify(
     for (uint32_t i = 0; i < 16; i++) {
         g[i] = 0;
     }
+    uint32_t rope_p;  // the peer's position of row 0
     if constexpr (feed_kind == 1) {
         p = h[1];
+        rope_p = p - h[10];
         const uint32_t accept = a0 == h[5];
         toks[0] = a0;
         toks[1] = a1;
-        g[1] = p;
-        g[2] = p + 1;
+        g[1] = rope_p;
+        g[2] = rope_p + 1;
+        g[10] = h[10];
         g[5] = accept;
         g[6] = a0;
         g[7] = a1;
@@ -137,7 +141,9 @@ void feed_verify(
         h[3] = p;
     } else {
         const uint32_t accept = h[5];
-        p = h[1] + 1 + accept;
+        p = h[1] + h[10] + 1 + accept;
+        rope_p = p;
+        g[10] = h[10];
         const uint32_t d = accept ? a1 : a0, t = accept ? h[7] : h[6];
         toks[0] = t;
         toks[1] = d;
@@ -152,7 +158,8 @@ void feed_verify(
         h[2] = p;
         h[3] = 0;
     }
-    const uint32_t r0 = p < max_pos ? p : max_pos - 1, r1 = p + 1 < max_pos ? p + 1 : max_pos - 1;
+    const uint32_t r0 = rope_p < max_pos ? rope_p : max_pos - 1;
+    const uint32_t r1 = rope_p + 1 < max_pos ? rope_p + 1 : max_pos - 1;
     const InterleavedAddrGen<true> emb{.bank_base_address = embed_addr, .page_size = row_bytes};
     const InterleavedAddrGen<true> rtab{.bank_base_address = rope_addr, .page_size = rope_bytes};
     noc_async_read(emb.get_noc_addr(toks[0]), rows_l1, row_bytes);

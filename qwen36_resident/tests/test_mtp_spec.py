@@ -97,3 +97,23 @@ def test_mtp_spec(mesh_device):
     with open(OUT, "a") as f:
         f.write(json.dumps(rec) + "\n")
     assert same == NEW and fed_same == NEW
+
+
+@pytest.mark.parametrize(
+    "device_params", [{"fabric_config": ttnn.FabricConfig.FABRIC_1D, "trace_region_size": 64 << 20}], indirect=True
+)
+@pytest.mark.parametrize("mesh_device", [(1, 4)], indirect=True)
+def test_mtp_spec_prefilled(mesh_device):
+    """after the prefill (handed off to the verify model, no prompt entries in the draft model): hub-fed
+    speculative decode against greedy on the verify model from the same prefilled state"""
+    tokens = torch.load(REFPT, weights_only=False)["reference_tokens"][0]
+    prompt = tokens[:PROMPT].tolist()
+    spec = SpecDecoder(mesh_device, Q.Checkpoint(), LAYERS, PROMPT + NEW + 64, prefill=True)
+    want = spec.greedy(prompt, NEW, prefill=True)
+    got, stats = spec.generate_prefilled(prompt, NEW)
+    same = next((i for i, (a, b) in enumerate(zip(want[PROMPT:], got[PROMPT:])) if a != b), NEW)
+    rec = dict(test="mtp_spec_prefilled", layers=LAYERS, prompt=PROMPT, new=NEW, matching=same, **stats)
+    logger.info(rec)
+    with open(OUT, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    assert same == NEW

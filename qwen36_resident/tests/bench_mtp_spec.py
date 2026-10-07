@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """MTP speculative decode (hubs feeding each other, qwen36_resident.mtp) on chat-template prompts: short
 requests of different kinds, and summaries of MTP_LONG tokens of tt-metal's tech reports. Per prompt the
-draft acceptance, tokens per step and decode speed over MTP_NEW new tokens. The prompt runs through the
-verify step two tokens at a time (no prefill), so long prompts take a while."""
+draft acceptance, tokens per step and decode speed over MTP_NEW new tokens. MTP_PREFILL=1 (default): the
+prompt goes through the pipeline-parallel prefill (generate_prefilled: TTFT, no prompt entries in the draft
+model); 0: through the verify step two tokens at a time (draft entries for every prompt position, slow)."""
 import glob
 import json
 import os
@@ -20,6 +21,7 @@ from qwen36_resident.mtp import SpecDecoder
 OUT = os.environ.get("BENCH_OUT", "/tmp/mtp_spec_bench.jsonl")
 LAYERS = int(os.environ.get("RESIDENT_LAYERS", "64"))
 NEW = int(os.environ.get("MTP_NEW", "256"))
+PREFILL = os.environ.get("MTP_PREFILL", "1") == "1"
 LONG = [int(n) for n in os.environ.get("MTP_LONG", "8192,32768").split(",") if n]
 CHAT = [
     "Write a Python function that parses an ISO 8601 date string into a datetime, with error handling and tests.",
@@ -52,10 +54,12 @@ def test_mtp_spec_bench(mesh_device):
     tok = AutoTokenizer.from_pretrained(ck.path)
     cases = prompts(tok)
     max_pos = max(len(p) for _, p in cases) + NEW + 64
-    spec = SpecDecoder(mesh_device, ck, LAYERS, max_pos)
+    spec = SpecDecoder(mesh_device, ck, LAYERS, max_pos, prefill=PREFILL)
     for name, prompt in cases:
-        seq, stats = spec.generate_fed(prompt, NEW)
-        rec = dict(test="mtp_spec_bench", case=name, prompt=len(prompt), new=NEW, **stats)
+        parts = {}
+        seq, stats = spec.generate_prefilled(prompt, NEW, parts) if PREFILL else spec.generate_fed(prompt, NEW)
+        rec = dict(test="mtp_spec_bench", case=name, prefill=PREFILL, prompt=len(prompt), new=NEW, **stats)
+        rec["ttft_parts"] = {k: round(v, 4) for k, v in parts.items()}
         logger.info(rec)
         logger.info(f"{name}: {tok.decode(seq[len(prompt):])[:300]!r}")
         with open(OUT, "a") as f:
