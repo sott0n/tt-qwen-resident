@@ -27,6 +27,9 @@ OUT = os.environ.get("BENCH_OUT", "/tmp/mtp_spec.jsonl")
 LAYERS = int(os.environ.get("RESIDENT_LAYERS", "64"))
 PROMPT = int(os.environ.get("MTP_PROMPT", "128"))
 NEW = int(os.environ.get("MTP_NEW", "256"))
+BLOCK = int(os.environ.get("MTP_BLOCK", "8"))  # tokens per vLLM decode step (streaming check)
+DEPTH = int(os.environ.get("MTP_DEPTH", "4"))  # main + draft steps queued ahead of the host
+HOST_GAP_S = float(os.environ.get("MTP_HOST_GAP_MS", "40")) / 1e3  # host time between blocks
 
 
 def plain_greedy(mesh, ck, prompt, n_new, max_pos):
@@ -112,8 +115,18 @@ def test_mtp_spec_prefilled(mesh_device):
     want = spec.greedy(prompt, NEW, prefill=True)
     got, stats = spec.generate_prefilled(prompt, NEW)
     same = next((i for i, (a, b) in enumerate(zip(want[PROMPT:], got[PROMPT:])) if a != b), NEW)
+    # the streaming API as the vLLM block adapter drives it, with a host gap per block like vLLM's step
+    t0 = time.perf_counter()
+    streamed = [int(spec.start(prompt).argmax())]
+    while len(streamed) < NEW:
+        streamed += spec.next_block(BLOCK, DEPTH, PROMPT + NEW + 64)
+        time.sleep(HOST_GAP_S)
+    stream_s = time.perf_counter() - t0
+    spec.stop()
+    stream_same = next((i for i, (a, b) in enumerate(zip(want[PROMPT:], streamed)) if a != b), NEW)
     rec = dict(test="mtp_spec_prefilled", layers=LAYERS, prompt=PROMPT, new=NEW, matching=same, **stats)
+    rec.update(stream_matching=stream_same, stream_tok_s=len(streamed) / stream_s, block=BLOCK, depth=DEPTH)
     logger.info(rec)
     with open(OUT, "a") as f:
         f.write(json.dumps(rec) + "\n")
-    assert same == NEW
+    assert same == NEW and stream_same == NEW

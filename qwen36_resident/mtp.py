@@ -276,6 +276,71 @@ class SpecDecoder:
             fed_tok_s=(len(seq) - P) / total,
         )
 
+    # ---- streaming, for the vLLM block adapter: start() per request, then next_block() per decode step. The
+    # device runs `depth` main + draft steps ahead of the host; a step's record is read once the host needs
+    # its tokens, and tokens past a block wait for the next one, so the device keeps decoding while the
+    # host is away (the steps it ran past the end of a request are discarded by stop()).
+
+    def start(self, prompt):
+        """the prefill (prompt but its last token) and the first verify step: returns that step's row-0 logits
+        [vocab] (the first token is their argmax); a second token it may commit waits for next_block"""
+        self.stop()
+        for m in (self.main, self.draft):
+            m.reset()
+        self.pp.reset()
+        seq = [int(t) for t in prompt]
+        p = len(seq) - 1
+        if p > 0:
+            self.pp.run(torch.tensor(seq[:p]))
+            self.pp.handoff(self.main, p)
+        m = self.main
+        words = {5: seq[p], 6: seq[p], 10: p}  # the placeholder draft repeats the token
+        m.step(m.token_state(self.emb[[seq[p], seq[p]]], [p, p + 1], ring=0, slot=0, words=words))
+        logits = m.logits()[0][:, : self.d.vocab_chip].reshape(-1)[: self.emb.shape[0]]
+        accept, a0, a1, _ = self._record(ttnn.from_device(self._out_view(), blocking=True))
+        self.draft.step(None)
+        self._carry = [a1] if accept else []
+        self._last_pos = p + 1 + accept  # position of the last token the device committed
+        return logits
+
+    def next_block(self, n, depth, limit):
+        """the next n tokens, or fewer once the device would pass position `limit`"""
+        while len(self._carry) < n:
+            self._fill(depth, limit)
+            if not self._pending:
+                break
+            host, ev = self._pending.pop(0)
+            ttnn.event_synchronize(ev)
+            accept, a0, a1, p = self._record(host)
+            self._carry += [a0, a1] if accept else [a0]
+            self._last_pos = p + 1 + accept
+        self._fill(depth, limit)
+        block, self._carry = self._carry[:n], self._carry[n:]
+        return block
+
+    def stop(self):
+        """end the request: wait for the steps run ahead and drop them"""
+        if getattr(self, "_pending", None):
+            ttnn.synchronize_device(self.mesh)
+        self._pending, self._carry, self._last_pos = [], [], 0
+
+    def _fill(self, depth, limit):
+        # each queued step commits up to 2 positions past the last one read
+        while len(self._pending) < depth and self._last_pos + 2 * (len(self._pending) + 1) + 1 < limit:
+            self.main.step(None)
+            # the main step's record, read before the draft step (which does not write it) and the next main step
+            read = ttnn.from_device(self._out_view(), blocking=False)
+            self._pending.append((read, ttnn.record_event(self.mesh, 0)))
+            self.draft.step(None)
+
+    def _out_view(self):
+        return ttnn.get_device_tensors(self.main.out_t)[0]
+
+    @staticmethod
+    def _record(host):
+        """(accept, a0, a1, p) of a main step (mlp_hub.cpp feed kind 1)"""
+        return ttnn.to_torch(host).reshape(-1)[:4].tolist()
+
     def greedy(self, prompt, n_new, prefill=False):
         """plain greedy on the main model's verify step (row 1 repeats row 0's token and is never kept): the
         tokens speculative decode must reproduce (prefill: after the prefill, as generate_prefilled)"""
