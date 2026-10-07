@@ -152,7 +152,7 @@ class Qwen36ResidentForCausalLM:
         return ttnn.to_torch(out).reshape(-1)[:1].to(torch.int32).view(1, 1)
 
 
-MTP_BLOCK = int(os.environ.get("QWEN36_MTP_BLOCK", "8"))
+MTP_BLOCK = int(os.environ.get("QWEN36_MTP_BLOCK", "4"))
 MTP_DEPTH = int(os.environ.get("QWEN36_MTP_DEPTH", "4"))
 
 
