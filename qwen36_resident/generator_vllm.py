@@ -10,6 +10,10 @@ Greedy decode steps are sampled on device and run asynchronously (decode input u
 step's hub writes the next step's token state from its own argmax, so on a step without reload_inputs the
 adapter only replays the trace, and the runner reads the (token, position) word one step late. Any other
 step samples on the host from the full logits, with the host writing the token state.
+
+Qwen36ResidentMTPForCausalLM serves greedy MTP speculative decode (qwen36_resident.mtp) through the
+plugin's adaptive block output: every decode step commits MTP_BLOCK tokens, the device running MTP_DEPTH
+verify + draft steps ahead of the host so it keeps decoding during the runner's per-step work.
 """
 import os
 
@@ -20,6 +24,7 @@ from vllm.transformers_utils.config import uses_mrope
 import ttnn
 from qwen36_resident import weights as Q
 from qwen36_resident.model import Dims, ResidentModel, State
+from qwen36_resident.mtp import SpecDecoder
 from qwen36_resident.prefill.pp_prefill import PPPrefill
 
 PREFILL_CHUNKS = (128, 256, 512, 1024)
@@ -145,3 +150,67 @@ class Qwen36ResidentForCausalLM:
         if ttnn.is_tensor_storage_on_device(out):
             out = ttnn.from_device(ttnn.get_device_tensors(out)[0])
         return ttnn.to_torch(out).reshape(-1)[:1].to(torch.int32).view(1, 1)
+
+
+MTP_BLOCK = int(os.environ.get("QWEN36_MTP_BLOCK", "8"))
+MTP_DEPTH = int(os.environ.get("QWEN36_MTP_DEPTH", "4"))
+
+
+class Qwen36ResidentMTPForCausalLM(Qwen36ResidentForCausalLM):
+    """Greedy only: the device decodes from its own greedy tokens, so the runner's first token (sampled from
+    the prefill's logits) must be their argmax; anything else raises. One user (max_num_seqs=1), so every
+    request owns the scheduler's block session and every decode step is a block step."""
+
+    model_capabilities = {
+        "supports_prefix_caching": False,
+        "supports_async_decode": True,
+        # decode returns the committed tokens
+        "supports_sample_on_device": True,
+        "supports_device_penalties": False,
+        "output_tokens_per_step": MTP_BLOCK,
+        "tt_adaptive_block_output": True,
+        # positions one block step may run ahead: the block, then MTP_DEPTH steps of up to 2 each
+        "tt_block_kv_extent_tokens": MTP_BLOCK + 2 * MTP_DEPTH + 2,
+    }
+
+    def __init__(self, mesh, ck, max_seq_len, mrope):
+        self.mesh, self.mrope = mesh, mrope
+        cfg = ck.config
+        self.vocab = cfg["vocab_size"]
+        self.max_seq_len = max_seq_len
+        self.eos = int(cfg["eos_token_id"])
+        self.spec = SpecDecoder(mesh, ck, cfg["num_hidden_layers"], max_seq_len, prefill=True)
+        self._first = None
+
+    def prefill_forward(self, tokens, page_table, kv_cache, prompt_lens, **kwargs):
+        assert tokens.shape[0] == 1, "one user per prefill"
+        T = int(prompt_lens[0]) if prompt_lens is not None else tokens.shape[1]
+        logits = self.spec.start(tokens[0, :T].tolist())
+        self._first = int(logits.argmax())
+        logits = logits.view(1, 1, -1)
+        return (logits, torch.zeros(1, dtype=torch.long)) if self.mrope else logits
+
+    def decode_forward(self, tokens, start_pos, *args, **kwargs):
+        if self._first is not None:
+            token = int(tokens.reshape(-1)[0])
+            if token != self._first:
+                raise RuntimeError(
+                    f"MTP serving is greedy only: the runner's first token {token} is not the argmax "
+                    f"{self._first} the device decodes from"
+                )
+            self._first = None
+        block = self.spec.next_block(MTP_BLOCK, MTP_DEPTH, self.max_seq_len)
+        # short only at the position limit: the scheduler trims at the first stop token
+        out = torch.full((1, MTP_BLOCK), self.eos, dtype=torch.int32)
+        out[0, : len(block)] = torch.tensor(block, dtype=torch.int32)
+        return out
+
+    def note_state_slots_moved(self, moves):
+        pass
+
+    def release_request(self, row):
+        self.spec.stop()
+        self._first = None
+
+    def release_persistent_capture(self):
+        self.spec.stop()
