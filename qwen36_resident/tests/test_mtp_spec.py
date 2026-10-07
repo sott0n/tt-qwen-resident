@@ -115,7 +115,11 @@ def test_mtp_spec_prefilled(mesh_device):
     want = spec.greedy(prompt, NEW, prefill=True)
     got, stats = spec.generate_prefilled(prompt, NEW)
     same = next((i for i, (a, b) in enumerate(zip(want[PROMPT:], got[PROMPT:])) if a != b), NEW)
-    # the streaming API as the vLLM block adapter drives it, with a host gap per block like vLLM's step
+    # the streaming API as the vLLM block adapter drives it, with a host gap per block like vLLM's step;
+    # first a longer request on another prompt, whose state the next request must not read
+    spec.start(tokens[PROMPT : 3 * PROMPT].tolist())
+    for _ in range(8):
+        spec.next_block(BLOCK, DEPTH, PROMPT + NEW + 64)
     t0 = time.perf_counter()
     streamed = [int(spec.start(prompt).argmax())]
     while len(streamed) < NEW:

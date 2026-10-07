@@ -1459,11 +1459,13 @@ class ResidentModel:
             ttnn.copy_host_to_device_tensor(host, dev)
         ttnn.synchronize_device(self.mesh)
 
-    def reset(self):
-        """restore the decode state (GDN states, conv histories, KV caches) to its initial contents"""
-        for host, dev in self._initial:
-            ttnn.copy_host_to_device_tensor(host, dev)
-        ttnn.synchronize_device(self.mesh)
+    def reset(self, state=True):
+        """restore the decode state (GDN states, conv histories, KV caches) to its initial contents; state=False
+        only resets the feeding hubs' counters, for a caller that overwrites every state it reads"""
+        if state:
+            for host, dev in self._initial:
+                ttnn.copy_host_to_device_tensor(host, dev)
+            ttnn.synchronize_device(self.mesh)
         if self.feed:
             # a feeding hub counts monotonically from its launch counter; zero them all while idle
             for s in self.ccl_sems + self.feed_sems:

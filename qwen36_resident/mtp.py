@@ -285,11 +285,13 @@ class SpecDecoder:
         """the prefill (prompt but its last token) and the first verify step: returns that step's row-0 logits
         [vocab] (the first token is their argmax); a second token it may commit waits for next_block"""
         self.stop()
-        for m in (self.main, self.draft):
-            m.reset()
-        self.pp.reset()
         seq = [int(t) for t in prompt]
         p = len(seq) - 1
+        # the handoff writes every state the main model reads (KV past the prompt is masked), and the draft
+        # model writes each KV row before it attends to it: only a one-token prompt needs the initial state
+        self.main.reset(state=p == 0)
+        self.draft.reset(state=False)
+        self.pp.reset()
         if p > 0:
             self.pp.run(torch.tensor(seq[:p]))
             self.pp.handoff(self.main, p)
