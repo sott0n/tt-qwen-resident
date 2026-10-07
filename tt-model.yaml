@@ -46,6 +46,15 @@ serve:
       sample_on_device_mode: decode_only   # greedy decode steps read the device argmax
   args: [--async-scheduling]   # greedy steps are submitted before the previous token is read back
 
+serve_profiles:
+  - name: default
+    description: One user, any sampling.
+  - name: mtp
+    description: One user, greedy only, MTP speculative decode (about 1.45x the decode speed).
+    env:
+      TT_MODEL_CLASS_OVERRIDES: "TTQwen3_5ForConditionalGeneration=qwen36_resident.generator_vllm:Qwen36ResidentMTPForCausalLM"
+default_profile: default
+
 verify:
   - "from qwen36_resident.generator_vllm import Qwen36ResidentForCausalLM; assert Qwen36ResidentForCausalLM"
   - "from qwen36_resident.generator_vllm import Qwen36ResidentMTPForCausalLM; assert Qwen36ResidentMTPForCausalLM"
@@ -69,12 +78,25 @@ card:
 
     Token accuracy, teacher-forced against the Hugging Face reference (512 scored tokens): 99.41% top-1,
     100% top-5.
+
+    The `mtp` profile (`tt-model serve --profile mtp ...`) adds MTP speculative decode with the
+    checkpoint's MTP layer: one user, greedy, 256 generated tokens, chat template with thinking on.
+
+    | Prompt (tokens) | Time to first token | Decode |
+    | --- | --- | --- |
+    | 21-60 (chat) | 0.27-0.29 s | 118-125 tok/s |
+    | 8,211 | 1.37 s | 110 tok/s |
+    | 32,020 | 4.65 s | 101 tok/s |
+
+    Its output equals greedy decode of its verify step token for token; it can differ from the
+    default profile's greedy output where two logits tie in bf16.
   limitations: >
     One user at a time (max_num_seqs 1). Text only: image and video input are not supported. Served
     context is 32,768 tokens. The decode speed above holds for greedy requests (temperature 0 or
     top_k 1, no penalties or logprobs): they are sampled on device and run asynchronously. Any other
     request samples on the host from the full logits and runs synchronously: about 60 tok/s measured
-    on that path with greedy requests; stochastic sampling itself was not measured.
+    on that path with greedy requests; stochastic sampling itself was not measured. The `mtp` profile
+    serves greedy requests only: any other request fails at its first decode step.
   architecture: 27B dense hybrid (48 Gated DeltaNet + 16 full-attention layers)
   status: Experimental
   out_of_scope_use: Image or video input; this port serves the language model only.
