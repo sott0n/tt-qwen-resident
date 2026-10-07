@@ -8,6 +8,7 @@ execution with a design built for Tensix.
 | | |
 |---|---|
 | Decode, batch 1 | 83 tok/s/user (demo: 25.5) |
+| Decode, batch 1, MTP speculative decode | 118–125 tok/s/user on chat prompts, served through vLLM |
 | TTFT, 511-token prompt | 0.19 s (demo: 0.31 s at 128) |
 | Batch 8 | 374 tok/s total, 46.7 tok/s/user (demo: 165 total) |
 | Longest context run end to end | 256k |
@@ -230,6 +231,51 @@ took batch 8 from 38.5 to 21.4 ms per step:
 
 At batch 32 the total is 7% below the demo, because sub-batches do not share the weight stream.
 
+## MTP speculative decode
+
+The checkpoint ships one MTP layer (a full-attention decoder layer that predicts the token after next from
+the main model's last hidden state and the next token). Greedy decode with one draft per step: a verify step
+runs the token t at p and the draft d at p + 1 as two rows through all 64 layers, and commits a0, plus a1
+when a0 == d. Weights stream once for both rows, so a step costs 14.3 ms against 12.1 ms for one row, and
+commits 1.8–1.9 tokens.
+
+Served through vLLM, one user, greedy, 256 generated tokens, streaming client:
+
+| Prompt | TTFT | Decode | Without MTP |
+|---|---|---|---|
+| Chat, 21–60 tokens | 0.27–0.29 s | 118–125 tok/s/user | 0.17 s, 83 tok/s/user |
+| 8k | 1.37 s | 110 tok/s/user | 1.16 s, 81 tok/s/user |
+| 32k | 4.65 s | 101 tok/s/user | 4.56 s, 74 tok/s/user |
+
+The output equals greedy decode of the verify model token for token (it can differ from batch-1 greedy
+decode where two logits tie in bf16: one row and two rows round differently). Drafts accepted: 80–90% on
+chat prompts, 74–82% on long documents.
+
+How the verify step works with two rows of one user:
+
+- **GDN state.** Row 1 starts from row 0's updated state, copied in L1 on the head core. Each row writes its
+  own state slot, so the next step continues from row 0's or row 1's state by its slot: a rejected draft
+  needs no rollback.
+- **conv1d.** The history is a ring of 4 pair slots, each holding two consecutive inputs as rows 0 and 1, so
+  each row reads its own window. Row 1's newest tap is row 0's input of the same step: a 0/1 32×32 matmul
+  moves it into place.
+- **Attention.** Both rows share the KV cache. Row 1 reads row 0's new k/v row after the tail core writes it
+  back; when p ends a KV tile, the chunk worker that reads that tile for row 1 waits for the write-back.
+  A rejected row's k/v is masked and overwritten by the next step.
+
+The draft model is the MTP layer as a one-layer verify model with its own KV cache and the main lm_head
+(folded with the MTP norm). Its fc ([embedding | hidden] → hidden) runs on device as an extra all-reduce
+round before the layer, each chip taking a quarter of K. The two models feed each other: the main model's hub
+accepts the draft and writes the draft model's token state; the draft model's hub picks the next draft from
+the kept row and writes the main model's next token state (positions, embeddings, RoPE, GDN slot, conv ring
+step). Steps run back to back and the host reads one record per step, late.
+
+The prefill hands its state to the verify model. The draft model gets no prompt entries (its positions start
+at the last prompt token), which costs 3–6 points of draft acceptance against an MTP prefill. Under vLLM the
+model uses the plugin's adaptive block output: each decode step returns 4 tokens while the device runs 4
+verify steps ahead, so it keeps decoding during the runner's per-step work; tokens past a block carry to
+the next one. vLLM sends the first token with the first block, which is most of the TTFT difference.
+
 ## Bugs that cost the most time
 
 - **Fabric all-reduce races.** Accuracy changed from run to run (97.66 to 99.02 top-1). Two causes: one
@@ -251,6 +297,10 @@ At batch 32 the total is 7% below the demo, because sub-batches do not share the
 - **Prefill handoff into a batch slot.** Prefill can hand its state to a batch-1 decode model only, so batched
   serving still lacks per-user TTFT.
 - **Long-context prefill attention**, which dominates TTFT past 64k.
+- **MTP: draft prompt entries.** An MTP prefill over the prompt would recover 3–6 points of draft
+  acceptance; more than one draft per step, sampled requests and batches are not supported yet.
+- **MTP at long context.** Both verify rows read the whole KV cache (18.7 ms per step at 32k against 15.3 ms
+  at short context); reading each block once for both rows would close most of that.
 - The demo at 64k and 256k was not measured, and a clean build of this repository from its submodule has not
   been run.
 
@@ -282,6 +332,15 @@ over the model's own, for the request handling and the decode state reset.
 Limits: one user at a time (`max_num_seqs` 1, since the prefill hands off to a batch-1 decode model only),
 text only, 32k context in the package.
 
+MTP speculative decode (greedy only) is a separate serving class, selected at launch:
+
+```bash
+export TT_MODEL_CLASS_OVERRIDES="TTQwen3_5ForConditionalGeneration=qwen36_resident.generator_vllm:Qwen36ResidentMTPForCausalLM"
+```
+
+`QWEN36_MTP_BLOCK` (default 4) sets the tokens per vLLM decode step and `QWEN36_MTP_DEPTH` (default 4) the
+verify steps the device runs ahead. A request that is not greedy fails at its first decode step.
+
 ## Layout
 
 ```
@@ -292,6 +351,7 @@ qwen36_resident/
   weights.py checkpoint -> per-chip weights
   common.py  dimensions and streamer layout helpers
   generator_vllm.py  vLLM adapter; vllm_models/ registers it with the plugin
+  mtp.py     MTP speculative decode: draft model, verify loop, streaming
   tests/     accuracy tests and benchmarks
 patches/     changes to tt-metal's ttnn this code needs (applied to the submodule)
 tt-metal/    submodule, pinned to the tt-metal commit this code is built against
@@ -326,6 +386,11 @@ pytest qwen36_resident/tests/test_resident_feed.py                              
 RESIDENT_BATCHES=1,8,32 pytest qwen36_resident/tests/bench_resident_batch.py          # decode step per batch
 RESIDENT_BATCH=8 pytest qwen36_resident/tests/bench_resident_model.py::test_resident_decode_steps  # vs torch, random weights
 RESIDENT_LAYERS=16 pytest qwen36_resident/tests/prof_pp_tick.py                       # untraced prefill ticks for the profiler
+pytest qwen36_resident/tests/test_resident_verify.py                                  # 2-row verify step vs torch, random weights
+pytest qwen36_resident/tests/test_resident_accuracy.py::test_resident_verify_accuracy # verify step accuracy
+pytest --timeout 1400 qwen36_resident/tests/test_mtp_spec.py                          # MTP decode = verify-model greedy
+pytest --timeout 1400 qwen36_resident/tests/bench_mtp_spec.py                         # MTP decode on chat and long prompts
+python -m qwen36_resident.tests.mtp_acceptance <dump.pt>                              # draft acceptance on host (RESIDENT_DUMP)
 ```
 
 If a run hangs, reset the cards (`tt-smi -r 0,1,2,3`) before the next one.

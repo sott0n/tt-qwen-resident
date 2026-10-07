@@ -22,6 +22,7 @@ source:
         - qwen36_resident/model.py
         - qwen36_resident/weights.py
         - qwen36_resident/generator_vllm.py
+        - qwen36_resident/mtp.py                       # imported by generator_vllm (the MTP serving class)
         - qwen36_resident/kernels                     # JIT-compiled at serve time
         - qwen36_resident/prefill
         - qwen36_resident/vllm_models                 # covers extra_models_dir
@@ -47,6 +48,7 @@ serve:
 
 verify:
   - "from qwen36_resident.generator_vllm import Qwen36ResidentForCausalLM; assert Qwen36ResidentForCausalLM"
+  - "from qwen36_resident.generator_vllm import Qwen36ResidentMTPForCausalLM; assert Qwen36ResidentMTPForCausalLM"
   - "from pathlib import Path; assert Path('/opt/tt-metal/qwen36_resident/kernels/streamer_reader.cpp').is_file(), 'decode kernels missing'"
   - "from pathlib import Path; assert Path('/opt/tt-metal/qwen36_resident/prefill/kernels/handoff.cpp').is_file(), 'prefill kernels missing'"
 
