@@ -50,7 +50,7 @@ serve_profiles:
   - name: default
     description: One user, any sampling.
   - name: mtp
-    description: One user, greedy only, MTP speculative decode (about 1.45x the decode speed).
+    description: One user, always greedy, MTP speculative decode (about 1.45x the decode speed).
     env:
       TT_MODEL_CLASS_OVERRIDES: "TTQwen3_5ForConditionalGeneration=qwen36_resident.generator_vllm:Qwen36ResidentMTPForCausalLM"
 default_profile: default
@@ -96,7 +96,7 @@ card:
     top_k 1, no penalties or logprobs): they are sampled on device and run asynchronously. Any other
     request samples on the host from the full logits and runs synchronously: about 60 tok/s measured
     on that path with greedy requests; stochastic sampling itself was not measured. The `mtp` profile
-    serves greedy requests only: any other request fails at its first decode step.
+    decodes every request greedily: it ignores the request's sampling controls.
   architecture: 27B dense hybrid (48 Gated DeltaNet + 16 full-attention layers)
   status: Experimental
   out_of_scope_use: Image or video input; this port serves the language model only.

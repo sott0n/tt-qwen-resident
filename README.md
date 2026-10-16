@@ -339,7 +339,8 @@ export TT_MODEL_CLASS_OVERRIDES="TTQwen3_5ForConditionalGeneration=qwen36_reside
 ```
 
 `QWEN36_MTP_BLOCK` (default 4) sets the tokens per vLLM decode step and `QWEN36_MTP_DEPTH` (default 4) the
-verify steps the device runs ahead. A request that is not greedy fails at its first decode step.
+verify steps the device runs ahead. Every request decodes greedily: vLLM ignores a block-output model's
+sampling controls.
 
 ## Layout
 

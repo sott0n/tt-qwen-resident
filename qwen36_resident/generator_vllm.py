@@ -187,6 +187,10 @@ class Qwen36ResidentMTPForCausalLM(Qwen36ResidentForCausalLM):
         T = int(prompt_lens[0]) if prompt_lens is not None else tokens.shape[1]
         logits = self.spec.start(tokens[0, :T].tolist())
         self._first = int(logits.argmax())
+        # the plugin samples a block-output model's prefill logits at temperature 1, whatever the request
+        # asks: only the argmax the device decodes from may be sampled
+        logits = torch.full_like(logits, float("-inf"))
+        logits[self._first] = 0
         logits = logits.view(1, 1, -1)
         return (logits, torch.zeros(1, dtype=torch.long)) if self.mrope else logits
 
