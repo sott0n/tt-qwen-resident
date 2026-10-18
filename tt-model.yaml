@@ -79,6 +79,15 @@ card:
     Token accuracy, teacher-forced against the Hugging Face reference (512 scored tokens): 99.41% top-1,
     100% top-5.
 
+    Sampled requests with top_k up to 32 are drawn on device too. One user, chat prompts, 256 generated
+    tokens:
+
+    | Request | Sampled on | Decode |
+    | --- | --- | --- |
+    | Greedy | device | 82.5 tok/s |
+    | Qwen's default (temperature 1.0, top_k 20, top_p 0.95) | device | 82.5 tok/s |
+    | top_k off (temperature 1.0, top_p 0.95) | host | 24.2 tok/s |
+
     The `mtp` profile (`tt-model serve --profile mtp ...`) adds MTP speculative decode with the
     checkpoint's MTP layer: one user, greedy, 256 generated tokens, chat template with thinking on.
 
@@ -92,11 +101,11 @@ card:
     default profile's greedy output where two logits tie in bf16.
   limitations: >
     One user at a time (max_num_seqs 1). Text only: image and video input are not supported. Served
-    context is 32,768 tokens. The decode speed above holds for greedy requests (temperature 0 or
-    top_k 1, no penalties or logprobs): they are sampled on device and run asynchronously. Any other
-    request samples on the host from the full logits and runs synchronously: about 60 tok/s measured
-    on that path with greedy requests; stochastic sampling itself was not measured. The `mtp` profile
-    decodes every request greedily: it ignores the request's sampling controls.
+    context is 32,768 tokens. The decode speed above holds for requests sampled on device (temperature
+    0, or top_k up to 32 with any temperature and top_p; no penalties, logprobs, logit bias or
+    structured output): they run asynchronously. Any other request, including top_k off, samples on
+    the host from the full logits and runs synchronously at about 24 tok/s. The `mtp` profile decodes
+    every request greedily: it ignores the request's sampling controls.
   architecture: 27B dense hybrid (48 Gated DeltaNet + 16 full-attention layers)
   status: Experimental
   out_of_scope_use: Image or video input; this port serves the language model only.
