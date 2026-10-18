@@ -30,9 +30,11 @@
 //
 // With the lm_head the writer scans this core's logits for their maximum (the first one on ties) and
 // writes (order key, vocab index) to record slot [core] on the hub, so the host reads num_streamers
-// candidates per chip instead of the logits.
+// candidates per chip instead of the logits. With sample (batch 1) it writes this core's top sampling::kTopK
+// instead, for the hub's on-device sampling (sampling.hpp).
 
 #include "api/dataflow/dataflow_api.h"
+#include "sampling.hpp"
 #include "streamer_common.hpp"
 
 using namespace resident;
@@ -236,9 +238,22 @@ void kernel_main() {
             // Column c of user u: tile c / 32, face (c % 32) / 16, face row u
             cb_wait_front(cb_logits, nv_max);
             const uint32_t base = get_read_ptr(cb_logits);
-            auto key = [](uint32_t b) { return (b & 0x8000) ? (~b & 0xffff) : (b | 0x8000); };
+            auto key = [](uint32_t b) { return sampling::key_of(b); };
             volatile tt_l1_ptr uint32_t* rec = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(cb_pout));
-            for (uint32_t u = 0; u < batch; u++) {
+            if constexpr (sample) {
+                static_assert(nd_max * kTileBytes >= sampling::kListBytes, "the list is staged in cb_pout");
+                sampling::clear(rec);
+                for (uint32_t i = 0; i < valid_cols; i += 2) {
+                    const uint32_t c = i % 32;
+                    const uint32_t w = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                        base + (i / 32) * kTileBytes + (c / 16) * 32)[(c % 16) / 2];
+                    sampling::insert(rec, key(w & 0xffff), first_index + i);
+                    if (i + 1 < valid_cols) {
+                        sampling::insert(rec, key(w >> 16), first_index + i + 1);
+                    }
+                }
+            }
+            for (uint32_t u = 0; !sample && u < batch; u++) {
                 uint32_t best = 0, best_i = 0;
                 for (uint32_t i = 0; i < valid_cols; i += 2) {
                     const uint32_t c = i % 32;
@@ -260,8 +275,9 @@ void kernel_main() {
                 rec[4 * u] = best;
                 rec[4 * u + 1] = first_index + best_i;
             }
+            constexpr uint32_t rec_bytes = sample ? sampling::kListBytes : batch * 16;
             noc_async_write(
-                get_write_ptr(cb_pout), get_noc_addr(hub_x, hub_y, argmax_addr + core * batch * 16), batch * 16);
+                get_write_ptr(cb_pout), get_noc_addr(hub_x, hub_y, argmax_addr + core * rec_bytes), rec_bytes);
             noc_async_write_barrier();
             noc_semaphore_inc(hub_gather_sem, 1);  // the record is on the hub (a feeding hub waits for it)
         }

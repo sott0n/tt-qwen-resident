@@ -6,9 +6,10 @@ One user: the prompt but its last token goes through the pipeline-parallel prefi
 the resident decode model, and the last prompt token runs one decode step for the first logits. The model
 owns its KV cache, GDN state and conv history, so the plugin's paged KV cache is not used.
 
-Greedy decode steps are sampled on device and run asynchronously (decode input update contract 1): each
-step's hub writes the next step's token state from its own argmax, so on a step without reload_inputs the
-adapter only replays the trace, and the runner reads the (token, position) word one step late. Any other
+Decode steps with temperature 0 or top-k <= 32 (and no penalties, log-probs or other host-only parameters)
+are sampled on device and run asynchronously (decode input update contract 1): each step's hub draws the next
+token from the chips' top 32 logits and writes the next step's token state, so on a step without reload_inputs
+the adapter only replays the trace, and the runner reads the (token, position) word one step late. Any other
 step samples on the host from the full logits, with the host writing the token state.
 
 Qwen36ResidentMTPForCausalLM serves greedy MTP speculative decode (qwen36_resident.mtp) through the
@@ -23,7 +24,7 @@ from vllm.transformers_utils.config import uses_mrope
 
 import ttnn
 from qwen36_resident import weights as Q
-from qwen36_resident.model import Dims, ResidentModel, State
+from qwen36_resident.model import TOP_K, Dims, ResidentModel, State
 from qwen36_resident.mtp import SpecDecoder
 from qwen36_resident.prefill.pp_prefill import PPPrefill
 
@@ -34,9 +35,9 @@ class Qwen36ResidentForCausalLM:
     model_capabilities = {
         "supports_prefix_caching": False,
         "supports_async_decode": True,
-        # greedy decode steps take the device argmax; anything else samples on the host from the logits
+        # the hub samples from the top TOP_K logits; anything else samples on the host from the logits
         "supports_sample_on_device": True,
-        "max_device_top_k": 1,
+        "max_device_top_k": TOP_K,
         "supports_device_penalties": False,
     }
     decode_input_update_contract = 1
@@ -128,9 +129,16 @@ class Qwen36ResidentForCausalLM:
     ):
         assert "reset_batch" not in kwargs, "contract 1 adapters take the explicit reload commands"
         token, pos = tokens.reshape(-1)[0], start_pos.reshape(-1)[0]
-        # sampling_params arrive only on the steps the runner samples on device: all greedy (max_device_top_k 1)
+        # sampling_params arrive only on the steps the runner samples on device (top-k <= TOP_K or greedy)
         if sampling_params is None:
             return self._step(token, pos)
+        if reload_sampling_params:
+            self.model.set_sampling(
+                float(sampling_params.temperature[0]),
+                int(sampling_params.top_k[0]),
+                float(sampling_params.top_p[0]),
+                sampling_params.seed[0],
+            )
         # without reload_inputs, tokens and start_pos are one step behind: the hub wrote the token state
         self.model.step(self._write_token(token, pos) if reload_inputs else None)
         if read_from_device:

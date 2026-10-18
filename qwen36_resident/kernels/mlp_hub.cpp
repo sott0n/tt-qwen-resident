@@ -38,8 +38,12 @@
 // Compile-time args 13 feed, 14 max_pos, 15 tok page bytes, 16 rope offset in tok, 17 rope bytes, 18 feed
 // kind, 19 rope offset in the peer's tok, 20 embedding row bytes.
 // Runtime args (feed), after the rectangles: argmax records, candidate slots (L1, num_chips x 16 B, same
-// address on every chip), candidate semaphore, launch counter, tok, embedding table, rope table, out, then
-// the peer's tok (verify kinds).
+// address on every chip), candidate semaphore, launch counter, tok, embedding table, rope table, out, sampling
+// parameters, then the peer's tok (verify kinds).
+//
+// Compile-time arg 21 sample (feed kind 0): the records are the streamers' top-k lists and the candidate slots
+// the chips' (sampling::kListBytes each); the token is drawn from them with the sampling parameters (DRAM, 16 words,
+// the first 4 used, see sampling.hpp) instead of taken as the argmax.
 //
 // Feed kinds 1 and 2 run MTP speculative decode with no host between steps: the main model's verify step
 // (kind 1, rows t at p and draft d at p + 1) and the draft model's (kind 2, see mtp.py) alternate, each
@@ -59,6 +63,7 @@
 #include "tt_metal/fabric/hw/inc/noc_addr.h"
 #include "tt_metal/fabric/hw/inc/packet_header_pool.h"
 #include "cpp/ttnn/operations/ccl/common/kernels/minimal_ccl_common.hpp"
+#include "sampling.hpp"
 
 constexpr uint32_t num_chips = get_compile_time_arg_val(0);
 constexpr uint32_t chip = get_compile_time_arg_val(1);
@@ -82,6 +87,9 @@ constexpr uint32_t feed_kind = get_compile_time_arg_val(18);
 constexpr uint32_t peer_rope_off = get_compile_time_arg_val(19);
 constexpr uint32_t row_bytes = get_compile_time_arg_val(20);
 constexpr uint32_t rows = feed_kind > 0 ? 2 : 1;  // greedy tokens per launch
+constexpr bool sample = get_compile_time_arg_val(21) != 0;
+static_assert(!sample || (feed && feed_kind == 0), "sampling feeds batch 1");
+constexpr uint32_t cand_bytes = sample ? sampling::kListBytes : 16;
 constexpr uint32_t packets_per_vector = (vector_bytes + packet_bytes - 1) / packet_bytes;
 constexpr uint32_t num_headers = 2 * packets_per_vector * 2 + (feed ? 2 : 0);
 constexpr bool pooled = num_headers <= NUM_PACKET_HEADERS / MaxDMProcessorsPerCoreType;
@@ -196,7 +204,7 @@ void kernel_main() {
     const size_t rect_args = arg_idx;
     arg_idx += 5 * rects;
     uint32_t argmax_addr = 0, cand_addr = 0, cand_sem_addr = 0, launch_addr = 0;
-    uint32_t tok_addr = 0, embed_addr = 0, rope_addr = 0, out_addr = 0, peer_tok_addr = 0;
+    uint32_t tok_addr = 0, embed_addr = 0, rope_addr = 0, out_addr = 0, params_addr = 0, peer_tok_addr = 0;
     if constexpr (feed) {
         argmax_addr = get_arg_val<uint32_t>(arg_idx++);
         cand_addr = get_arg_val<uint32_t>(arg_idx++);
@@ -206,6 +214,7 @@ void kernel_main() {
         embed_addr = get_arg_val<uint32_t>(arg_idx++);
         rope_addr = get_arg_val<uint32_t>(arg_idx++);
         out_addr = get_arg_val<uint32_t>(arg_idx++);
+        params_addr = get_arg_val<uint32_t>(arg_idx++);
         if constexpr (feed_kind > 0) {
             peer_tok_addr = get_arg_val<uint32_t>(arg_idx++);
         }
@@ -246,14 +255,14 @@ void kernel_main() {
     }
     volatile PACKET_HEADER_TYPE* cand_hdr[2] = {nullptr, nullptr};
     if constexpr (feed) {
-        const uint64_t dst = get_noc_addr(my_x[0], my_y[0], cand_addr + chip * 16);
+        const uint64_t dst = get_noc_addr(my_x[0], my_y[0], cand_addr + chip * cand_bytes);
         const uint64_t sem = get_noc_addr(my_x[0], my_y[0], cand_sem_addr);
         for (uint32_t dir = 0; dir < 2; dir++) {
             volatile PACKET_HEADER_TYPE* h = allocate();
             h->to_chip_multicast(tt::tt_fabric::MulticastRoutingCommandHeader{
                 1, static_cast<uint8_t>(dir == 0 ? num_chips - 1 - chip : chip)});
             h->to_noc_fused_unicast_write_atomic_inc(
-                tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem, 1, true}, 16);
+                tt::tt_fabric::NocUnicastAtomicIncFusedCommandHeader{dst, sem, 1, true}, cand_bytes);
             cand_hdr[dir] = h;
         }
     }
@@ -362,8 +371,11 @@ void kernel_main() {
         volatile tt_l1_ptr uint32_t* cand = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cand_addr);
         auto better = [](uint32_t k, uint32_t i, uint32_t bk, uint32_t bi) { return k > bk || (k == bk && i < bi); };
         // per row u: record of streamer s at rec[4 (s rows + u)]; candidate words 2u, 2u + 1
-        uint32_t best_ks[rows], best_is[rows];
-        for (uint32_t u = 0; u < rows; u++) {
+        uint32_t best_ks[rows] = {}, best_is[rows] = {};
+        if constexpr (sample) {
+            sampling::merge(rec, num_streamers, cand + chip * 2 * sampling::kTopK);
+        }
+        for (uint32_t u = 0; !sample && u < rows; u++) {
             uint32_t bk = rec[4 * u], bi = rec[4 * u + 1];
             for (uint32_t s = 1; s < num_streamers; s++) {
                 if (better(rec[4 * (s * rows + u)], rec[4 * (s * rows + u) + 1], bk, bi)) {
@@ -378,16 +390,18 @@ void kernel_main() {
         }
         if constexpr (num_chips > 1) {
             if (fabric.has_forward_connection()) {
-                perform_payload_send(fabric.get_forward_connection(), cand_addr + chip * 16, 16, cand_hdr[0]);
+                perform_payload_send(
+                    fabric.get_forward_connection(), cand_addr + chip * cand_bytes, cand_bytes, cand_hdr[0]);
             }
             if (fabric.has_backward_connection()) {
-                perform_payload_send(fabric.get_backward_connection(), cand_addr + chip * 16, 16, cand_hdr[1]);
+                perform_payload_send(
+                    fabric.get_backward_connection(), cand_addr + chip * cand_bytes, cand_bytes, cand_hdr[1]);
             }
             noc_semaphore_wait_min(
                 reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cand_sem_addr), (launch + 1) * (num_chips - 1));
             invalidate_l1_cache();
         }
-        for (uint32_t u = 0; u < rows; u++) {
+        for (uint32_t u = 0; !sample && u < rows; u++) {
             for (uint32_t c = 0; c < num_chips; c++) {
                 if (better(cand[4 * c + 2 * u], cand[4 * c + 2 * u + 1], best_ks[u], best_is[u])) {
                     best_ks[u] = cand[4 * c + 2 * u];
@@ -395,15 +409,30 @@ void kernel_main() {
                 }
             }
         }
-        const uint32_t best_i = best_is[0];
+        uint32_t best_i = best_is[0];
 
         // staging in the parity-1 slots: a peer writes there only after this chip's next round 0
         const uint32_t stage = (slots + num_chips * vector_bytes + 63) & ~63u;
         const uint32_t head = stage, x0 = stage + 64, rope = x0 + vector_bytes;
         const InterleavedAddrGen<true> tok{.bank_base_address = tok_addr, .page_size = tok_bytes};
         noc_async_read(tok.get_noc_addr(0), head, 64);
+        // sample: the parameters, the global list and the draw's weights after the rope tiles
+        const uint32_t params = rope + rope_bytes, list = params + 64, weights = list + sampling::kListBytes;
+        if constexpr (sample) {
+            const InterleavedAddrGen<true> par{.bank_base_address = params_addr, .page_size = 64};
+            noc_async_read(par.get_noc_addr(0), params, 64);
+        }
         noc_async_read_barrier();
         volatile tt_l1_ptr uint32_t* h = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(head);
+        if constexpr (sample) {
+            volatile tt_l1_ptr uint32_t* l = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(list);
+            sampling::merge(cand, num_chips, l);
+            best_i = sampling::draw(
+                l,
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(params),
+                h[1],
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(weights));
+        }
         if constexpr (feed_kind > 0) {
             feed_verify(h, best_is, stage, embed_addr, rope_addr, peer_tok_addr, out_addr, cb_base(2));
         } else {

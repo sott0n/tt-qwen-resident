@@ -26,7 +26,8 @@
 //   page_size, block_bytes, then 53 sem_local (conv history write-backs done, for the reader), 54 batch
 //   (users per step, 1 / 2 / 4 / 8), 55 sem_addr (CB addresses exchanged with the hub), 56 o_heads (GDN
 //   head cores that write o, one per value head), 57 column block tiles (kBlk), 58 sem_ring (local: the
-//   ring step + 1, from the reader to the writer), 59 verify (0 / 1), 60 fc (0 / 1)
+//   ring step + 1, from the reader to the writer), 59 verify (0 / 1), 60 fc (0 / 1), 61 sample (0 / 1: the
+//   lm_head writes this core's top sampling::kTopK logits instead of its largest, see sampling.hpp)
 //
 // fc (the MTP draft layer, no GDN layers): x of layer 0 is fc([norm_e(e) | norm_h(h)]) for the token state's
 // two vectors per row (embedding e, then the main model's last x as h). Chip c's K slice of the fc is slice
@@ -147,6 +148,8 @@ static_assert(!verify || batch == 2, "verify runs two rows of one user");
 constexpr uint32_t kHistSlots = verify ? 4 : 3;  // conv history slots per (streamer, GDN copy) row
 constexpr uint32_t gdn_layers = layers - (attn_interval > 0 ? layers / attn_interval : 0);
 constexpr bool fc_in = get_compile_time_arg_val(60) != 0;
+constexpr bool sample = get_compile_time_arg_val(61) != 0;
+static_assert(!sample || batch == 1, "on-device sampling serves batch 1");
 static_assert(!fc_in || gdn_layers == 0, "fc streams through the GDN projection entry");
 constexpr uint32_t kRound0 = fc_in ? 1 : 0;  // hub round of layer 0's mixer half
 

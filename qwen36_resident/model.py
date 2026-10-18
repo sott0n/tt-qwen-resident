@@ -77,6 +77,7 @@ KV_BLOCK = 8  # KV position tiles per streamed block of an attention worker
 HEAD_FP32_CBS = (5, 6, 7, 15, 30, 31)
 TOK_X0 = 64
 TOK_SLOT = 4  # token state word: the GDN state slot of row 0 (verify)
+TOP_K = 32  # sampling::kTopK: the candidates of on-device sampling, the largest top-k it serves
 KV_ROW = (HD // TILE) * TILE_BYTES[ttnn.bfloat8_b]
 
 
@@ -420,7 +421,8 @@ class ResidentModel:
         """st: the decode state (State), or one State per user for a batch of len(st) users. More than 8 users
         run as sub-batches of 8, one launch each (the launches share the weights and buffers, each has its
         own decode state). embed (the embedding table on device, one row per page; batch 1 with the lm_head):
-        each step also writes the next step's token state from its own greedy token (step(None)).
+        each step also writes the next step's token state from its own token (step(None)), drawn on device
+        with the parameters of set_sampling (greedy until set).
         verify: st is one user's State and a step runs two rows of it, at positions p and p + 1 (a token
         and its draft); see token_state for continuing from either row. fc (the MTP draft layer): per chip
         its K slice [2 HIDDEN / n, HIDDEN] of the fc that makes x0 from the token state's two vectors per row
@@ -430,6 +432,7 @@ class ResidentModel:
         self.mesh, self.d, self.layers, self.interval, self.lm_head = mesh, d, layers, interval, lm_head
         self.verify = verify
         self.fc = fc is not None
+        self.sample = embed is not None and not verify  # the hub draws the fed token (sampling.hpp)
         if verify:
             assert isinstance(st, State)
             st = [st, st]
@@ -726,11 +729,13 @@ class ResidentModel:
         self.x_t = dram_t(torch.zeros(n, B * HIDDEN), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
         self.ccl_sems = [ttnn.create_global_semaphore(mesh, hub_grid, 0) for _ in range(2)]  # per slot parity
         # per streamer (order key, vocab index) of its largest logit, written by the streamer writers
+        # (sample: its top-k list, sampling.hpp)
+        rec_words = S * (2 * TOP_K if self.sample else B * 4)
         self.argmax_t = (
             l1(
-                torch.zeros(1, S * B * 4, dtype=torch.int32),
+                torch.zeros(1, rec_words, dtype=torch.int32),
                 hub_grid,
-                [1, S * B * 4],
+                [1, rec_words],
                 ttnn.uint32,
                 layout=ttnn.ROW_MAJOR_LAYOUT,
             )
@@ -744,11 +749,15 @@ class ResidentModel:
             assert lm_head and (B == 1 or verify) and n_sub == 1, "the hub feeds batch 1 with the lm_head"
             assert (feed_peer is not None) == verify
             self.embed, self.feed_peer = embed, feed_peer
-            self.cand_t = l1(torch.zeros(1, n * 4, dtype=torch.int32), hub_grid, [1, n * 4], ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
+            cand_words = n * (2 * TOP_K if self.sample else 4)
+            self.cand_t = l1(
+                torch.zeros(1, cand_words, dtype=torch.int32), hub_grid, [1, cand_words], ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
+            )
             self.feed_sems = [ttnn.create_global_semaphore(mesh, hub_grid, 0) for _ in range(2)]  # candidates, launches
             rope = rope_words(sts[0].max_pos).reshape(sts[0].max_pos, -1).view(np.int32)
             self.rope_t = dram_t(torch.from_numpy(rope.copy()), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, rep)
             self.out_t = dram_t(torch.zeros(1, 16, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, rep)
+            self.params_t = dram_t(torch.zeros(1, 16, dtype=torch.int32), ttnn.uint32, ttnn.ROW_MAJOR_LAYOUT, rep)
 
         # ---- optional timelines
         def ts_buf(grid_, count, words):
@@ -1064,7 +1073,7 @@ class ResidentModel:
                 ct += [d.conv_tiles, d.Ot, d.nv * G, int(lm_head)]
                 for (Kt, _, _), (sb, pages, page, block) in zip(entries, geo):
                     ct += [Kt, sb, pages, page, block]
-                ct += [SEM_LOCAL, B, SEM_ADDR, d.nv, blk_tiles, SEM_FLAG, int(self.verify), int(self.fc)]
+                ct += [SEM_LOCAL, B, SEM_ADDR, d.nv, blk_tiles, SEM_FLAG, int(self.verify), int(self.fc), int(self.sample)]
                 rr, wr, cr = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
                 peers = [v for p in sphys for v in (p.x, p.y)]
                 head_xy = [v for p in head_p for v in (p.x, p.y)]
@@ -1120,7 +1129,7 @@ class ResidentModel:
                 hub_ct += [SEM_FLAG, int(lm_head), 1, 1, SEM_ADDR]
                 hub_ct += [int(self.feed), sts[0].max_pos, self.tok_words * 4, self.rope_off, 3 * 2048]
                 feed_kind = (2 if self.fc else 1) if self.feed and verify else 0
-                hub_ct += [feed_kind, TOK_X0 + (1 if self.fc else 2) * d.Ht * 64 * B, HIDDEN * 2]
+                hub_ct += [feed_kind, TOK_X0 + (1 if self.fc else 2) * d.Ht * 64 * B, HIDDEN * 2, int(self.sample)]
                 if self.feed:
                     hub_args += [
                         sub["argmax"].buffer_address(),
@@ -1130,6 +1139,7 @@ class ResidentModel:
                         self.embed.buffer_address(),
                         self.rope_t.buffer_address(),
                         self.out_t.buffer_address(),
+                        self.params_t.buffer_address(),
                     ]
                     if feed_kind:
                         hub_args.append(self.feed_peer.buffer_address())
@@ -1274,7 +1284,7 @@ class ResidentModel:
             if lm_head:
                 io += [sub["logits"], sub["argmax"]]
             if self.feed:
-                io += [self.cand_t, self.rope_t, self.out_t, self.embed]
+                io += [self.cand_t, self.rope_t, self.out_t, self.params_t, self.embed]
                 if self.feed_peer is not None:
                     io.append(self.feed_peer)
             if timeline:
@@ -1513,6 +1523,33 @@ class ResidentModel:
         o = o.reshape(self.d.n, self.S, self.batch, -1)[:, 0]
         return o[:, 0] if self.batch == 1 else o
 
+    @staticmethod
+    def sampling_words(temperature=0.0, top_k=1, top_p=1.0, seed=0):
+        """the hub's sampling parameter words (sampling.hpp): temperature 0 or top_k 1 is greedy, top_k <= TOP_K
+        (< 1: TOP_K)"""
+        top_k = TOP_K if top_k < 1 else min(int(top_k), TOP_K)
+        words = np.zeros(16, dtype=np.uint32)
+        words[0] = min(round(65536 / temperature), 2**31 - 1) if temperature > 0 else 0
+        words[1] = top_k
+        words[2] = min(max(round(top_p * 65536), 1), 65536)
+        words[3] = int(seed) & 0xFFFFFFFF
+        return words
+
+    def set_sampling(self, temperature=0.0, top_k=1, top_p=1.0, seed=None):
+        """the parameters of the fed token's draw (sample), read by every step until set again; seed None picks
+        one (see sampling_words)"""
+        assert self.sample
+        if seed is None:
+            seed = int(np.random.randint(0, 2**32, dtype=np.uint64))
+        words = self.sampling_words(temperature, top_k, top_p, seed)
+        t = ttnn.from_torch(
+            torch.from_numpy(words.view(np.int32).copy()).reshape(1, -1),
+            dtype=ttnn.uint32,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh),
+        )
+        ttnn.copy_host_to_device_tensor(t, self.params_t)
+
     def fed_token(self):
         """(token, position) the last step fed into the next one (feed)"""
         out = ttnn.to_torch(ttnn.get_device_tensors(self.out_t)[0]).reshape(-1)
@@ -1524,7 +1561,11 @@ class ResidentModel:
         out = []
         for sub in self.subs:
             raw = ttnn.to_torch(sub["argmax"], mesh_composer=ttnn.ConcatMeshToTensor(self.mesh, dim=0))
-            c = raw.reshape(-1, self.S, self.batch, 4)[..., :2].to(torch.int64) & 0xFFFFFFFF
+            if self.sample:  # each streamer's list starts with its largest (key, index)
+                c = raw.reshape(-1, self.S, 1, 2, TOP_K)[..., 0]
+            else:
+                c = raw.reshape(-1, self.S, self.batch, 4)[..., :2]
+            c = c.to(torch.int64) & 0xFFFFFFFF
             for u in range(self.batch):
                 cu = c[:, :, u].reshape(-1, 2)
                 best = cu[:, 0].max()
