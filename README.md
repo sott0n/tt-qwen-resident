@@ -160,9 +160,11 @@ of the hardware floor.
 - Attention layer: 155–160 µs at short context.
 - All-reduce: 3.75 µs per [1, 5120] vector, against 14 µs for the ttnn CCL op.
 
-At batch 1 the step also produces the next step's input, so the host is never between two steps. The hub
-reduces the streamers' argmax candidates, exchanges one 16-byte record per chip over fabric, and every chip
-picks the same token. It then writes the next token state to DRAM: the position + 1, the token's embedding
+At batch 1 the step also produces the next step's input, so the host is never between two steps. Each
+streamer keeps the top 32 of its logits; the hub merges them into the chip's top 32, exchanges that 256-byte
+list with every chip over fabric, and every chip draws the same token from the merged list: greedy, or
+temperature, top-k (<= 32) and top-p in fixed point (the data movement cores have no FPU), with a random
+number hashed from the request's seed and the position. It then writes the next token state to DRAM: the position + 1, the token's embedding
 row (from the prefill's table) and the RoPE tiles of the new position (from a table built at load). A token
 costs 12.0 ms with the host reading it one step late, against 12.6 ms when the host writes each state. The
 fabric semaphores count up from a per-hub launch counter and are never reset inside a step: with no host gap,
@@ -324,10 +326,21 @@ Served by that package, one user, greedy, 128 generated tokens, measured from a 
 | 8k | 1.16 s | 81 tok/s/user |
 | 32k | 4.56 s | 74 tok/s/user |
 
-Greedy steps (temperature 0 or top_k 1, no penalties or logprobs) take the device argmax and run
-asynchronously: vLLM submits step N + 1 before reading step N's token, which the hub has already fed into
-step N + 1. Any other request samples on the host from the full logits, synchronously. TTFT is 50–90 ms
-over the model's own, for the request handling and the decode state reset.
+Steps with temperature 0 or top_k <= 32 (no penalties, logprobs or other host-only parameters) are sampled
+on device and run asynchronously: vLLM submits step N + 1 before reading step N's token, which the hub has
+already drawn and fed into step N + 1. Any other request samples on the host from the full logits,
+synchronously. TTFT is 50–90 ms over the model's own, for the request handling and the decode state reset.
+
+Sampling, one user, chat prompts, 256 generated tokens, served by `vllm serve` from this repository:
+
+| Request | Sampled on | Decode |
+|---|---|---|
+| Greedy | device | 82.5 tok/s/user |
+| Qwen's default (temperature 1.0, top_k 20, top_p 0.95) | device | 82.5 tok/s/user |
+| top_k off (temperature 1.0, top_p 0.95) | host | 24.2 tok/s/user |
+
+With host sampling for every non-greedy request, Qwen's default ran at 24.3 tok/s/user; the device draw
+costs greedy decode 1% (83.3 tok/s/user before).
 
 Limits: one user at a time (`max_num_seqs` 1, since the prefill hands off to a batch-1 decode model only),
 text only, 32k context in the package.
@@ -384,6 +397,7 @@ RESIDENT_PREFILL=1 pytest qwen36_resident/tests/test_resident_accuracy.py::test_
 RESIDENT_PROMPTS=511,8192,32767 pytest qwen36_resident/tests/bench_ttft.py           # TTFT and decode speed
 RESIDENT_FEED=1 RESIDENT_PROMPTS=127,32767 pytest qwen36_resident/tests/bench_ttft.py # with the decode feeding itself
 pytest qwen36_resident/tests/test_resident_feed.py                                    # fed greedy = host-fed greedy
+pytest qwen36_resident/tests/test_resident_sampling.py                                # device draw = host reference
 RESIDENT_BATCHES=1,8,32 pytest qwen36_resident/tests/bench_resident_batch.py          # decode step per batch
 RESIDENT_BATCH=8 pytest qwen36_resident/tests/bench_resident_model.py::test_resident_decode_steps  # vs torch, random weights
 RESIDENT_LAYERS=16 pytest qwen36_resident/tests/prof_pp_tick.py                       # untraced prefill ticks for the profiler
