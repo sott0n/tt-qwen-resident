@@ -1,18 +1,19 @@
 # tt-qwen-resident
 
 Qwen3.6-27B (dense, 64 layers: 48 Gated DeltaNet + 16 full attention) on a Tenstorrent QB2 (4× Blackhole P150).
-Decode is 3× faster and TTFT is lower at every prompt length than the tt-metal demo
-(`models/demos/blackhole/qwen36`), with better token accuracy. This came from replacing the op-by-op ttnn
+Decode is 3× faster and TTFT is lower at every prompt length than the tt-metal reference, with better token
+accuracy. The tt-metal reference is tt-metal's own Qwen3.6-27B implementation
+(`models/demos/blackhole/qwen36`): op-by-op ttnn, tensor-parallel over 4 chips. This came from replacing the op-by-op ttnn
 execution with a design built for Tensix.
 
 | | |
 |---|---|
-| Decode, batch 1 | 83 tok/s/user (demo: 25.5) |
+| Decode, batch 1 | 83 tok/s/user (tt-metal: 25.5) |
 | Decode, batch 1, MTP speculative decode | 118–125 tok/s/user on chat prompts, served through vLLM |
-| TTFT, 511-token prompt | 0.19 s (demo: 0.31 s at 128) |
-| Batch 8 | 374 tok/s total, 46.7 tok/s/user (demo: 165 total) |
+| TTFT, 511-token prompt | 0.19 s (tt-metal: 0.31 s at 128) |
+| Batch 8 | 374 tok/s total, 46.7 tok/s/user (tt-metal: 165 total) |
 | Longest context run end to end | 256k |
-| Token accuracy, top-1 / top-5 | 99.41 / 100 (demo: 98.63 / 100) |
+| Token accuracy, top-1 / top-5 | 99.41 / 100 (tt-metal: 98.63 / 100) |
 
 Accuracy is teacher-forced against the Hugging Face reference, 512 scored tokens, same reference file for both.
 
@@ -81,11 +82,11 @@ RESIDENT_PREFILL=1 pytest qwen36_resident/tests/test_resident_accuracy.py::test_
 
 If a run hangs, reset the cards with `tt-smi -r 0,1,2,3` before the next one.
 
-## Results against the tt-metal demo
+## Results against the tt-metal reference
 
 Measured on the same host.
 
-| Metric | tt-metal demo | This work | Ratio |
+| Metric | tt-metal | This work | Ratio |
 |---|---|---|---|
 | Decode, batch 1, short context | 25.5 tok/s/user | 83 tok/s/user | 3.3× |
 | TTFT, 128 tokens | 0.31 s | 0.12 s | 2.6× |
@@ -102,7 +103,7 @@ Measured on the same host.
 Rates marked tok/s/user are per user; at batch 1 that is the whole decode rate. Totals are tok/s summed over
 the batch. Decode rates include the host's read of every generated token; at batch 1 the device feeds itself
 (see [Resident decode](#resident-decode)). TTFT is end to end: prefill, state handoff to the decode model, and
-the first decode step. The demo's batched runs use 128-token prompts.
+the first decode step. The tt-metal reference's batched runs use 128-token prompts.
 
 ## Distance to the floor
 
@@ -111,7 +112,7 @@ token reads 5.47 GB of weights per chip, and DRAM delivers about 510 GB/s per ch
 bound by compute: 2 FLOPs per weight per token on 24.5 B weights (the embedding and lm_head excluded), plus
 causal attention, at 4 × 371 TFLOPS (the sustained matmul rate measured in ttnn).
 
-| Workload | Floor | tt-metal demo | % of floor | This work | % of floor |
+| Workload | Floor | tt-metal | % of floor | This work | % of floor |
 |---|---|---|---|---|---|
 | Decode step, batch 1 | 10.7 ms | 38.3 ms | 28% | 12.1 ms | 88% |
 | Decode token with host, batch 1 | 10.7 ms | 39.2 ms | 27% | 12.0 ms | 89% |
@@ -120,7 +121,7 @@ causal attention, at 4 × 371 TFLOPS (the sustained matmul rate measured in ttnn
 | Prefill, 32k prompt | 1.22 s | 6.35 s | 19% | 4.50 s | 27% |
 
 The batch-8 floor adds each user's GDN state read and write (about 75 MB per user per chip). Prefill rows are
-end-to-end TTFT; prefill alone is 1.02 s at 8k (27%). The demo's batch-1 step is from a profile at tt-metal
+end-to-end TTFT; prefill alone is 1.02 s at 8k (27%). The tt-metal reference's batch-1 step is from a profile at tt-metal
 `816841ddc93`; its host-included token uses 25.5 tok/s/user measured at `f9304d29843`.
 
 Where the rest goes:
@@ -156,12 +157,12 @@ table leaves them out.
 - **Judge by the floor and by the whole model.** Every change is measured against the bandwidth or compute
   floor, and must keep 64-layer token accuracy and bit-repeatable runs. Passing op-level tests is not enough.
 
-## Design compared with the upstream implementation
+## Design compared with the tt-metal reference
 
 Both run the same model with the same weight formats (gate/up bf4, the other projections and down bf8, KV cache
 bf8, GDN state fp32) and are scored against the same reference. The execution model is what differs.
 
-| Aspect | Upstream (tt-metal demo) | This work |
+| Aspect | tt-metal | This work |
 |---|---|---|
 | Unit of execution | A graph of ttnn ops, about 4,800 per decode token, replayed from a trace. Each op is its own program; data goes back to DRAM or L1 between ops. | One persistent program per chip for the whole decode step (64 layers + lm_head). Activations stay in L1 from layer to layer. |
 | Core allocation | Every op picks its own grid; each core does one op at a time. | Fixed roles for the whole step: 32 weight streamers, GDN head cores, an attention leader with 31 workers and a tail core, one all-reduce hub. The roles run at the same time. |
@@ -175,12 +176,12 @@ bf8, GDN state fp32) and are scored against the same reference. The execution mo
 | Batching | Batch dimension in every op; paged KV and batched GDN state; batch 8 and 32 in one trace. | Up to 8 users share one weight stream, as rows of the activation tiles; GDN and attention cores take the users in turn. Larger batches run as sub-batches of 8. |
 | Main limit | Op count and op gaps (decode); Ethernet traffic of tensor-parallel prefill. | DRAM bandwidth for weights (decode, 88% of the hardware floor); prefill attention at long context; L1 size for batches above 8. |
 
-Upstream facts are from `models/demos/blackhole/qwen36` at tt-metal `f9304d29843` (op and CCL counts from a
+tt-metal facts are from `models/demos/blackhole/qwen36` at tt-metal `f9304d29843` (op and CCL counts from a
 profile of commit `816841ddc93`).
 
 ## Starting point: where the time went
 
-A roofline study of the demo set the direction. At 128 tokens of context, decode took 38.3 ms per token
+A roofline study of the tt-metal reference set the direction. At 128 tokens of context, decode took 38.3 ms per token
 (26.1 tok/s/user, batch 1):
 
 | Part of a decode step | Time | What it is |
@@ -311,14 +312,14 @@ TDP. Profiles taken without a trace run at full clock and understate the tick.
 Decode attention streams the KV cache in blocks of 8 position tiles with an online softmax, so worker L1 no
 longer grows with the context. Logits PCC against torch is 0.998 at position 131k.
 
-| Prompt (batch 1) | TTFT | Decode | Demo TTFT | Demo decode |
+| Prompt (batch 1) | TTFT | Decode | tt-metal TTFT | tt-metal decode |
 |---|---|---|---|---|
 | 32k | 4.50 s | 73.7 tok/s/user | 6.35 s | 24.3 tok/s/user |
 | 64k | 11.3 s | 67.8 tok/s/user | not measured | not measured |
 | 128k | 32.6 s | 57.9 tok/s/user | 34.4 s | 22.9 tok/s/user |
 | 256k | 107.0 s | 44.9 tok/s/user | not measured | not measured |
 
-At 128k the prefill is nearly level with the demo. Prefill attention FLOPs grow with the square of the prompt
+At 128k the prefill is nearly level with the tt-metal reference. Prefill attention FLOPs grow with the square of the prompt
 and dominate there; this is the next prefill lever.
 
 ## Batching
@@ -328,7 +329,7 @@ heads and attention handle the users in turn. Up to 8 users run in one launch, b
 takes in0 tiles of 1, 2, 4 or 8 rows. Larger batches run as sub-batches of 8, one launch each, replayed as one
 trace.
 
-| Batch | Step | Total tok/s | tok/s/user | Demo: total (tok/s/user) |
+| Batch | Step | Total tok/s | tok/s/user | tt-metal: total (tok/s/user) |
 |---|---|---|---|---|
 | 1 | 12.7 ms | 79 | 79 | 25.5 |
 | 8 | 21.4 ms | 374 | 46.7 | 165 (20.6) |
@@ -349,7 +350,7 @@ took batch 8 from 38.5 to 21.4 ms per step:
 - Elementwise work only on the 32×32 views that hold data.
 - The attention leader prepares the next user's q while the workers finish the current user.
 
-At batch 32 the total is 7% below the demo, because sub-batches do not share the weight stream.
+At batch 32 the total is 7% below the tt-metal reference, because sub-batches do not share the weight stream.
 
 ## MTP speculative decode
 
