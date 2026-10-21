@@ -16,6 +16,71 @@ execution with a design built for Tensix.
 
 Accuracy is teacher-forced against the Hugging Face reference, 512 scored tokens, same reference file for both.
 
+## Setup
+
+Needs a QB2 (4× Blackhole P150) and the Hugging Face checkpoint `Qwen/Qwen3.6-27B` in
+`~/.cache/huggingface/hub`.
+
+```bash
+git clone --recurse-submodules git@github.com:sott0n/tt-qwen-resident.git
+cd tt-qwen-resident
+./scripts/setup.sh          # applies patches/, builds tt-metal, creates its python env
+```
+
+`pip install ttnn` is not enough: the prefill uses a ttnn op change (`patches/`) and kernel APIs newer than the
+published wheels. To use an existing tt-metal build of the pinned commit with the patches applied, set
+`TT_METAL_HOME` to it before sourcing `scripts/env.sh`.
+
+## How to run
+
+There are three ways, from easiest to most hands-on.
+
+**1. Prebuilt container (no setup needed).** Needs Docker and
+[tt-model](https://github.com/tenstorrent/tt-model-manager):
+
+```bash
+tt-model serve kyamaguchiTT/qwen3.6-27b-resident-p150x4                 # OpenAI API on port 20000
+tt-model serve --profile mtp kyamaguchiTT/qwen3.6-27b-resident-p150x4   # with MTP speculative decode
+```
+
+**2. vLLM server from this checkout.** After [Setup](#setup), install vLLM 0.26.0 and
+[vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin) at `3506696` in a separate python environment
+(see the plugin's "Environment Setup"). Then start the server:
+
+```bash
+source scripts/env.sh
+export MESH_DEVICE=P150x4
+export EXTRA_MODELS_DIR=$PWD/qwen36_resident/vllm_models   # registers this model with the plugin
+<vllm-env>/bin/vllm serve Qwen/Qwen3.6-27B \
+  --max-num-seqs 1 --block-size 64 --max-model-len 32768 --async-scheduling --port 8000 \
+  --additional-config '{"tt": {"trace_region_size": 134217728, "sample_on_device_mode": "decode_only"}}'
+```
+
+For MTP speculative decode, add this before `vllm serve`:
+
+```bash
+export TT_MODEL_CLASS_OVERRIDES="TTQwen3_5ForConditionalGeneration=qwen36_resident.generator_vllm:Qwen36ResidentMTPForCausalLM"
+```
+
+Send a request once the server prints that it is ready:
+
+```bash
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "Qwen/Qwen3.6-27B", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 64}'
+```
+
+**3. Without vLLM.** The accuracy test loads the real weights and runs the model end to end. It needs the
+reference tokens from tt-metal (`models/tt_transformers/tests/reference_outputs/Qwen3.6-27B.refpt`, or set
+`RESIDENT_REFPT`):
+
+```bash
+source scripts/env.sh
+pytest qwen36_resident/tests/test_resident_accuracy.py::test_resident_accuracy                     # decode
+RESIDENT_PREFILL=1 pytest qwen36_resident/tests/test_resident_accuracy.py::test_resident_accuracy  # prefill + decode
+```
+
+If a run hangs, reset the cards with `tt-smi -r 0,1,2,3` before the next one.
+
 ## Results against the tt-metal demo
 
 Measured on the same host.
@@ -335,12 +400,8 @@ the next one. vLLM sends the first token with the first block, which is most of 
 
 `qwen36_resident/generator_vllm.py` adapts the model to vLLM through the
 [vllm-tt-plugin](https://github.com/tenstorrent/vllm-tt-plugin), and `tt-model.yaml` packages it with
-[tt-model](https://github.com/tenstorrent/tt-model-manager) as a container on Hugging Face. On a host with
-Docker and a QB2:
-
-```bash
-tt-model serve kyamaguchiTT/qwen3.6-27b-resident-p150x4    # OpenAI API on port 20000
-```
+[tt-model](https://github.com/tenstorrent/tt-model-manager) as a container on Hugging Face. To start it, see
+[How to run](#how-to-run).
 
 Served by that package, one user, greedy, 128 generated tokens, measured from a streaming client:
 
@@ -379,20 +440,3 @@ export TT_MODEL_CLASS_OVERRIDES="TTQwen3_5ForConditionalGeneration=qwen36_reside
 `QWEN36_MTP_BLOCK` (default 4) sets the tokens per vLLM decode step and `QWEN36_MTP_DEPTH` (default 4) the
 verify steps the device runs ahead. Every request decodes greedily: vLLM ignores a block-output model's
 sampling controls.
-
-## Setup
-
-```bash
-git clone --recurse-submodules git@github.com:sott0n/tt-qwen-resident.git   # or: git submodule update --init --recursive
-cd tt-qwen-resident
-./scripts/setup.sh          # applies patches/, builds tt-metal, creates its python env
-source scripts/env.sh       # TT_METAL_HOME, PYTHONPATH, python env
-```
-
-`pip install ttnn` is not enough: the prefill uses a ttnn op change (`patches/`) and kernel APIs newer than the
-published wheels. To use an existing tt-metal build of the pinned commit with the patches applied, set
-`TT_METAL_HOME` to it before sourcing `scripts/env.sh`.
-
-Weights: the Hugging Face checkpoint `Qwen/Qwen3.6-27B` in `~/.cache/huggingface/hub`. The accuracy tests read
-the reference tokens from tt-metal (`models/tt_transformers/tests/reference_outputs/Qwen3.6-27B.refpt`, or
-`RESIDENT_REFPT`).
