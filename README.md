@@ -2,9 +2,10 @@
 
 Qwen3.6-27B (dense, 64 layers: 48 Gated DeltaNet + 16 full attention) on a Tenstorrent QB2 (4× Blackhole P150).
 Decode is 3× faster and TTFT is lower at every prompt length than the tt-metal reference, with better token
-accuracy. The tt-metal reference is tt-metal's own Qwen3.6-27B implementation
-(`models/demos/blackhole/qwen36`): op-by-op ttnn, tensor-parallel over 4 chips. This came from replacing the op-by-op ttnn
-execution with a design built for Tensix.
+accuracy. This came from replacing the op-by-op ttnn execution with a design built for Tensix.
+
+The tt-metal reference is tt-metal's own Qwen3.6-27B implementation (`models/demos/blackhole/qwen36`):
+op-by-op ttnn, tensor-parallel over 4 chips. All comparisons below are against it.
 
 | | |
 |---|---|
