@@ -27,20 +27,17 @@ Measured on the same host.
 | TTFT, 4k | 0.65 s | 0.63 s | 1.0× |
 | TTFT, 8k | 1.24 s | 1.07 s | 1.2× |
 | TTFT, 16k | 2.68 s | 2.06 s | 1.3× |
-| TTFT, 32k | 6.35 s | 4.49 s | 1.4× |
-| TTFT, 128k | 34.4 s | 32.7 s | 1.05× |
+| TTFT, 32k | 6.35 s | 4.50 s | 1.4× |
+| TTFT, 128k | 34.4 s | 32.6 s | 1.06× |
 | Decode, batch 1, at 32k / 128k | 24.3 / 22.9 tok/s/user | 73.7 / 57.9 tok/s/user | 3.0× / 2.5× |
 | Batch 8: total tok/s (tok/s/user) | 165 (20.6) | 374 (46.7) | 2.3× |
 | Batch 32: total tok/s (tok/s/user) | 404 (12.6) | 374 (11.7) | 0.93× |
 | Token accuracy top-1 / top-5 | 98.63 / 100 | 99.41 / 100 | — |
 
 Rates marked tok/s/user are per user; at batch 1 that is the whole decode rate. Totals are tok/s summed over
-the batch. Decode rates include the host's read of every generated token. At batch 1 the decode model feeds
-itself: each step's hub picks the greedy token across the chips and writes the next step's token state on
-device, so steps run back to back and the host reads each token one step late. With the host writing every
-token state and waiting for the argmax instead, batch 1 takes 12.6 ms per token at short context. TTFT is end to end:
-prefill, state handoff to the decode model, and the first decode step. The demo's batched runs use 128-token
-prompts.
+the batch. Decode rates include the host's read of every generated token; at batch 1 the device feeds itself
+(see [Resident decode](#resident-decode)). TTFT is end to end: prefill, state handoff to the decode model, and
+the first decode step. The demo's batched runs use 128-token prompts.
 
 ## Distance to the floor
 
@@ -55,7 +52,7 @@ causal attention, at 4 × 371 TFLOPS (the sustained matmul rate measured in ttnn
 | Decode token with host, batch 1 | 10.7 ms | 39.2 ms | 27% | 12.0 ms | 89% |
 | Decode step, batch 8 | 11.9 ms | 48.5 ms | 25% | 21.4 ms | 56% |
 | Prefill, 8k prompt | 0.27 s | 1.24 s | 22% | 1.07 s | 25% |
-| Prefill, 32k prompt | 1.22 s | 6.35 s | 19% | 4.49 s | 27% |
+| Prefill, 32k prompt | 1.22 s | 6.35 s | 19% | 4.50 s | 27% |
 
 The batch-8 floor adds each user's GDN state read and write (about 75 MB per user per chip). Prefill rows are
 end-to-end TTFT; prefill alone is 1.02 s at 8k (27%). The demo's batch-1 step is from a profile at tt-metal
@@ -141,19 +138,72 @@ fusion with a hard ceiling, so the work moved to a new execution model.
 ## Resident decode
 
 One persistent program per chip runs a whole decode step: 64 layers and the lm_head, tensor-parallel over 4
-chips. Nothing is launched per op. Each group of cores has one fixed job:
+chips. Nothing is launched per op. Each group of cores has one fixed job. Weights, KV cache and GDN state stay
+in DRAM; what is resident is the program and the role of each core.
+
+Core map of one chip at batch 1 (logical coordinates; all 4 chips use the same map):
 
 ```
-streamers (32 cores, 4 per DRAM bank)   stream every weight through a 1 MB L1 ring, run rmsnorm,
-                                        projections, conv1d, MLP; reads alternate NOC0 / NOC1
-GDN head cores (12, x4 per user group)  delta-rule recurrence, fp32 state in DRAM, updated in place
-attention leader, tail, 31 workers      q/k norm + RoPE, KV streamed in blocks, tree reduction
-hub (1)                                 all-reduce over fabric, sums the 4 chips, multicasts x back
+        x=0   1   2   3   4   5   6   7   8   9  10  11  12
+      ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┐
+ y=0  │ L │ G │ G │ W │ W │ W │ W │ G │ G │ G │ G │ G │ G │
+ y=1  │S1 │S1 │ H │ W │ W │ W │ W │S5 │S5 │ G │ G │ G │ G │
+ y=2  │S1 │S1 │ . │ W │ W │ W │ W │S5 │S5 │ . │ . │ . │ . │
+ y=3  │S3 │S3 │ . │ W │ W │ W │ W │S7 │S7 │ . │ . │ . │ . │
+ y=4  │S3 │S3 │ . │ W │ W │ W │ W │S7 │S7 │ . │ . │ . │ . │
+ y=5  │S2 │S2 │ . │ W │ W │ W │ W │S6 │S6 │ . │ . │ . │ . │
+ y=6  │S2 │S2 │ . │ W │ W │ W │ W │S6 │S6 │ . │ . │ . │ . │
+ y=7  │S0 │S0 │ . │ W │ W │ W │ T │S4 │S4 │ . │ . │ . │ . │
+ y=8  │S0 │S0 │ . │ . │ . │ . │ . │S4 │S4 │ . │ . │ . │ . │
+ y=9  │ . │ . │ . │ . │ . │ . │ . │ . │ . │ . │ . │ . │ . │
+      └───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┴───┘
 ```
 
-Weight streaming reaches about 490 GB/s per chip (the per-chip ceiling measured with both NOCs is about
-510 GB/s). A step takes 12.1 ms. At the DRAM limit the weights alone would take 10.7 ms, so a step reaches 88%
-of the hardware floor.
+| Cores | Role | L1 per core |
+|---|---|---|
+| `Sn` streamers, 32 (2×2 next to DRAM bank n) | Stream every weight through a 1 MB L1 ring; rmsnorm, projections, conv1d, MLP, lm_head. Reads alternate NOC0 / NOC1. | ~1.07 MB |
+| `G` GDN head cores, 12 (48 at batch ≥ 4) | One per local value head: delta-rule recurrence, fp32 state in DRAM, updated in place | ~0.52 MB |
+| `L` attention leader, 1 | q norm + RoPE, multicasts q, root of the reduction tree | ~0.35 MB |
+| `W` attention workers, 31 | Stream the KV cache in blocks of 8 tiles with an online softmax; fan-in-8 reduction tree | ~0.59 MB |
+| `T` attention tail, 1 | k norm + RoPE, writes the new KV row | worker + tail buffers |
+| `H` hub, 1 | Fabric all-reduce with the chips ±1, multicasts x back; top-32 merge and sampling; next token state | ~0.1 MB |
+| `.` idle, 52 | | |
+
+Placement is computed at load (`model.py`, `streamer_cores` in `common.py`): streamers from the optimal
+DRAM-bank-to-worker assignment, the hub at the first free core in their bounding box, the workers as a 4×8
+rectangle, then the leader and the head cores from the remaining free cores. L1 figures are sums of the
+circular buffers and L1 tensors at batch 1.
+
+One layer of a decode step:
+
+```mermaid
+flowchart LR
+  DRAM[("DRAM, 8 banks: weights, KV cache, GDN state")]
+  S["Streamers ×32: rmsnorm, matmul columns"]
+  G["GDN head cores ×12: delta rule, fp32"]
+  L["Attention leader"]
+  W["Workers ×31 + tail"]
+  H["Hub"]
+  P[["Chips ±1 over fabric"]]
+
+  DRAM -- weight stream --> S
+  S -- qkvzab tiles --> G
+  G <-- state --> DRAM
+  S -- q/k/v rows --> L
+  L -- q multicast --> W
+  DRAM -- KV blocks --> W
+  W -- reduction tree --> L
+  G -- o --> S
+  L -- o --> S
+  S -- out / down partials --> H
+  H <-- all-reduce --> P
+  H -- x multicast --> S
+  S -- top-32 logits --> H
+  H -- next token state --> DRAM
+```
+
+A GDN layer uses the head cores; a full-attention layer (every fourth) uses the leader, workers and tail. Each
+layer has two hub all-reduce rounds: after the out projection and after the MLP down projection.
 
 - GDN layer: 222.9 → 164.6 µs once the reader used both NOCs and interleaved the 4 cores of a bank.
 - MLP half: 97 µs per layer (503 GB/s).
@@ -219,6 +269,9 @@ trace.
 | 8 | 21.4 ms | 374 | 46.7 | 165 (20.6) |
 | 16 | 42.7 ms | 375 | 23.4 | not measured |
 | 32 | 85.5 ms | 374 | 11.7 | 404 (12.6) |
+
+Steps here are host-fed: the host writes each token state and reads every user's argmax
+(`bench_resident_batch.py`). At batch 1 the device-fed decode runs at 83 tok/s/user instead of 79.
 
 Accuracy is 99.41 / 100 for every reference user at batch 8 and 32, the same as at batch 1. The changes that
 took batch 8 from 38.5 to 21.4 ms per step:
