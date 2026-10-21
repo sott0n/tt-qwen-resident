@@ -289,9 +289,44 @@ a peer can start the next step and count into this chip before this chip's step 
 
 ## Pipeline-parallel prefill
 
-Each chip holds 16 complete layers and the prompt flows chip to chip in chunks. Every tick runs the same op
-sequence on all chips, so a tick is traced once and replayed. The state then moves to the decode model on
-device. The chunk size (128, 256, 512 or 1024 tokens) is picked per prompt from a timing model.
+Prefill is compute-bound. Tensor parallelism would make it communication-bound: every half layer all-reduces
+a [chunk, 5120] activation over Ethernet. So prefill splits the model by layers instead. Chip p holds the
+full weights of layers 16p to 16p + 15. The prompt is cut into chunks of C tokens, and each chunk passes
+through chip 0, 1, 2 and 3 in turn. Only the chunk's [C, 5120] activation moves between chips, sent by a
+small fabric kernel (`prefill/kernels/shift.cpp`).
+
+A tick is one step of the pipeline: in tick t, chip p runs its 16 layers on chunk t − p, then passes the
+result to chip p + 1 for the next tick. For a prompt of 5 chunks:
+
+```
+tick:    0   1   2   3   4   5   6   7
+chip0:  c0  c1  c2  c3  c4  --  --  --      layers  0-15
+chip1:  --  c0  c1  c2  c3  c4  --  --      layers 16-31
+chip2:  --  --  c0  c1  c2  c3  c4  --      layers 32-47
+chip3:  --  --  --  c0  c1  c2  c3  c4      layers 48-63
+```
+
+n chunks take n + 3 ticks. In the slots marked `--` a chip has no chunk to work on.
+
+All 4 chips run the same program in every tick, so a tick is traced once per chunk size and replayed. The
+program is the same, but each chip reads different data:
+
+- **Weights.** Stage layer j is one mesh tensor sharded over the chips, so the same tensor holds layer j on
+  chip 0, layer 16 + j on chip 1, and so on (`pp_prefill.py`). This needs the same layer pattern on every
+  chip: 16 is a multiple of the attention interval 4, so each chip runs GDN, GDN, GDN, attention four times.
+- **Per-tick values.** Positions, RoPE, the KV blocks to write and two flags (`valid` rows, `update`) differ
+  per chip and per tick. The host writes them into small control tensors before each tick.
+- **Empty slots.** A trace cannot skip work on one chip, so the empty slots still compute and then discard
+  the result: with `update = 0` the GDN gates are g = 0 and β = 0, so the delta rule leaves the state
+  unchanged; the conv history is not updated; and the KV rows go to scratch blocks. The same mask covers the
+  padding rows of the last chunk. Without a trace those chips would sit idle instead; either way the empty
+  slots cost the same time, and they cap an 8k prompt (8 chunks, 11 ticks) at 73% of the work rate.
+
+The chunk size (128, 256, 512 or 1024 tokens) is picked per prompt from a timing model. It estimates
+(chunks + 3) × tick time, where the measured tick time grows with the prompt's mean context. Small chunks
+cut the empty slots on short prompts; large chunks make the matmuls more efficient on long ones. After the
+last tick, a device kernel (`handoff.cpp`) moves the KV cache and GDN state into the decode model's
+tensor-parallel layout, on chip or over fabric.
 
 | Prompt (tokens) | 127 | 255 | 511 | 1k | 2k | 8k | 16k |
 |---|---|---|---|---|---|---|---|
