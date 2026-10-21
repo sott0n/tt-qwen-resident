@@ -331,34 +331,6 @@ model uses the plugin's adaptive block output: each decode step returns 4 tokens
 verify steps ahead, so it keeps decoding during the runner's per-step work; tokens past a block carry to
 the next one. vLLM sends the first token with the first block, which is most of the TTFT difference.
 
-## Bugs that cost the most time
-
-- **Fabric all-reduce races.** Accuracy changed from run to run (97.66 to 99.02 top-1). Two causes: one
-  semaphore counted rounds across layers, and a packet header was rewritten while a non-blocking send was still
-  reading it. Fixed with one semaphore per slot parity and prebuilt headers. Random weights without host gaps
-  never showed it.
-- **An intermittent hang every few hundred steps.** `tt-triage` on the live process found the cause. A RISC-V
-  core's NOC read barrier never finished because another core on the same Tensix shared the NOC1 read counters
-  while streaming weights. The rule now: if NCRISC reads on a NOC, no other RISC on that core issues plain reads
-  on it.
-- **Op unit tests miss model accuracy.** A faster GDN inverse passed all 50 op tests and still dropped 64-layer
-  accuracy to 99.22 / 99.80. Every numeric change now has to pass the full-model accuracy test.
-
-## Open items
-
-- **16 rows per launch**, so batch 32 can beat the demo. The hub's L1 cannot hold 2 parities × 4 chips × 160 KB.
-  Options: credit-based flow control with one parity, or two 8-row groups sharing one weight stream with
-  sequential hub rounds. Estimate: 570–640 tok/s total.
-- **Prefill handoff into a batch slot.** Prefill can hand its state to a batch-1 decode model only, so batched
-  serving still lacks per-user TTFT.
-- **Long-context prefill attention**, which dominates TTFT past 64k.
-- **MTP: draft prompt entries.** An MTP prefill over the prompt would recover 3–6 points of draft
-  acceptance; more than one draft per step, sampled requests and batches are not supported yet.
-- **MTP at long context.** Both verify rows read the whole KV cache (18.7 ms per step at 32k against 15.3 ms
-  at short context); reading each block once for both rows would close most of that.
-- The demo at 64k and 256k was not measured, and a clean build of this repository from its submodule has not
-  been run.
-
 ## Serving with vLLM
 
 `qwen36_resident/generator_vllm.py` adapts the model to vLLM through the
@@ -408,23 +380,6 @@ export TT_MODEL_CLASS_OVERRIDES="TTQwen3_5ForConditionalGeneration=qwen36_reside
 verify steps the device runs ahead. Every request decodes greedily: vLLM ignores a block-output model's
 sampling controls.
 
-## Layout
-
-```
-qwen36_resident/
-  kernels/   resident decode kernels (streamers, GDN heads, attention, hub)
-  prefill/   pipeline-parallel prefill (pp_prefill.py) and its kernels
-  model.py   resident decode model builder
-  weights.py checkpoint -> per-chip weights
-  common.py  dimensions and streamer layout helpers
-  generator_vllm.py  vLLM adapter; vllm_models/ registers it with the plugin
-  mtp.py     MTP speculative decode: draft model, verify loop, streaming
-  tests/     accuracy tests and benchmarks
-patches/     changes to tt-metal's ttnn this code needs (applied to the submodule)
-tt-metal/    submodule, pinned to the tt-metal commit this code is built against
-tt-model.yaml  container package manifest for tt-model
-```
-
 ## Setup
 
 ```bash
@@ -441,24 +396,3 @@ published wheels. To use an existing tt-metal build of the pinned commit with th
 Weights: the Hugging Face checkpoint `Qwen/Qwen3.6-27B` in `~/.cache/huggingface/hub`. The accuracy tests read
 the reference tokens from tt-metal (`models/tt_transformers/tests/reference_outputs/Qwen3.6-27B.refpt`, or
 `RESIDENT_REFPT`).
-
-## Running
-
-```bash
-pytest qwen36_resident/tests/test_resident_accuracy.py::test_resident_accuracy        # decode accuracy (RESIDENT_BATCH=8)
-RESIDENT_PREFILL=1 pytest qwen36_resident/tests/test_resident_accuracy.py::test_resident_accuracy  # with prefill
-RESIDENT_PROMPTS=511,8192,32767 pytest qwen36_resident/tests/bench_ttft.py           # TTFT and decode speed
-RESIDENT_FEED=1 RESIDENT_PROMPTS=127,32767 pytest qwen36_resident/tests/bench_ttft.py # with the decode feeding itself
-pytest qwen36_resident/tests/test_resident_feed.py                                    # fed greedy = host-fed greedy
-pytest qwen36_resident/tests/test_resident_sampling.py                                # device draw = host reference
-RESIDENT_BATCHES=1,8,32 pytest qwen36_resident/tests/bench_resident_batch.py          # decode step per batch
-RESIDENT_BATCH=8 pytest qwen36_resident/tests/bench_resident_model.py::test_resident_decode_steps  # vs torch, random weights
-RESIDENT_LAYERS=16 pytest qwen36_resident/tests/prof_pp_tick.py                       # untraced prefill ticks for the profiler
-pytest qwen36_resident/tests/test_resident_verify.py                                  # 2-row verify step vs torch, random weights
-pytest qwen36_resident/tests/test_resident_accuracy.py::test_resident_verify_accuracy # verify step accuracy
-pytest --timeout 1400 qwen36_resident/tests/test_mtp_spec.py                          # MTP decode = verify-model greedy
-pytest --timeout 1400 qwen36_resident/tests/bench_mtp_spec.py                         # MTP decode on chat and long prompts
-python -m qwen36_resident.tests.mtp_acceptance <dump.pt>                              # draft acceptance on host (RESIDENT_DUMP)
-```
-
-If a run hangs, reset the cards (`tt-smi -r 0,1,2,3`) before the next one.
